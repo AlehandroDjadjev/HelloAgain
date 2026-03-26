@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helloagain.app/schemas/action_step",
+  "title": "ActionStep",
+  "description": "A single typed, fully-parameterised step in an ActionPlan. The executor must process one step at a time and verify the expected_outcome before advancing.",
+  "type": "object",
+  "required": ["id", "type", "params", "sensitivity", "requires_confirmation"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique identifier for this step within the plan, e.g. 'step_1'."
+    },
+    "type": {
+      "$ref": "https://helloagain.app/schemas/action_type"
+    },
+    "params": {
+      "type": "object",
+      "description": "Action-specific parameters. Shape is validated per-type by the executor. See $defs below.",
+      "$comment": "Validated via discriminated-union rules keyed on 'type'."
+    },
+    "expected_outcome": {
+      "oneOf": [
+        { "$ref": "#/$defs/ExpectedOutcome" },
+        { "type": "null" }
+      ],
+      "description": "What the executor should verify after the action completes. On mismatch: retry once with alternate selector, then escalate."
+    },
+    "timeout_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 5000,
+      "description": "Maximum ms to wait for the action to complete before treating it as a timeout."
+    },
+    "retry_policy": {
+      "$ref": "#/$defs/RetryPolicy"
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "Risk level of this individual action. 'high' actions require an explicit confirmation step immediately before them in the plan."
+    },
+    "requires_confirmation": {
+      "type": "boolean",
+      "description": "If true, a REQUEST_CONFIRMATION step must immediately precede this step. Policy engine enforces this; plans that skip it are rejected."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "RetryPolicy": {
+      "type": "object",
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "default": 2
+        },
+        "backoff_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 500
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExpectedOutcome": {
+      "type": "object",
+      "properties": {
+        "screen_hint": {
+          "type": "string",
+          "description": "Human-readable token describing the expected screen state, e.g. 'chat_list', 'message_sent'."
+        },
+        "element_visible": {
+          "type": "string",
+          "description": "view_id that must be visible after the action."
+        },
+        "element_gone": {
+          "type": "string",
+          "description": "view_id that must no longer be visible after the action."
+        },
+        "package": {
+          "type": "string",
+          "description": "foreground_package that must match after the action."
+        }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+    "OpenAppParams": {
+      "type": "object",
+      "required": ["package"],
+      "properties": {
+        "package": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "SelectorParams": {
+      "type": "object",
+      "required": ["selector"],
+      "properties": {
+        "selector": { "$ref": "https://helloagain.app/schemas/selector" }
+      },
+      "additionalProperties": false
+    },
+    "TypeTextParams": {
+      "type": "object",
+      "required": ["text"],
+      "properties": {
+        "selector": { "$ref": "https://helloagain.app/schemas/selector" },
+        "text": { "type": "string", "minLength": 1 },
+        "append": { "type": "boolean", "default": false }
+      },
+      "additionalProperties": false
+    },
+    "ScrollParams": {
+      "type": "object",
+      "required": ["direction"],
+      "properties": {
+        "selector": { "$ref": "https://helloagain.app/schemas/selector" },
+        "direction": { "type": "string", "enum": ["up", "down", "left", "right"] },
+        "distance_dp": { "type": "integer", "minimum": 1 },
+        "to_end": { "type": "boolean", "default": false }
+      },
+      "additionalProperties": false
+    },
+    "SwipeParams": {
+      "type": "object",
+      "required": ["start_x", "start_y", "end_x", "end_y"],
+      "properties": {
+        "start_x": { "type": "integer" },
+        "start_y": { "type": "integer" },
+        "end_x":   { "type": "integer" },
+        "end_y":   { "type": "integer" },
+        "duration_ms": { "type": "integer", "minimum": 0, "default": 300 }
+      },
+      "additionalProperties": false
+    },
+    "AssertScreenParams": {
+      "type": "object",
+      "required": ["screen_hint"],
+      "properties": {
+        "screen_hint": { "type": "string" },
+        "required_package": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "RequestConfirmationParams": {
+      "type": "object",
+      "required": ["action_summary"],
+      "properties": {
+        "action_summary": { "type": "string" },
+        "recipient": { "type": "string" },
+        "content_preview": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "AbortParams": {
+      "type": "object",
+      "required": ["reason"],
+      "properties": {
+        "reason": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,110 @@
+{
+    "goal":        "Send WhatsApp message to Alex: I'm running 10 minutes late",
+    "app_package": "com.whatsapp",
+    "steps": [
+        {
+            "id":    "wa_1",
+            "type":  "OPEN_APP",
+            "params": {"package": "com.whatsapp"},
+            "expected_outcome": {"screen_hint": "chat_list"},
+            "timeout_ms": 5000,
+            "retry_policy": {"max_attempts": 2},
+            "sensitivity": "low",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_2",
+            "type":  "WAIT_FOR_APP",
+            "params": {"package": "com.whatsapp"},
+            "expected_outcome": {"screen_hint": "chat_list"},
+            "timeout_ms": 6000,
+            "retry_policy": {"max_attempts": 2},
+            "sensitivity": "low",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_3",
+            "type":  "FIND_ELEMENT",
+            "params": {"selector": {"content_desc": "Search"}},
+            "expected_outcome": {"screen_hint": "chat_list"},
+            "timeout_ms": 4000,
+            "retry_policy": {"max_attempts": 2},
+            "sensitivity": "low",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_4",
+            "type":  "TAP_ELEMENT",
+            "params": {"selector": {"content_desc": "Search"}},
+            "expected_outcome": {"screen_hint": "search_open"},
+            "timeout_ms": 4000,
+            "retry_policy": {"max_attempts": 2},
+            "sensitivity": "low",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_5",
+            "type":  "TYPE_TEXT",
+            "params": {"text": "Alex"},
+            "expected_outcome": {"screen_hint": "search_results"},
+            "timeout_ms": 4000,
+            "retry_policy": {"max_attempts": 1},
+            "sensitivity": "low",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_6",
+            "type":  "TAP_ELEMENT",
+            "params": {"selector": {"text_contains": "Alex"}},
+            "expected_outcome": {"screen_hint": "chat_open"},
+            "timeout_ms": 4000,
+            "retry_policy": {"max_attempts": 2},
+            "sensitivity": "low",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_7",
+            "type":  "TAP_ELEMENT",
+            "params": {"selector": {"view_id": "entry", "content_desc": "Message Input Box"}},
+            "expected_outcome": {"screen_hint": "message_input_focused"},
+            "timeout_ms": 3000,
+            "retry_policy": {"max_attempts": 2},
+            "sensitivity": "low",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_8",
+            "type":  "TYPE_TEXT",
+            "params": {"text": "I'm running 10 minutes late"},
+            "expected_outcome": {"screen_hint": "message_typed"},
+            "timeout_ms": 4000,
+            "retry_policy": {"max_attempts": 1},
+            "sensitivity": "medium",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_9",
+            "type":  "REQUEST_CONFIRMATION",
+            "params": {
+                "action_summary": "Send WhatsApp to Alex: \"I'm running 10 minutes late\"",
+                "recipient": "Alex",
+                "content_preview": "I'm running 10 minutes late"
+            },
+            "expected_outcome": {"screen_hint": "confirmation_shown"},
+            "timeout_ms": 60000,
+            "retry_policy": {"max_attempts": 1},
+            "sensitivity": "medium",
+            "requires_confirmation": false
+        },
+        {
+            "id":    "wa_10",
+            "type":  "TAP_ELEMENT",
+            "params": {"selector": {"content_desc": "Send"}},
+            "expected_outcome": {"screen_hint": "message_sent"},
+            "timeout_ms": 5000,
+            "retry_policy": {"max_attempts": 2},
+            "sensitivity": "high",
+            "requires_confirmation": true
+        }
+    ]
+}

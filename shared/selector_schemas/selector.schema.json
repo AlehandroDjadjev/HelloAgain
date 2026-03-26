@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helloagain.app/schemas/selector",
+  "title": "Selector",
+  "description": "Identifies a UI node in the Android accessibility tree. Resolution priority (highest → lowest): element_ref → view_id → content_desc → text → class_name+index_in_parent → bounds. Raw bounds are a last resort and require policy.allow_coordinates_fallback = true.",
+  "type": "object",
+  "properties": {
+    "element_ref": {
+      "type": "string",
+      "description": "Opaque ref string assigned by AccessibilityService for this render pass. Highest priority — use when available."
+    },
+    "view_id": {
+      "type": "string",
+      "description": "Android resource ID, e.g. 'com.whatsapp:id/send_button'. Stable across app versions when present."
+    },
+    "content_desc": {
+      "type": "string",
+      "description": "Accessibility content description (contentDescription attribute)."
+    },
+    "text": {
+      "type": "string",
+      "description": "Visible text content of the node. May be localised — prefer view_id or content_desc."
+    },
+    "class_name": {
+      "type": "string",
+      "description": "Full Android class name, e.g. 'android.widget.EditText'. Use together with index_in_parent when no stable id exists."
+    },
+    "index_in_parent": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Zero-based index within the parent node. Only meaningful when used together with class_name."
+    },
+    "bounds": {
+      "$ref": "#/$defs/Bounds",
+      "description": "Absolute screen coordinates. Last resort — requires policy.allow_coordinates_fallback = true."
+    }
+  },
+  "minProperties": 1,
+  "$defs": {
+    "Bounds": {
+      "type": "object",
+      "required": ["left", "top", "right", "bottom"],
+      "properties": {
+        "left":   { "type": "integer" },
+        "top":    { "type": "integer" },
+        "right":  { "type": "integer" },
+        "bottom": { "type": "integer" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

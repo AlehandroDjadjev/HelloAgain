@@ -1,0 +1,22 @@
+name: android_control_plugin
+description: >
+  HelloAgain Android control plugin.
+  Provides AccessibilityService-based device control for the automation agent.
+  Android only — no iOS, macOS, Windows, Linux or web support.
+version: 0.1.0
+homepage: https://github.com/helloagain/android_control_plugin
+
+environment:
+  sdk: ^3.10.8
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: com.example.control
+        pluginClass: AndroidControlPlugin

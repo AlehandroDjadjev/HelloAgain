@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helloagain.app/schemas/confirmation_request",
+  "title": "ConfirmationRequest",
+  "description": "Displayed to the user before any irreversible action is executed. The UI must show all required fields and block execution until a decision is recorded. Silent auto-approval is never permitted.",
+  "type": "object",
+  "required": [
+    "confirmation_id",
+    "session_id",
+    "plan_id",
+    "step_id",
+    "app_name",
+    "app_package",
+    "action_summary",
+    "sensitivity",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "confirmation_id": {
+      "type": "string",
+      "description": "Unique identifier. Used in POST /api/agent/confirmations/{id}/approve|reject."
+    },
+    "session_id": { "type": "string" },
+    "plan_id":    { "type": "string" },
+    "step_id": {
+      "type": "string",
+      "description": "The ActionStep.id this confirmation gates."
+    },
+    "app_name": {
+      "type": "string",
+      "description": "Human-readable app name shown in the confirmation UI, e.g. 'WhatsApp'."
+    },
+    "app_package": {
+      "type": "string",
+      "description": "Package name, e.g. 'com.whatsapp'."
+    },
+    "action_summary": {
+      "type": "string",
+      "description": "One-sentence plain-language description of what will happen, e.g. 'Send a message to Alice'."
+    },
+    "recipient": {
+      "type": ["string", "null"],
+      "description": "Who the action targets, if applicable."
+    },
+    "content_preview": {
+      "type": ["string", "null"],
+      "description": "Preview of content that will be submitted (message text, form value, etc.)."
+    },
+    "sensitivity": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "approved", "rejected", "expired"],
+      "description": "Execution only proceeds when status = 'approved'."
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "If set, the confirmation automatically moves to 'expired' after this time and the plan is aborted."
+    },
+    "resolved_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "When the user approved or rejected."
+    }
+  },
+  "additionalProperties": false
+}

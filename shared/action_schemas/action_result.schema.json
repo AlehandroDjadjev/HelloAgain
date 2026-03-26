@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helloagain.app/schemas/action_result",
+  "title": "ActionResult",
+  "description": "The structured outcome reported by Android after executing a single ActionStep. Posted to /api/agent/sessions/{id}/action-result/.",
+  "type": "object",
+  "required": ["step_id", "session_id", "plan_id", "status", "executed_at", "duration_ms"],
+  "properties": {
+    "step_id": {
+      "type": "string",
+      "description": "Matches ActionStep.id."
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "plan_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "failure", "timeout", "aborted", "skipped"],
+      "description": "'success' means expected_outcome was verified. All other values halt normal execution flow."
+    },
+    "screen_state": {
+      "oneOf": [
+        { "$ref": "https://helloagain.app/schemas/screen_state" },
+        { "type": "null" }
+      ],
+      "description": "Fresh ScreenState captured immediately after the action. Required unless the device is unreachable."
+    },
+    "error_code": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "ELEMENT_NOT_FOUND",
+            "ELEMENT_NOT_CLICKABLE",
+            "APP_NOT_FOREGROUND",
+            "SCREEN_MISMATCH",
+            "TIMEOUT",
+            "SENSITIVE_SCREEN",
+            "CONFIRMATION_REJECTED",
+            "POLICY_VIOLATION",
+            "UNKNOWN"
+          ]
+        },
+        { "type": "null" }
+      ]
+    },
+    "error_detail": {
+      "type": ["string", "null"],
+      "description": "Human-readable detail for logging/debug. Not shown to the user."
+    },
+    "executed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Wall-clock time from action dispatch to result capture, in milliseconds."
+    }
+  },
+  "additionalProperties": false
+}
