@@ -2,7 +2,6 @@ import 'api/android_control_api.dart';
 import 'channel/automation_event_channel.dart';
 import 'channel/device_control_channel.dart';
 import 'events/automation_event.dart';
-import 'models/models.dart';
 import 'permissions/permission_checker.dart';
 
 /// Top-level facade for the Android control plugin.
