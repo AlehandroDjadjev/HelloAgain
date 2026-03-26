@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helloagain.app/schemas/action_type",
+  "title": "ActionType",
+  "description": "Exhaustive enumeration of every action the executor layer is permitted to take. Natural language must never reach the executor — only values from this enum.",
+  "type": "string",
+  "enum": [
+    "OPEN_APP",
+    "GET_SCREEN_STATE",
+    "WAIT_FOR_APP",
+    "WAIT_FOR_ELEMENT",
+    "FIND_ELEMENT",
+    "TAP_ELEMENT",
+    "LONG_PRESS_ELEMENT",
+    "FOCUS_ELEMENT",
+    "TYPE_TEXT",
+    "CLEAR_TEXT",
+    "SCROLL",
+    "SWIPE",
+    "BACK",
+    "HOME",
+    "REQUEST_CONFIRMATION",
+    "ASSERT_SCREEN",
+    "ASSERT_ELEMENT",
+    "ABORT"
+  ],
+  "$comment": "ABORT and REQUEST_CONFIRMATION are control-flow actions, not UI gestures. Coordinates-based actions (SWIPE) are permitted only when policy.allow_coordinates_fallback = true."
+}
