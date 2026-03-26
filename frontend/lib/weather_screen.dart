@@ -47,10 +47,9 @@ Color _weatherColor(int code) {
 }
 
 // ── Elderly-friendly daily tip ─────────────────────────────────────────────
-String _dailyTip(int code, double maxTemp, double windSpeed) {
+String _dailyTip(int code, double maxTemp) {
   if (maxTemp >= 30) return '🌡 Много горещо! Пийте вода по-често и избягвайте излизане следобед.';
   if (maxTemp <= 2) return '🧥 Студено е! Облечете се топло и внимавайте за лед.';
-  if (windSpeed > 40) return '💨 Силен вятър. Препоръчваме да останете на закрито.';
   if (code >= 60 && code <= 69) return '☔ Носете чадър! Очаква се дъжд.';
   if (code >= 70 && code <= 79) return '❄ Снежно! Внимавайте при ходене.';
   if (code >= 95) return '⛈ Гръмотевична буря. Избягвайте открити места.';
@@ -64,7 +63,6 @@ class DayForecast {
   final double maxTemp;
   final double minTemp;
   final int weatherCode;
-  final double windSpeed;
   final double precipitation;
 
   DayForecast({
@@ -72,7 +70,6 @@ class DayForecast {
     required this.maxTemp,
     required this.minTemp,
     required this.weatherCode,
-    required this.windSpeed,
     required this.precipitation,
   });
 }
@@ -105,7 +102,7 @@ class _WeatherScreenState extends State<WeatherScreen> {
       final url = Uri.parse(
         'https://api.open-meteo.com/v1/forecast'
         '?latitude=$lat&longitude=$lng'
-        '&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max'
+        '&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum'
         '&timezone=auto'
         '&forecast_days=7',
       );
@@ -117,7 +114,6 @@ class _WeatherScreenState extends State<WeatherScreen> {
         final maxTemps = List<double>.from(daily['temperature_2m_max'].map((v) => v?.toDouble() ?? 0.0));
         final minTemps = List<double>.from(daily['temperature_2m_min'].map((v) => v?.toDouble() ?? 0.0));
         final codes = List<int>.from(daily['weathercode'].map((v) => (v ?? 0).toInt()));
-        final winds = List<double>.from(daily['windspeed_10m_max'].map((v) => v?.toDouble() ?? 0.0));
         final precip = List<double>.from(daily['precipitation_sum'].map((v) => v?.toDouble() ?? 0.0));
 
         setState(() {
@@ -126,7 +122,6 @@ class _WeatherScreenState extends State<WeatherScreen> {
             maxTemp: maxTemps[i],
             minTemp: minTemps[i],
             weatherCode: codes[i],
-            windSpeed: winds[i],
             precipitation: precip[i],
           ));
           _loading = false;
@@ -298,7 +293,7 @@ class _WeatherScreenState extends State<WeatherScreen> {
               borderRadius: BorderRadius.circular(14),
             ),
             child: Text(
-              _dailyTip(today.weatherCode, today.maxTemp, today.windSpeed),
+              _dailyTip(today.weatherCode, today.maxTemp),
               style: const TextStyle(color: _kText, fontSize: 15, height: 1.4),
             ),
           ),
@@ -306,8 +301,6 @@ class _WeatherScreenState extends State<WeatherScreen> {
           Row(
             children: [
               Expanded(child: _statCard('Мин', '${today.minTemp.round()}°', Icons.thermostat)),
-              const SizedBox(width: 10),
-              Expanded(child: _statCard('Вятър', '${today.windSpeed.round()} км/ч', Icons.air)),
               const SizedBox(width: 10),
               Expanded(child: _statCard('Валеж', '${today.precipitation.round()} мм', Icons.water_drop)),
             ],

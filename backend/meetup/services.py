@@ -3,6 +3,31 @@ import requests
 import math
 from datetime import datetime, timedelta
 
+
+_WEATHER_BG_MAP = {
+    'Clear': 'Ясно',
+    'Clouds': 'Облачно',
+    'Rain': 'Дъжд',
+    'Drizzle': 'Ръмеж',
+    'Thunderstorm': 'Гръмотевици',
+    'Snow': 'Сняг',
+    'Mist': 'Мъгла',
+    'Fog': 'Мъгла',
+    'Haze': 'Мараня',
+    'Smoke': 'Дим',
+    'Dust': 'Прах',
+    'Sand': 'Пясък',
+    'Ash': 'Пепел',
+    'Squall': 'Шквал',
+    'Tornado': 'Торнадо',
+}
+
+
+def _to_bg_weather(label):
+    if not label:
+        return ''
+    return _WEATHER_BG_MAP.get(label, label)
+
 def get_central_point(coordinates):
     if not coordinates:
         return None
@@ -28,11 +53,11 @@ def fetch_places(location, radius=2000):
     url = "https://places.googleapis.com/v1/places:searchNearby"
     headers = {
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName,places.location,places.types,places.formattedAddress,places.id",
+        "X-Goog-FieldMask": "places.displayName,places.location,places.types,places.formattedAddress,places.id,places.rating,places.userRatingCount",
         "Content-Type": "application/json"
     }
     data = {
-        "includedTypes": ["park", "cafe", "tourist_attraction"],
+        "includedTypes": ["park"],
         "maxResultCount": 10,
         "languageCode": "bg",
         "locationRestriction": {
@@ -58,6 +83,8 @@ def fetch_places(location, radius=2000):
                 'name': p.get('displayName', {}).get('text', 'Unknown'),
                 'types': p.get('types', []),
                 'vicinity': p.get('formattedAddress', ''),
+                'rating': p.get('rating', 0),
+                'user_ratings_total': p.get('userRatingCount', 0),
                 'geometry': {
                     'location': {
                         'lat': p.get('location', {}).get('latitude'),
@@ -122,6 +149,13 @@ def get_best_meetup_spot(coordinates):
         plng = place['geometry']['location']['lng']
         dist = calculate_distance(center['lat'], center['lng'], plat, plng)
         dist_score = max(0, 2 - dist) * 10 
+        rating = float(place.get('rating') or 0)
+        ratings_count = int(place.get('user_ratings_total') or 0)
+
+        # Weight quality by review score and confidence by number of reviews.
+        rating_score = min(10.0, max(0.0, rating) * 2.0)
+        confidence_score = min(5.0, math.log10(max(ratings_count, 1)) * 2.5)
+        reviews_score = rating_score + confidence_score
         
         for vh in valid_hours:
             weather_score = 10
@@ -133,27 +167,31 @@ def get_best_meetup_spot(coordinates):
                 weather_score -= 3
             
             types = place.get('types', [])
-            amenities_score = 0
-            if 'park' in types and not vh['rain']:
-                amenities_score += 5
-            elif 'cafe' in types or 'restaurant' in types:
-                amenities_score += 5
-                if vh['rain']:
-                    amenities_score += 10
+
+            # Strictly allow only real parks in final candidate scoring.
+            if 'park' not in types:
+                continue
+
+            # Keep a light preference toward park-friendly weather.
+            amenities_score = 6
+            if not vh['rain']:
+                amenities_score += 2
                     
-            total_score = dist_score + weather_score + amenities_score
+            total_score = dist_score + weather_score + amenities_score + reviews_score
             
             if total_score > best_score:
                 best_score = total_score
-                amenities_desc = "Indoor (Cafe/Restaurant)" if ('cafe' in types or 'restaurant' in types) else "Outdoor (Park)"
+                amenities_desc = "Открито (Парк)"
                 best_match = {
                     'place_name': place.get('name'),
-                    'place_lat': plat,
-                    'place_lng': plng,
+                    'place_lat': round(plat, 6),
+                    'place_lng': round(plng, 6),
                     'recommended_time': vh['time'].strftime('%Y-%m-%d %H:00'),
-                    'temperature': vh['temp'],
-                    'weather': vh['weather_main'],
-                    'score': total_score,
+                    'temperature': round(vh['temp'], 1),
+                    'weather': _to_bg_weather(vh['weather_main']),
+                    'score': round(total_score, 2),
+                    'rating': round(rating, 1),
+                    'review_count': ratings_count,
                     'types': types,
                     'amenities': amenities_desc,
                     'vicinity': place.get('vicinity', '')

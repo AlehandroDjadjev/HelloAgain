@@ -21,7 +21,6 @@ from .gat.feature_schema import (
     normalize_feature_name,
 )
 from .services.compatibility_engine import compare_people, dominant_traits
-from .services.feature_extraction import extract_feature_profile, extraction_to_vectors
 from .services.profile_ingestion import apply_interaction_signals, hydrate_profile_from_description
 from .services.recommendation_explainer import explain_recommendation
 from .services.graph_training import record_training_run
@@ -176,6 +175,10 @@ def compare_users(request):
             p = get_object_or_404(ElderProfile, pk=int(uid))
             return p.feature_vector, p.feature_confidence, p
         elif desc:
+            from .services.feature_extraction import (
+                extract_feature_profile,
+                extraction_to_vectors,
+            )
             ext = extract_feature_profile(str(desc))
             _, vec, conf, _, _ = extraction_to_vectors(ext)
             return vec, conf, None

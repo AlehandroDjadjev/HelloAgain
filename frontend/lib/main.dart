@@ -5,7 +5,6 @@ import 'package:geolocator/geolocator.dart';
 
 import 'meetup_screen.dart';
 import 'weather_screen.dart';
-import 'src/screens/permission_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();

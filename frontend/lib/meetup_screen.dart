@@ -177,12 +177,9 @@ class _MeetupScreenState extends State<MeetupScreen> {
       scheduledMeeting = scheduledMeeting.add(const Duration(days: 1)); // tomorrow
     }
 
-    // Set reminder for 30 minutes BEFORE the meeting
-    final reminderTime = scheduledMeeting.subtract(const Duration(minutes: 30));
-
     // Since exact alarms require more complex timezone setup in full production,
     // we use a simple delay notification as placeholder for this prototype.
-    // We will evaluate the difference between `reminderTime` and `now`.
+    // We keep the prototype behavior simple and immediate for demo reliability.
     
     const androidDetails = AndroidNotificationDetails(
       'meetup_channel', 'Meetup Reminders',
@@ -339,23 +336,4 @@ class _MeetupScreenState extends State<MeetupScreen> {
     );
   }
 
-  void _setMapStyle(GoogleMapController c) {
-    c.setMapStyle('''
-    [
-      {"elementType":"geometry","stylers":[{"color":"#f8f8f8"}]},
-      {"elementType":"labels.icon","stylers":[{"visibility":"off"}]},
-      {"elementType":"labels.text.fill","stylers":[{"color":"#9e9e9e"}]},
-      {"featureType":"administrative.locality","elementType":"labels.text.fill","stylers":[{"color":"#555555"}]},
-      {"featureType":"poi","elementType":"labels","stylers":[{"visibility":"off"}]},
-      {"featureType":"poi.park","elementType":"geometry","stylers":[{"color":"#e8f5e9"}]},
-      {"featureType":"road","elementType":"geometry","stylers":[{"color":"#ffffff"}]},
-      {"featureType":"road.arterial","elementType":"labels.text.fill","stylers":[{"color":"#aaaaaa"}]},
-      {"featureType":"road.highway","elementType":"geometry","stylers":[{"color":"#f0f0f0"}]},
-      {"featureType":"road.highway","elementType":"labels","stylers":[{"visibility":"off"}]},
-      {"featureType":"transit","stylers":[{"visibility":"off"}]},
-      {"featureType":"water","elementType":"geometry","stylers":[{"color":"#dce9f5"}]},
-      {"featureType":"water","elementType":"labels.text.fill","stylers":[{"color":"#9e9e9e"}]}
-    ]
-    ''');
-  }
 }

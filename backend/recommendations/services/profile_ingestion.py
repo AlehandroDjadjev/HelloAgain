@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from recommendations.gat.feature_updater import apply_manual_override, update_feature_vector
+from recommendations.gat.feature_schema import get_default_feature_vector
 from recommendations.models import ElderProfile
-from recommendations.services.feature_extraction import extract_feature_profile, extraction_to_vectors
 
 
 def hydrate_profile_from_description(
@@ -16,12 +16,29 @@ def hydrate_profile_from_description(
     vector_source: str = "description_hybrid",
     preserve_adaptation: bool = False,
 ) -> ElderProfile:
-    extraction = extract_feature_profile(
-        description,
-        manual_overrides=manual_overrides,
-        clarification_answers=clarification_answers,
-    )
-    base_vector, effective_vector, confidence, evidence, _ = extraction_to_vectors(extraction)
+    try:
+        from recommendations.services.feature_extraction import (
+            extract_feature_profile,
+            extraction_to_vectors,
+        )
+
+        extraction = extract_feature_profile(
+            description,
+            manual_overrides=manual_overrides,
+            clarification_answers=clarification_answers,
+        )
+        base_vector, effective_vector, confidence, evidence, _ = extraction_to_vectors(extraction)
+    except ModuleNotFoundError as exc:
+        if exc.name != "torch":
+            raise
+
+        # Keep onboarding functional even when torch-based extraction isn't installed.
+        base_vector = get_default_feature_vector()
+        effective_vector = dict(base_vector)
+        confidence = {"overall": 0.0, "source": "fallback_no_torch"}
+        evidence = {
+            "warning": "Torch is not installed; used default feature profile.",
+        }
     current_effective = profile.feature_vector or effective_vector
     adapted_vector = (
         current_effective
