@@ -110,7 +110,8 @@ coverage/
 # Symbols
 app.*.symbols
 
-venv\
+venv/
+.env/
 
 # Exceptions to above rules.
 !**/ios/**/default.mode1v3

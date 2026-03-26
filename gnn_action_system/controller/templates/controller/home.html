@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GNN Action Controller</title>
+  <style>
+    :root {
+      --bg: #f3efe4;
+      --panel: rgba(255, 250, 240, 0.82);
+      --panel-strong: rgba(255, 248, 232, 0.95);
+      --ink: #1f2a29;
+      --muted: #5f6a66;
+      --line: rgba(54, 74, 68, 0.15);
+      --accent: #bf5a36;
+      --accent-deep: #7b3721;
+      --accent-soft: #f0ceb6;
+      --ok: #456a52;
+      --shadow: 0 24px 60px rgba(54, 43, 29, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(240, 206, 182, 0.9), transparent 30%),
+        radial-gradient(circle at top right, rgba(197, 218, 206, 0.9), transparent 30%),
+        linear-gradient(180deg, #fbf7ef 0%, var(--bg) 100%);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    .shell {
+      width: min(1400px, calc(100% - 32px));
+      margin: 24px auto 40px;
+    }
+
+    .hero, .panel {
+      backdrop-filter: blur(16px);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      padding: 28px;
+      margin-bottom: 20px;
+      background:
+        linear-gradient(135deg, rgba(255, 248, 232, 0.95), rgba(255, 244, 225, 0.82)),
+        var(--panel);
+    }
+
+    h1, h2, h3 {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    p { margin: 0; color: var(--muted); line-height: 1.55; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 20px;
+    }
+
+    .panel { padding: 22px; }
+
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      margin-top: 16px;
+      padding: 18px;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background: rgba(255, 252, 244, 0.94);
+      color: var(--ink);
+      font: inherit;
+      resize: vertical;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+    }
+
+    .actions, .quick-grid, .chip-grid, .card-grid { display: flex; flex-wrap: wrap; gap: 12px; }
+
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 12px 18px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    .primary { background: var(--accent); color: #fff7f2; box-shadow: 0 14px 28px rgba(191, 90, 54, 0.24); }
+    .secondary { background: #dbe7df; color: #234138; }
+    .ghost { background: rgba(255, 255, 255, 0.68); color: var(--accent-deep); border: 1px solid var(--line); }
+    .danger { background: rgba(123, 55, 33, 0.12); color: #6f2d19; border: 1px solid rgba(123, 55, 33, 0.18); }
+
+    .quick-grid { margin-top: 18px; }
+    .stat {
+      min-width: 160px;
+      padding: 16px 18px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: var(--panel-strong);
+    }
+    .stat strong { display: block; font-size: 1.35rem; }
+    .label { font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+
+    .chip, .list-chip {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.76);
+      border: 1px solid rgba(54, 74, 68, 0.1);
+      color: var(--ink);
+      font-size: 0.92rem;
+    }
+
+    .list-chip strong { color: var(--accent-deep); }
+    .card-grid { margin-top: 14px; }
+    .card {
+      flex: 1 1 260px;
+      min-width: 0;
+      padding: 16px;
+      border-radius: 20px;
+      background: var(--panel-strong);
+      border: 1px solid var(--line);
+    }
+    .card p { margin-top: 8px; }
+
+    .section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+    .muted { color: var(--muted); font-size: 0.94rem; }
+    .empty { color: var(--muted); font-style: italic; }
+    .status {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.7);
+      color: var(--ink);
+      font-size: 0.95rem;
+    }
+    .status.error {
+      background: rgba(191, 90, 54, 0.12);
+      border-color: rgba(191, 90, 54, 0.28);
+      color: #6f2d19;
+    }
+    details { margin-top: 16px; }
+    pre {
+      margin: 10px 0 0;
+      padding: 14px;
+      border-radius: 18px;
+      background: rgba(28, 38, 37, 0.92);
+      color: #edf4f2;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow: auto;
+      max-height: 380px;
+    }
+
+    @media (max-width: 980px) {
+      .grid { grid-template-columns: 1fr; }
+      .shell { width: min(100% - 20px, 1400px); }
+      .hero, .panel { border-radius: 20px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <h1>Preference Graph Console</h1>
+      <p style="margin-top: 10px;">Drive the user graph in three modes. <strong>Add</strong> creates or deepens an action, <strong>Fetch</strong> picks the best current action and updates nearby ones, and <strong>Conversation</strong> quietly propagates overlap updates in the background.</p>
+      <div class="quick-grid" id="headline-stats"></div>
+    </section>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="section-title">
+          <div>
+            <h2>Prompt Workspace</h2>
+            <p style="margin-top: 6px;">The parser gets the full attribute catalog and action inventory every time.</p>
+          </div>
+          <div class="actions">
+            <button class="ghost" id="refresh-btn" type="button">Refresh State</button>
+            <button class="danger" id="reset-btn" type="button">Wipe DB</button>
+          </div>
+        </div>
+        <textarea id="prompt" placeholder="Describe what the user wants, how they feel, or define a new action..."></textarea>
+        <div class="actions" style="margin-top: 16px;">
+          <button class="primary" id="add-btn" type="button" data-endpoint="/api/add-action/" data-mode="add">Add Action</button>
+          <button class="secondary" id="fetch-btn" type="button" data-endpoint="/api/fetch-action/" data-mode="fetch">Fetch Action</button>
+          <button class="ghost" id="conversation-btn" type="button" data-endpoint="/api/conversation/" data-mode="conversation">Conversation</button>
+        </div>
+        <div class="status" id="request-status">Ready. Start the manual Qwen server with <code>python main.py --warmup</code> before using add/fetch/conversation.</div>
+        <div class="status" id="qwen-status" style="margin-top: 10px;">Checking Qwen server...</div>
+      </div>
+
+      <div class="panel">
+        <div class="section-title">
+          <div>
+            <h2>Latest Result</h2>
+            <p style="margin-top: 6px;">Live view of parser output, chosen action, and overlap propagation.</p>
+          </div>
+          <span class="label" id="last-mode">Idle</span>
+        </div>
+        <div id="result-summary" class="card-grid"></div>
+        <div style="margin-top: 14px;">
+          <div class="label">Changed User State</div>
+          <div id="changed-user-state" class="chip-grid" style="margin-top: 10px;"></div>
+        </div>
+        <div style="margin-top: 14px;">
+          <div class="label">Background Updates</div>
+          <div id="background-updates" class="card-grid" style="margin-top: 10px;"></div>
+        </div>
+        <details>
+          <summary>Raw Response</summary>
+          <pre id="response-raw"></pre>
+        </details>
+      </div>
+    </section>
+
+    <section class="grid" style="margin-top: 20px;">
+      <div class="panel">
+        <div class="section-title">
+          <div>
+            <h2>Attribute Catalog</h2>
+            <p style="margin-top: 6px;">Full user-facing attribute list with current scores.</p>
+          </div>
+          <span class="muted" id="catalog-count"></span>
+        </div>
+        <div id="attribute-catalog" class="chip-grid"></div>
+      </div>
+
+      <div class="panel">
+        <div class="section-title">
+          <div>
+            <h2>Ranking Snapshot</h2>
+            <p style="margin-top: 6px;">Current GNN blend, vector similarity, and direct-edge view.</p>
+          </div>
+        </div>
+        <div id="ranking-cards" class="card-grid"></div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top: 20px;">
+      <div class="section-title">
+        <div>
+          <h2>Action Graph</h2>
+          <p style="margin-top: 6px;">Each card shows the action vector, direct edge, and stored history depth.</p>
+        </div>
+        <span class="muted" id="action-count"></span>
+      </div>
+      <div id="action-cards" class="card-grid"></div>
+      <details>
+        <summary>Raw State JSON</summary>
+        <pre id="state-raw"></pre>
+      </details>
+    </section>
+  </main>
+
+  <script>
+    const ids = ['add-btn', 'fetch-btn', 'conversation-btn', 'refresh-btn', 'reset-btn'];
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function formatScore(value) {
+      const num = Number(value ?? 0);
+      return Number.isFinite(num) ? num.toFixed(3) : '0.000';
+    }
+
+    function setBusy(isBusy) {
+      ids.forEach((id) => {
+        const button = document.getElementById(id);
+        if (button) button.disabled = isBusy;
+      });
+    }
+
+    function setStatus(message, isError = false) {
+      const el = document.getElementById('request-status');
+      el.textContent = message;
+      el.className = isError ? 'status error' : 'status';
+    }
+
+    function setQwenStatus(message, isError = false) {
+      const el = document.getElementById('qwen-status');
+      el.textContent = message;
+      el.className = isError ? 'status error' : 'status';
+    }
+
+    function renderHeadlineStats(state) {
+      const stats = [
+        { label: 'Attributes', value: state.attribute_catalog?.length ?? 0 },
+        { label: 'Actions', value: state.actions?.length ?? 0 },
+        { label: 'History Entries', value: state.user?.state_history?.length ?? 0 },
+      ];
+      document.getElementById('headline-stats').innerHTML = stats.map((item) => `
+        <div class="stat">
+          <span class="label">${escapeHtml(item.label)}</span>
+          <strong>${escapeHtml(item.value)}</strong>
+        </div>
+      `).join('');
+    }
+
+    function renderAttributeCatalog(attributes) {
+      document.getElementById('catalog-count').textContent = `${attributes.length} tracked`;
+      document.getElementById('attribute-catalog').innerHTML = attributes.length
+        ? attributes.map((item) => `<span class="chip"><strong>${escapeHtml(item.name)}</strong>${formatScore(item.score)}</span>`).join('')
+        : '<div class="empty">No attributes yet.</div>';
+    }
+
+    function renderRanking(ranking) {
+      document.getElementById('ranking-cards').innerHTML = ranking.length
+        ? ranking.slice(0, 8).map((item) => `
+            <article class="card">
+              <div class="label">${escapeHtml(item.name)}</div>
+              <p><strong>Score:</strong> ${formatScore(item.score)}</p>
+              <p><strong>GNN:</strong> ${formatScore(item.gnn_score)} | <strong>Vector:</strong> ${formatScore(item.vector_similarity)}</p>
+              <p><strong>Direct Edge:</strong> ${formatScore(item.direct_edge)}</p>
+            </article>
+          `).join('')
+        : '<div class="empty">No ranked actions yet.</div>';
+    }
+
+    function previewAttributes(map) {
+      const entries = Object.entries(map || {}).slice(0, 10);
+      return entries.length
+        ? entries.map(([name, score]) => `<span class="list-chip"><strong>${escapeHtml(name)}</strong>${formatScore(score)}</span>`).join('')
+        : '<div class="empty">No attributes stored.</div>';
+    }
+
+    function listToAttributeMap(items) {
+      const map = {};
+      (items || []).forEach((item) => {
+        if (!item || !item.attribute) return;
+        map[item.attribute] = item.score ?? 0;
+      });
+      return map;
+    }
+
+    function renderActions(actions) {
+      document.getElementById('action-count').textContent = `${actions.length} actions`;
+      document.getElementById('action-cards').innerHTML = actions.length
+        ? actions.map((action) => `
+            <article class="card">
+              <div class="label">${escapeHtml(action.name)}</div>
+              <p>${escapeHtml(action.description || action.base_summary || 'No description yet.')}</p>
+              <p><strong>Direct Edge:</strong> ${formatScore(action.direct_edge)} | <strong>History:</strong> ${(action.history_stack || []).length}</p>
+              <p><strong>State Match</strong></p>
+              <div class="chip-grid" style="margin-top: 12px;">${previewAttributes(action.attributes)}</div>
+              <p style="margin-top: 10px;"><strong>Desired Side</strong></p>
+              <div class="chip-grid" style="margin-top: 10px;">${previewAttributes(action.desired_attributes)}</div>
+            </article>
+          `).join('')
+        : '<div class="empty">No actions created yet.</div>';
+    }
+
+    function renderResult(data, modeLabel) {
+      document.getElementById('last-mode').textContent = modeLabel.toUpperCase();
+      const chosen = data.action?.name || data.result?.name || 'No direct action';
+      const changedCount = Object.keys(data.changed_user_state || {}).length;
+      const overlapCount = (data.background_updates || []).length;
+      const promptDesired = listToAttributeMap(data.plan?.prompt_context?.desired_attributes || []);
+      const promptOpposite = listToAttributeMap(data.plan?.prompt_context?.opposite_attributes || []);
+      const storedDesired = data.action?.desired_attributes || data.result?.action?.desired_attributes || {};
+      const reconciliationNotes = data.plan?.reconciliation_notes || [];
+
+      document.getElementById('result-summary').innerHTML = `
+        <article class="card">
+          <div class="label">Summary</div>
+          <p>${escapeHtml(data.plan?.summary || data.message || 'No parser summary returned.')}</p>
+        </article>
+        <article class="card">
+          <div class="label">Primary Result</div>
+          <p><strong>${escapeHtml(chosen)}</strong></p>
+          <p>Changed fields: ${escapeHtml(changedCount)} | Background updates: ${escapeHtml(overlapCount)}</p>
+        </article>
+        <article class="card">
+          <div class="label">Prompt Desired</div>
+          <div class="chip-grid" style="margin-top: 10px;">${previewAttributes(promptDesired)}</div>
+          <p style="margin-top: 10px;"><strong>Fallback Opposite</strong></p>
+          <div class="chip-grid" style="margin-top: 10px;">${previewAttributes(promptOpposite)}</div>
+        </article>
+        <article class="card">
+          <div class="label">Stored Desired Side</div>
+          <div class="chip-grid" style="margin-top: 10px;">${previewAttributes(storedDesired)}</div>
+        </article>
+        <article class="card">
+          <div class="label">Reconciliation</div>
+          ${reconciliationNotes.length
+            ? reconciliationNotes.map((note) => `<p>${escapeHtml(note)}</p>`).join('')
+            : '<p>No server-side corrections were needed.</p>'}
+        </article>
+      `;
+
+      const changed = Object.entries(data.changed_user_state || {});
+      document.getElementById('changed-user-state').innerHTML = changed.length
+        ? changed.map(([name, score]) => `<span class="chip"><strong>${escapeHtml(name)}</strong>${formatScore(score)}</span>`).join('')
+        : '<div class="empty">No direct user-score shifts were applied.</div>';
+
+      document.getElementById('background-updates').innerHTML = (data.background_updates || []).length
+        ? data.background_updates.map((item) => `
+            <article class="card">
+              <div class="label">${escapeHtml(item.action)}</div>
+              <p><strong>Relevance:</strong> ${formatScore(item.relevance)}</p>
+              <div class="chip-grid" style="margin-top: 10px;">${previewAttributes(item.applied_attributes)}</div>
+            </article>
+          `).join('')
+        : '<div class="empty">No background action overlaps were updated.</div>';
+
+      document.getElementById('response-raw').textContent = JSON.stringify(data, null, 2);
+    }
+
+    function renderError(modeLabel, message, rawText = '') {
+      document.getElementById('last-mode').textContent = `${modeLabel.toUpperCase()} ERROR`;
+      document.getElementById('result-summary').innerHTML = `
+        <article class="card">
+          <div class="label">Request Failed</div>
+          <p>${escapeHtml(message)}</p>
+        </article>
+      `;
+      document.getElementById('changed-user-state').innerHTML = '<div class="empty">No result because the request failed.</div>';
+      document.getElementById('background-updates').innerHTML = '<div class="empty">No updates were applied.</div>';
+      document.getElementById('response-raw').textContent = rawText || message;
+    }
+
+    function renderState(state) {
+      renderHeadlineStats(state);
+      renderAttributeCatalog(state.attribute_catalog || []);
+      renderRanking(state.ranking || []);
+      renderActions(state.actions || []);
+      document.getElementById('state-raw').textContent = JSON.stringify(state, null, 2);
+    }
+
+    async function sendPromptRequest(url, modeLabel) {
+      const prompt = document.getElementById('prompt').value.trim();
+      if (!prompt) {
+        setStatus('Enter a prompt first.', true);
+        return;
+      }
+      setBusy(true);
+      const absoluteUrl = new URL(url, window.location.origin).toString();
+      setStatus(`Running ${modeLabel} request to ${absoluteUrl}`, false);
+      try {
+        const response = await fetch(absoluteUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+          body: JSON.stringify({ prompt })
+        });
+        const rawText = await response.text();
+        let data = null;
+        try {
+          data = rawText ? JSON.parse(rawText) : {};
+        } catch (error) {
+          throw new Error(`Server returned non-JSON output (${response.status}). ${rawText.slice(0, 1200)}`);
+        }
+        if (!response.ok) {
+          throw new Error(data.detail || data.error || `Request failed with status ${response.status}.`);
+        }
+        renderResult(data, modeLabel);
+        setStatus(`${modeLabel} request finished successfully.`, false);
+        await loadState();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        renderError(modeLabel, message, message);
+        setStatus(message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function loadState() {
+      setBusy(true);
+      try {
+        const response = await fetch('/api/state/');
+        const state = await response.json();
+        renderState(state);
+        setStatus('State refreshed.', false);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(`State refresh failed: ${message}`, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function resetState() {
+      const confirmed = window.confirm('Wipe the current graph database state? This clears actions, attributes, edges, and history.');
+      if (!confirmed) return;
+      setBusy(true);
+      setStatus('Wiping graph database state...', false);
+      try {
+        const response = await fetch('/api/reset-state/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+          body: '{}'
+        });
+        const rawText = await response.text();
+        let data = {};
+        try {
+          data = rawText ? JSON.parse(rawText) : {};
+        } catch (error) {
+          throw new Error(`Server returned non-JSON output (${response.status}). ${rawText.slice(0, 1200)}`);
+        }
+        if (!response.ok) {
+          throw new Error(data.detail || `Reset failed with status ${response.status}.`);
+        }
+        renderState(data);
+        document.getElementById('last-mode').textContent = 'RESET';
+        document.getElementById('result-summary').innerHTML = `
+          <article class="card">
+            <div class="label">Database Reset</div>
+            <p>The graph state was cleared successfully.</p>
+          </article>
+        `;
+        document.getElementById('changed-user-state').innerHTML = '<div class="empty">No user-state changes after reset.</div>';
+        document.getElementById('background-updates').innerHTML = '<div class="empty">No background updates after reset.</div>';
+        document.getElementById('response-raw').textContent = JSON.stringify(data, null, 2);
+        setStatus('Graph database state wiped.', false);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(message, true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function loadQwenHealth() {
+      try {
+        const response = await fetch('/api/qwen-health/', { cache: 'no-store' });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || `Qwen health failed with status ${response.status}.`);
+        }
+        const loaded = payload.loaded ? 'loaded' : 'not loaded';
+        const device = payload.device || 'unknown device';
+        const gpu = payload.gpu_name ? ` | GPU: ${payload.gpu_name}` : '';
+        setQwenStatus(`Qwen ${loaded} on ${device}${gpu}`, !payload.loaded);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setQwenStatus(`Qwen unavailable: ${message}`, true);
+      }
+    }
+
+    document.getElementById('refresh-btn').addEventListener('click', () => {
+      loadState();
+    });
+
+    document.getElementById('reset-btn').addEventListener('click', () => {
+      resetState();
+    });
+
+    document.querySelectorAll('[data-endpoint]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const endpoint = button.getAttribute('data-endpoint');
+        const mode = button.getAttribute('data-mode') || 'request';
+        sendPromptRequest(endpoint, mode);
+      });
+    });
+
+    loadQwenHealth();
+    loadState();
+  </script>
+</body>
+</html>

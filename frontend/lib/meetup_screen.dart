@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 // Palette
 const _kBackground = Color(0xFFF9FAFB);
@@ -47,13 +48,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
   final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
 
   String _backendBaseUrl() {
-    if (kIsWeb) {
-      return 'http://localhost:8000';
-    }
-
-    return defaultTargetPlatform == TargetPlatform.android
-        ? 'http://10.0.2.2:8000'
-        : 'http://localhost:8000';
+    return dotenv.get('API_BASE_URL', fallback: 'http://localhost:8000');
   }
 
   @override
