@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Accessibility service configuration for HelloAgain automation agent.
+
+    Event types subscribed:
+      typeWindowStateChanged   — detect app/screen transitions
+      typeWindowContentChanged — detect dynamic content updates (chat lists, search results)
+      typeViewFocused          — track focused element for typeText operations
+      typeViewClicked          — observe tap outcomes
+      typeViewTextChanged      — observe text field changes after type operations
+
+    Capability flags:
+      flagReportViewIds              — includes viewIdResourceName in node info
+      flagRetrieveInteractiveWindows — access all interactive windows (required for multi-window)
+
+    canRetrieveWindowContent: required to walk the accessibility node tree.
+    canPerformGestures: required for dispatchGesture (swipe).
+    notificationTimeout: 100ms — balance between responsiveness and event flood.
+-->
+<accessibility-service
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="
+        typeWindowStateChanged|
+        typeWindowContentChanged|
+        typeViewFocused|
+        typeViewClicked|
+        typeViewTextChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="
+        flagReportViewIds|
+        flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:notificationTimeout="100"
+    android:description="@string/accessibility_service_description" />
