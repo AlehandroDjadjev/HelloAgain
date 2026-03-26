@@ -35,13 +35,13 @@ class AutomationEventChannel {
 
   /// Convenience filter: only [ScreenStateUpdated] events.
   static Stream<ScreenStateUpdated> get screenStateUpdates =>
-      events.whereType<ScreenStateUpdated>();
+      events.where((e) => e is ScreenStateUpdated).cast<ScreenStateUpdated>();
 
   /// Convenience filter: only [SensitiveScreenDetected] events.
   static Stream<SensitiveScreenDetected> get sensitiveScreens =>
-      events.whereType<SensitiveScreenDetected>();
+      events.where((e) => e is SensitiveScreenDetected).cast<SensitiveScreenDetected>();
 
   /// Convenience filter: only [ConfirmationRequested] events.
   static Stream<ConfirmationRequested> get confirmationRequests =>
-      events.whereType<ConfirmationRequested>();
+      events.where((e) => e is ConfirmationRequested).cast<ConfirmationRequested>();
 }

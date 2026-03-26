@@ -21,7 +21,7 @@ class DeviceControlChannel implements AndroidControlApi {
       final raw = await _channel
           .invokeMethod<Map<Object?, Object?>>('getPermissionStatus');
       return _castBoolMap(raw);
-    } on PlatformException catch (e) {
+    } on PlatformException {
       return {'accessibilityService': false, 'overlayPermission': false};
     }
   }
@@ -75,8 +75,8 @@ class DeviceControlChannel implements AndroidControlApi {
         return _emptyScreenState();
       }
       return ScreenState.fromMap(raw);
-    } on PlatformException catch (e) {
-      return _emptyScreenState(hash: 'error:${e.code}');
+    } on PlatformException {
+      return _emptyScreenState(hash: 'error:PlatformException');
     }
   }
 
