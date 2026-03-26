@@ -77,3 +77,27 @@ class ContactsImportSerializer(serializers.Serializer):
     source = serializers.CharField(required=False, allow_blank=True, max_length=32, default="manual")
     contacts = serializers.ListField(child=serializers.DictField(), allow_empty=True)
 
+
+class DiscoveryQuerySerializer(serializers.Serializer):
+    description = serializers.CharField(allow_blank=False)
+    limit = serializers.IntegerField(required=False, min_value=1, max_value=25, default=8)
+
+
+class RecommendationActivitySerializer(serializers.Serializer):
+    event_type = serializers.ChoiceField(
+        choices=[
+            "profile_viewed",
+            "recommendation_clicked",
+            "search_result_opened",
+            "call_tapped",
+            "email_tapped",
+        ]
+    )
+    target_user_id = serializers.IntegerField(required=False, min_value=1)
+    discovery_mode = serializers.ChoiceField(
+        choices=["for_you", "describe_someone", "search", "direct"],
+        required=False,
+        default="direct",
+    )
+    query_text = serializers.CharField(required=False, allow_blank=True)
+    metadata = serializers.DictField(required=False, default=dict)

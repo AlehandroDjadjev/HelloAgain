@@ -184,3 +184,53 @@ class ImportedContact(models.Model):
             fields.update({"normalized_phone_number", "normalized_email"})
             kwargs["update_fields"] = list(fields)
         super().save(*args, **kwargs)
+
+
+class RecommendationActivity(models.Model):
+    class EventType(models.TextChoices):
+        PROFILE_VIEWED = "profile_viewed", "Profile Viewed"
+        RECOMMENDATION_CLICKED = "recommendation_clicked", "Recommendation Clicked"
+        SEARCH_RESULT_OPENED = "search_result_opened", "Search Result Opened"
+        DESCRIPTION_QUERY_SUBMITTED = "description_query_submitted", "Description Query Submitted"
+        FRIEND_REQUEST_SENT = "friend_request_sent", "Friend Request Sent"
+        FRIEND_REQUEST_ACCEPTED = "friend_request_accepted", "Friend Request Accepted"
+        FRIEND_REQUEST_DECLINED = "friend_request_declined", "Friend Request Declined"
+        FRIEND_REQUEST_CANCELED = "friend_request_canceled", "Friend Request Canceled"
+        CONTACT_MATCH_HIT = "contact_match_hit", "Contact Match Hit"
+        CALL_TAPPED = "call_tapped", "Call Tapped"
+        EMAIL_TAPPED = "email_tapped", "Email Tapped"
+
+    class DiscoveryMode(models.TextChoices):
+        FOR_YOU = "for_you", "For You"
+        DESCRIBE_SOMEONE = "describe_someone", "Describe Someone"
+        SEARCH = "search", "Search"
+        DIRECT = "direct", "Direct"
+
+    actor_profile = models.ForeignKey(
+        AccountProfile,
+        on_delete=models.CASCADE,
+        related_name="recommendation_activities",
+    )
+    target_profile = models.ForeignKey(
+        AccountProfile,
+        on_delete=models.CASCADE,
+        related_name="targeted_recommendation_activities",
+        null=True,
+        blank=True,
+    )
+    event_type = models.CharField(max_length=48, choices=EventType.choices)
+    discovery_mode = models.CharField(
+        max_length=32,
+        choices=DiscoveryMode.choices,
+        default=DiscoveryMode.DIRECT,
+    )
+    query_text = models.TextField(blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+    signal_strength = models.FloatField(default=0.0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at", "-id"]
+
+    def __str__(self):
+        return f"{self.actor_profile} {self.event_type} {self.target_profile or ''}".strip()

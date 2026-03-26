@@ -14,6 +14,7 @@ urlpatterns = [
         name="accounts_onboarding_preview",
     ),
     path("discovery/", views.discovery_feed, name="accounts_discovery"),
+    path("discovery/query/", views.discovery_query, name="accounts_discovery_query"),
     path("search/", views.search_users, name="accounts_search"),
     path("friends/", views.friends_list, name="accounts_friends"),
     path("users/<int:user_id>/", views.user_detail, name="accounts_user_detail"),
@@ -29,4 +30,5 @@ urlpatterns = [
     ),
     path("contacts/", views.contacts_collection, name="accounts_contacts"),
     path("contacts/import/", views.import_contacts_view, name="accounts_contacts_import"),
+    path("activities/", views.activity_event_collection, name="accounts_activities"),
 ]
