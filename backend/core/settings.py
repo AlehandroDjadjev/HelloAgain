@@ -1,11 +1,11 @@
-"""
-Django settings for HelloAgain backend.
-"""
+"""Django settings for HelloAgain backend."""
+
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-# Load .env FIRST so all os.getenv() calls below work correctly
+# Load .env so os.environ values are available below.
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -21,10 +21,9 @@ SECRET_KEY = os.environ.get(
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("DJANGO_DEBUG", "True") == "True"
-
-ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if not DEBUG else ["*"]
-
-# Application definition
+ALLOWED_HOSTS = ["*"] if DEBUG else [
+    host for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if host
+]
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -39,6 +38,7 @@ INSTALLED_APPS = [
     # Platform
     'voice_gateway',
     'meetup',
+    "apps.accounts",
     # Agent apps
     'apps.agent_core',
     'apps.agent_sessions',
@@ -110,24 +110,26 @@ if os.environ.get("REDIS_URL"):
             "BACKEND": "django_redis.cache.RedisCache",
             "LOCATION": REDIS_URL,
             "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
         },
         "sessions": {
             "BACKEND": "django_redis.cache.RedisCache",
             "LOCATION": REDIS_URL,
             "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
         },
     }
 
-# ── Celery ────────────────────────────────────────────────────────────────────
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/1")
-CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+CELERY_RESULT_BACKEND = os.environ.get(
+    "CELERY_RESULT_BACKEND", "redis://localhost:6379/1"
+)
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
 CELERY_TASK_TRACK_STARTED = True
 
-# ── DRF ──────────────────────────────────────────────────────────────────────
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
     "DEFAULT_PARSER_CLASSES": ["rest_framework.parsers.JSONParser"],
@@ -155,7 +157,14 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# Logging
+CORS_ALLOW_ALL_ORIGINS = True
+
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "transformers")
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -165,5 +174,15 @@ LOGGING = {
     "handlers": {
         "console": {"class": "logging.StreamHandler", "formatter": "verbose"},
     },
-    "root": {"handlers": ["console"], "level": "INFO"},
+    "root": {
+        "handlers": ["console"],
+        "level": "INFO",
+    },
+    "loggers": {
+        "apps": {
+            "handlers": ["console"],
+            "level": "DEBUG" if DEBUG else "INFO",
+            "propagate": False,
+        },
+    },
 }
