@@ -20,4 +20,5 @@ from django.urls import path, include
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/meetup/', include('meetup.urls')),
+    path('api/voice-gateway/', include('voice_gateway.urls')),
 ]

@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://helloagain.app/schemas/screen_state",
+  "title": "ScreenState",
+  "description": "Structured snapshot of the Android screen emitted by AccessibilityService after every action. Must never contain raw screenshots. If is_sensitive = true, the executor must abort or pause immediately — no further actions are permitted.",
+  "type": "object",
+  "required": ["foreground_package", "screen_hash", "is_sensitive", "nodes", "captured_at"],
+  "properties": {
+    "foreground_package": {
+      "type": "string",
+      "description": "Package name of the foreground app, e.g. 'com.whatsapp'."
+    },
+    "window_title": {
+      "type": ["string", "null"],
+      "description": "Title of the active window or Activity label."
+    },
+    "screen_hash": {
+      "type": "string",
+      "description": "Deterministic hash of the accessibility node tree. Used for change detection and audit fingerprinting. Must be stable for identical visible trees."
+    },
+    "focused_element_ref": {
+      "type": ["string", "null"],
+      "description": "Ref of the currently focused accessibility node, if any."
+    },
+    "is_sensitive": {
+      "type": "boolean",
+      "description": "True when the screen contains sensitive content (password entry, OTP, payment, biometric). Forces immediate abort or manual takeover."
+    },
+    "nodes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/AccessibilityNode" },
+      "description": "Flat list of all accessibility nodes in the visible tree. Hierarchy is reconstructed via ref/children."
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 UTC timestamp of when this snapshot was taken."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "Bounds": {
+      "type": "object",
+      "required": ["left", "top", "right", "bottom"],
+      "properties": {
+        "left":   { "type": "integer" },
+        "top":    { "type": "integer" },
+        "right":  { "type": "integer" },
+        "bottom": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "AccessibilityNode": {
+      "type": "object",
+      "required": ["ref", "clickable", "enabled", "focused", "index_in_parent"],
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "Opaque node identifier, stable for the lifetime of this screen render."
+        },
+        "text": {
+          "type": ["string", "null"],
+          "description": "Visible text content."
+        },
+        "content_desc": {
+          "type": ["string", "null"],
+          "description": "Accessibility content description."
+        },
+        "view_id": {
+          "type": ["string", "null"],
+          "description": "Android resource ID."
+        },
+        "class_name": {
+          "type": ["string", "null"],
+          "description": "Fully qualified Android class name."
+        },
+        "bounds": {
+          "$ref": "#/$defs/Bounds"
+        },
+        "clickable": { "type": "boolean" },
+        "enabled":   { "type": "boolean" },
+        "focused":   { "type": "boolean" },
+        "index_in_parent": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "children": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Refs of direct child nodes.",
+          "default": []
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
