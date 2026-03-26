@@ -1,32 +1,57 @@
 import 'package:flutter/material.dart';
-import 'package:geolocator/geolocator.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:geolocator/geolocator.dart';
+
 import 'meetup_screen.dart';
 import 'weather_screen.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await dotenv.load(fileName: ".env");
-  runApp(const MyApp());
+  await dotenv.load(fileName: '.env');
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
+  runApp(const HelloAgainApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class HelloAgainApp extends StatelessWidget {
+  const HelloAgainApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'HelloAgain',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2563EB)),
-        useMaterial3: true,
-      ),
+      debugShowCheckedModeBanner: false,
+      theme: _buildTheme(Brightness.light),
+      darkTheme: _buildTheme(Brightness.dark),
+      themeMode: ThemeMode.system,
       home: const LocationPermissionScreen(),
+    );
+  }
+
+  static ThemeData _buildTheme(Brightness brightness) {
+    final isDark = brightness == Brightness.dark;
+    const seed = Color(0xFF3B82F6);
+
+    return ThemeData(
+      useMaterial3: true,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: seed,
+        brightness: brightness,
+      ),
+      scaffoldBackgroundColor:
+          isDark ? const Color(0xFF0F172A) : const Color(0xFFF8FAFC),
+      cardTheme: CardThemeData(
+        elevation: 0,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        color: isDark ? const Color(0xFF1E293B) : Colors.white,
+      ),
     );
   }
 }
 
-// ── Shell that holds the two main tabs ────────────────────────────────────
 class MainShell extends StatefulWidget {
   final Position userPosition;
   const MainShell({super.key, required this.userPosition});
@@ -55,7 +80,7 @@ class _MainShellState extends State<MainShell> {
       body: IndexedStack(index: _currentIndex, children: _pages),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
-        onDestinationSelected: (i) => setState(() => _currentIndex = i),
+        onDestinationSelected: (index) => setState(() => _currentIndex = index),
         backgroundColor: const Color(0xFF162040),
         indicatorColor: const Color(0xFF3B82F6).withValues(alpha: 0.25),
         labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
@@ -76,7 +101,6 @@ class _MainShellState extends State<MainShell> {
   }
 }
 
-// ── Location permission screen ─────────────────────────────────────────────
 class LocationPermissionScreen extends StatefulWidget {
   const LocationPermissionScreen({super.key});
 
@@ -96,11 +120,8 @@ class _LocationPermissionScreenState extends State<LocationPermissionScreen> {
 
   Future<void> _requestLocation() async {
     setState(() => _isLoading = true);
-    
-    bool serviceEnabled;
-    LocationPermission permission;
 
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       setState(() {
         _errorMessage = 'Услугите за местоположение са изключени.';
@@ -109,7 +130,7 @@ class _LocationPermissionScreenState extends State<LocationPermissionScreen> {
       return;
     }
 
-    permission = await Geolocator.checkPermission();
+    var permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) {
@@ -120,24 +141,26 @@ class _LocationPermissionScreenState extends State<LocationPermissionScreen> {
         return;
       }
     }
-    
+
     if (permission == LocationPermission.deniedForever) {
       setState(() {
-        _errorMessage = 'Достъпът е постоянно отказан. Моля, разрешете го от настройките.';
+        _errorMessage =
+            'Достъпът е постоянно отказан. Моля, разрешете го от настройките.';
         _isLoading = false;
       });
       return;
     }
 
-    Position position = await Geolocator.getCurrentPosition();
-    
-    if (mounted) {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (context) => MainShell(userPosition: position),
-        ),
-      );
+    final position = await Geolocator.getCurrentPosition();
+    if (!mounted) {
+      return;
     }
+
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (context) => MainShell(userPosition: position),
+      ),
+    );
   }
 
   @override
@@ -151,12 +174,14 @@ class _LocationPermissionScreenState extends State<LocationPermissionScreen> {
                 children: const [
                   CircularProgressIndicator(color: Color(0xFF3B82F6)),
                   SizedBox(height: 20),
-                  Text('Зареждане на местоположение…',
-                      style: TextStyle(color: Colors.white70, fontSize: 16)),
+                  Text(
+                    'Зареждане на местоположение...',
+                    style: TextStyle(color: Colors.white70, fontSize: 16),
+                  ),
                 ],
               )
             : Padding(
-                padding: const EdgeInsets.all(32.0),
+                padding: const EdgeInsets.all(32),
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
@@ -171,12 +196,20 @@ class _LocationPermissionScreenState extends State<LocationPermissionScreen> {
                     ElevatedButton.icon(
                       onPressed: _requestLocation,
                       icon: const Icon(Icons.refresh),
-                      label: const Text('Опитай отново', style: TextStyle(fontSize: 18)),
+                      label: const Text(
+                        'Опитай отново',
+                        style: TextStyle(fontSize: 18),
+                      ),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF3B82F6),
                         foregroundColor: Colors.white,
-                        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 32,
+                          vertical: 14,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
                       ),
                     ),
                   ],

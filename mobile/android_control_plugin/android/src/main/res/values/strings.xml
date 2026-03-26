@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_label">HelloAgain Automation</string>
+    <string name="accessibility_service_description">
+        Allows HelloAgain to read the screen and perform actions inside supported apps
+        when you initiate an automation request. Active sessions are always visible
+        via a persistent notification. You can stop any session at any time.
+    </string>
+    <string name="foreground_notification_title">Automation Active</string>
+    <string name="foreground_notification_text">HelloAgain is running a task. Tap to view or stop.</string>
+    <string name="foreground_channel_id">helloagain_automation</string>
+    <string name="foreground_channel_name">Automation Sessions</string>
+</resources>

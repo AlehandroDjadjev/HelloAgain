@@ -353,39 +353,53 @@ class _WeatherScreenState extends State<WeatherScreen> {
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: Colors.white.withValues(alpha: 0.06), width: 1),
       ),
-      child: ListTile(
-        contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-        leading: Container(
-          width: 48, height: 48,
-          decoration: BoxDecoration(
-            color: _weatherColor(day.weatherCode).withValues(alpha: 0.15),
-            shape: BoxShape.circle,
-          ),
-          child: Icon(_weatherIcon(day.weatherCode), color: _weatherColor(day.weatherCode), size: 26),
-        ),
-        title: Row(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+        child: Row(
           children: [
-            Text(
-              _dayName(day.date),
-              style: const TextStyle(color: _kText, fontWeight: FontWeight.w700, fontSize: 18),
+            Container(
+              width: 48, height: 48,
+              decoration: BoxDecoration(
+                color: _weatherColor(day.weatherCode).withValues(alpha: 0.15),
+                shape: BoxShape.circle,
+              ),
+              child: Icon(_weatherIcon(day.weatherCode), color: _weatherColor(day.weatherCode), size: 26),
             ),
-            const SizedBox(width: 8),
-            Text(
-              _dateLabel(day.date),
-              style: const TextStyle(color: _kSubtext, fontSize: 12),
+            const SizedBox(width: 16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Text(
+                        _dayName(day.date),
+                        style: const TextStyle(color: _kText, fontWeight: FontWeight.w700, fontSize: 18),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _dateLabel(day.date),
+                        style: const TextStyle(color: _kSubtext, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(_weatherLabel(day.weatherCode),
+                      style: const TextStyle(color: _kSubtext, fontSize: 14)),
+                ],
+              ),
             ),
-          ],
-        ),
-        subtitle: Text(_weatherLabel(day.weatherCode),
-            style: const TextStyle(color: _kSubtext, fontSize: 14)),
-        trailing: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            Text('${day.maxTemp.round()}°',
-                style: const TextStyle(color: _kText, fontWeight: FontWeight.w800, fontSize: 22)),
-            Text('${day.minTemp.round()}°',
-                style: const TextStyle(color: _kSubtext, fontSize: 15)),
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text('${day.maxTemp.round()}°',
+                    style: const TextStyle(color: _kText, fontWeight: FontWeight.w800, fontSize: 22)),
+                Text('${day.minTemp.round()}°',
+                    style: const TextStyle(color: _kSubtext, fontSize: 15)),
+              ],
+            ),
           ],
         ),
       ),
