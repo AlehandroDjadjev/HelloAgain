@@ -12,14 +12,12 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.environ.get(
-    "DJANGO_SECRET_KEY",
-    "django-insecure-*@dfj01=#wsdypza-k!r2s+wtq3w6al!$(=!zb2waoxv_nm-=f",
-)
 
-DEBUG = os.environ.get("DJANGO_DEBUG", "True") == "True"
+# Quick-start development settings - unsuitable for production
+# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
-ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if not DEBUG else ["*"]
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = 'django-insecure-*@dfj01=#wsdypza-k!r2s+wtq3w6al!$(=!zb2waoxv_nm-=f'
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -36,34 +34,6 @@ ALLOWED_HOSTS = _default_allowed_hosts + _extra_allowed_hosts
 # Application definition
 
 INSTALLED_APPS = [
-    "django.contrib.admin",
-    "django.contrib.auth",
-    "django.contrib.contenttypes",
-    "django.contrib.sessions",
-    "django.contrib.messages",
-    "django.contrib.staticfiles",
-    # Third-party
-    "rest_framework",
-    # Platform
-    "voice_gateway",
-    # Agent apps
-    "apps.agent_core",
-    "apps.agent_sessions",
-    "apps.agent_plans",
-    "apps.agent_policy",
-    "apps.agent_executors",
-    "apps.device_bridge",
-    "apps.audit_log",
-]
-
-MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -79,9 +49,9 @@ MIDDLEWARE = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'core.middleware.ApiJsonErrorsMiddleware',
     'corsheaders.middleware.CorsMiddleware',          # must be before CommonMiddleware
-    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
