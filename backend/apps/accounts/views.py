@@ -517,7 +517,7 @@ def friend_requests_collection(request):
                 "from_profile__elder_profile",
                 "to_profile__user",
                 "to_profile__elder_profile",
-            ).filter(to_profile=viewer)
+            ).filter(to_profile=viewer, status=FriendRequest.Status.PENDING)
         ]
         outgoing = [
             _serialize_friend_request(item, viewer=viewer, matched_contact_ids=matched_contact_ids)
@@ -526,7 +526,7 @@ def friend_requests_collection(request):
                 "from_profile__elder_profile",
                 "to_profile__user",
                 "to_profile__elder_profile",
-            ).filter(from_profile=viewer)
+            ).filter(from_profile=viewer, status=FriendRequest.Status.PENDING)
         ]
         return _json_ok({"incoming": incoming, "outgoing": outgoing})
 

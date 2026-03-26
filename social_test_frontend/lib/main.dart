@@ -1050,19 +1050,21 @@ class _RequestsTabState extends State<RequestsTab> {
                   child: RequestCard(
                     row: row,
                     onTap: () => widget.onOpenProfile(row.counterparty),
-                    trailing: Wrap(
-                      spacing: 8,
-                      children: [
-                        FilledButton(
-                          onPressed: () => _respond(row, 'accept'),
-                          child: const Text('Accept'),
-                        ),
-                        OutlinedButton(
-                          onPressed: () => _respond(row, 'decline'),
-                          child: const Text('Decline'),
-                        ),
-                      ],
-                    ),
+                    trailing: row.status == 'pending'
+                        ? Wrap(
+                            spacing: 8,
+                            children: [
+                              FilledButton(
+                                onPressed: () => _respond(row, 'accept'),
+                                child: const Text('Accept'),
+                              ),
+                              OutlinedButton(
+                                onPressed: () => _respond(row, 'decline'),
+                                child: const Text('Decline'),
+                              ),
+                            ],
+                          )
+                        : StatusChip(label: row.status),
                   ),
                 ),
               ),

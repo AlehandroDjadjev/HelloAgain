@@ -48,7 +48,18 @@ class _MeetupScreenState extends State<MeetupScreen> {
   final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
 
   String _backendBaseUrl() {
-    return dotenv.get('API_BASE_URL', fallback: 'http://localhost:8000');
+    final configured = dotenv.env['API_BASE_URL']?.trim();
+    if (configured != null && configured.isNotEmpty) {
+      return configured;
+    }
+
+    if (kIsWeb) {
+      return 'http://localhost:8000';
+    }
+
+    return defaultTargetPlatform == TargetPlatform.android
+        ? 'http://10.0.2.2:8000'
+        : 'http://localhost:8000';
   }
 
   @override
@@ -114,14 +125,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
 
   void _updateMarkers() {
     _markers.clear();
-    
-    // User Location Marker
-    _markers.add(Marker(
-      markerId: const MarkerId('user_location'),
-      position: LatLng(widget.userPosition.latitude, widget.userPosition.longitude),
-      icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
-      infoWindow: const InfoWindow(title: 'Моето Местоположение'),
-    ));
 
     if (bestMatch != null) {
       _markers.add(Marker(
@@ -223,8 +226,8 @@ class _MeetupScreenState extends State<MeetupScreen> {
             child: GoogleMap(
               initialCameraPosition: CameraPosition(target: initialPos, zoom: 14.0),
               markers: _markers,
-              myLocationButtonEnabled: true,
-              myLocationEnabled: true,
+              myLocationButtonEnabled: false,
+              myLocationEnabled: false,
               zoomControlsEnabled: false,
               mapToolbarEnabled: false,
               style: _kMapStyle,

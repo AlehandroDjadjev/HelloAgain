@@ -43,7 +43,7 @@ Color _weatherColor(int code) {
   if (code <= 49) return const Color(0xFF90A4AE);
   if (code <= 69) return const Color(0xFF64B5F6);
   if (code <= 79) return const Color(0xFFCFD8DC);
-  return const Color(0xFFEF5350);
+  return const Color(0xFF5C6BC0);
 }
 
 // ── Elderly-friendly daily tip ─────────────────────────────────────────────
@@ -63,14 +63,12 @@ class DayForecast {
   final double maxTemp;
   final double minTemp;
   final int weatherCode;
-  final double precipitation;
 
   DayForecast({
     required this.date,
     required this.maxTemp,
     required this.minTemp,
     required this.weatherCode,
-    required this.precipitation,
   });
 }
 
@@ -85,6 +83,7 @@ class WeatherScreen extends StatefulWidget {
 
 class _WeatherScreenState extends State<WeatherScreen> {
   List<DayForecast> _forecast = [];
+  double? _currentTemp;
   bool _loading = true;
   String? _error;
 
@@ -102,7 +101,9 @@ class _WeatherScreenState extends State<WeatherScreen> {
       final url = Uri.parse(
         'https://api.open-meteo.com/v1/forecast'
         '?latitude=$lat&longitude=$lng'
-        '&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum'
+        '&daily=weathercode,temperature_2m_max,temperature_2m_min'
+        '&current=temperature_2m'
+        '&current_weather=true'
         '&timezone=auto'
         '&forecast_days=7',
       );
@@ -114,7 +115,18 @@ class _WeatherScreenState extends State<WeatherScreen> {
         final maxTemps = List<double>.from(daily['temperature_2m_max'].map((v) => v?.toDouble() ?? 0.0));
         final minTemps = List<double>.from(daily['temperature_2m_min'].map((v) => v?.toDouble() ?? 0.0));
         final codes = List<int>.from(daily['weathercode'].map((v) => (v ?? 0).toInt()));
-        final precip = List<double>.from(daily['precipitation_sum'].map((v) => v?.toDouble() ?? 0.0));
+
+        double? currentTemp;
+        final current = data['current'];
+        if (current is Map<String, dynamic> && current['temperature_2m'] != null) {
+          currentTemp = (current['temperature_2m'] as num).toDouble();
+        }
+        if (currentTemp == null) {
+          final currentWeather = data['current_weather'];
+          if (currentWeather is Map<String, dynamic> && currentWeather['temperature'] != null) {
+            currentTemp = (currentWeather['temperature'] as num).toDouble();
+          }
+        }
 
         setState(() {
           _forecast = List.generate(dates.length, (i) => DayForecast(
@@ -122,8 +134,8 @@ class _WeatherScreenState extends State<WeatherScreen> {
             maxTemp: maxTemps[i],
             minTemp: minTemps[i],
             weatherCode: codes[i],
-            precipitation: precip[i],
           ));
+          _currentTemp = currentTemp;
           _loading = false;
         });
       } else {
@@ -229,6 +241,7 @@ class _WeatherScreenState extends State<WeatherScreen> {
 
   Widget _buildHero(DayForecast? today) {
     if (today == null) return const SizedBox();
+    final currentDisplay = _currentTemp ?? today.maxTemp;
     return Container(
       margin: const EdgeInsets.fromLTRB(16, 16, 16, 10),
       padding: const EdgeInsets.all(22),
@@ -276,8 +289,16 @@ class _WeatherScreenState extends State<WeatherScreen> {
                     style: const TextStyle(color: _kSubtext, fontSize: 13),
                   ),
                   const SizedBox(height: 2),
-                  Text('${today.maxTemp.round()}°C',
+                  Text('Сега ${currentDisplay.round()}°C',
                       style: const TextStyle(color: _kText, fontSize: 60, fontWeight: FontWeight.w800, height: 1)),
+                  Text(
+                    'Макс: ${today.maxTemp.round()}°C',
+                    style: const TextStyle(color: _kSubtext, fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
+                  Text(
+                    'Мин: ${today.minTemp.round()}°C',
+                    style: const TextStyle(color: _kSubtext, fontSize: 16, fontWeight: FontWeight.w700),
+                  ),
                   Text(_weatherLabel(today.weatherCode),
                       style: const TextStyle(color: _kText, fontSize: 18, fontWeight: FontWeight.w500)),
                 ]),
@@ -296,41 +317,6 @@ class _WeatherScreenState extends State<WeatherScreen> {
               _dailyTip(today.weatherCode, today.maxTemp),
               style: const TextStyle(color: _kText, fontSize: 15, height: 1.4),
             ),
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(child: _statCard('Мин', '${today.minTemp.round()}°', Icons.thermostat)),
-              const SizedBox(width: 10),
-              Expanded(child: _statCard('Валеж', '${today.precipitation.round()} мм', Icons.water_drop)),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _statCard(String title, String value, IconData icon) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.12),
-        borderRadius: BorderRadius.circular(14),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 16, color: _kSubtext),
-          const SizedBox(height: 6),
-          Text(
-            title,
-            style: const TextStyle(color: _kSubtext, fontSize: 11, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            value,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: _kText, fontSize: 12, fontWeight: FontWeight.w700),
           ),
         ],
       ),
