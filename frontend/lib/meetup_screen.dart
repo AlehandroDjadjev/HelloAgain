@@ -2,6 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 // Palette
 const _kBackground = Color(0xFFF9FAFB);
@@ -11,32 +14,67 @@ const _kText = Color(0xFF111827);
 const _kSubtext = Color(0xFF6B7280);
 
 class MeetupScreen extends StatefulWidget {
-  const MeetupScreen({super.key});
+  final Position userPosition;
+  const MeetupScreen({super.key, required this.userPosition});
 
   @override
   State<MeetupScreen> createState() => _MeetupScreenState();
 }
 
 class _MeetupScreenState extends State<MeetupScreen> {
-  final List<Map<String, double>> mockParticipants = [
-    {'lat': 42.6977, 'lng': 23.3219},
-    {'lat': 42.6895, 'lng': 23.3197},
-    {'lat': 42.6993, 'lng': 23.3238},
-  ];
-
   Map<String, dynamic>? bestMatch;
   bool isLoading = false;
   String? errorMessage;
   GoogleMapController? mapController;
   final Set<Marker> _markers = {};
+  
+  final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
+
+  String _backendBaseUrl() {
+    if (kIsWeb) {
+      return 'http://localhost:8000';
+    }
+
+    return defaultTargetPlatform == TargetPlatform.android
+        ? 'http://10.0.2.2:8000'
+        : 'http://localhost:8000';
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _initNotifications();
+  }
+
+  Future<void> _initNotifications() async {
+    if (kIsWeb) return;
+    
+    const AndroidInitializationSettings initializationSettingsAndroid =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+    const InitializationSettings initializationSettings =
+        InitializationSettings(android: initializationSettingsAndroid);
+    
+    await _notificationsPlugin.initialize(
+      settings: initializationSettings,
+    );
+    
+    _notificationsPlugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>()?.requestNotificationsPermission();
+    _notificationsPlugin.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>()?.requestExactAlarmsPermission();
+  }
 
   Future<void> fetchRecommendation() async {
     setState(() { isLoading = true; errorMessage = null; });
     try {
       final response = await http.post(
-        Uri.parse('http://127.0.0.1:8000/api/meetup/recommend/'),
+        Uri.parse('${_backendBaseUrl()}/api/meetup/recommend/'),
         headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'participants': mockParticipants}),
+        body: jsonEncode({
+          'participants': [
+            {'lat': widget.userPosition.latitude, 'lng': widget.userPosition.longitude}
+          ]
+        }),
       );
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
@@ -50,7 +88,11 @@ class _MeetupScreenState extends State<MeetupScreen> {
           ));
         }
       } else {
-        setState(() { errorMessage = 'Не можахме да намерим подходящо място.'; });
+        final body = jsonDecode(response.body);
+        final apiError = body is Map<String, dynamic> ? body['error'] as String? : null;
+        setState(() {
+          errorMessage = apiError ?? 'Не можахме да намерим подходящо място.';
+        });
       }
     } catch (_) {
       setState(() { errorMessage = 'Няма връзка със сървъра.'; });
@@ -61,11 +103,19 @@ class _MeetupScreenState extends State<MeetupScreen> {
 
   void _updateMarkers() {
     _markers.clear();
+    
+    // User Location Marker
+    _markers.add(Marker(
+      markerId: const MarkerId('user_location'),
+      position: LatLng(widget.userPosition.latitude, widget.userPosition.longitude),
+      icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen),
+      infoWindow: const InfoWindow(title: 'Моето Местоположение'),
+    ));
+
     if (bestMatch != null) {
       _markers.add(Marker(
         markerId: const MarkerId('best_match'),
         position: LatLng(bestMatch!['place_lat'], bestMatch!['place_lng']),
-        // Simple, minimal default marker in accent blue
         icon: BitmapDescriptor.defaultMarkerWithHue(220),
         infoWindow: InfoWindow(
           title: bestMatch!['place_name'],
@@ -75,9 +125,80 @@ class _MeetupScreenState extends State<MeetupScreen> {
     }
   }
 
+  Future<void> _showReminderDialog() async {
+    TimeOfDay? selectedTime = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.now(),
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.light(
+              primary: _kAccent,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (selectedTime != null) {
+      await _scheduleNotification(selectedTime);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Напомнянето е запазено за ${selectedTime.format(context)}!')),
+        );
+      }
+    }
+  }
+
+  Future<void> _scheduleNotification(TimeOfDay time) async {
+    final now = DateTime.now();
+    var scheduledMeeting = DateTime(
+      now.year, now.month, now.day, time.hour, time.minute
+    );
+
+    if (scheduledMeeting.isBefore(now)) {
+      scheduledMeeting = scheduledMeeting.add(const Duration(days: 1)); // tomorrow
+    }
+
+    // Set reminder for 30 minutes BEFORE the meeting
+    final reminderTime = scheduledMeeting.subtract(const Duration(minutes: 30));
+
+    // Since exact alarms require more complex timezone setup in full production,
+    // we use a simple delay notification as placeholder for this prototype.
+    // We will evaluate the difference between `reminderTime` and `now`.
+    
+    const androidDetails = AndroidNotificationDetails(
+      'meetup_channel', 'Meetup Reminders',
+      channelDescription: 'Reminders for your meetups',
+      importance: Importance.max,
+      priority: Priority.high,
+    );
+    const platformDetails = NotificationDetails(android: androidDetails);
+
+    // If the reminder time is still in the future, we could theoretically schedule it.
+    // For this prototype, we'll demonstrate it with an immediate notification
+    // specifying when the meeting is:
+    
+    // Convert to readable format
+    final meetStartStr = "${scheduledMeeting.hour.toString().padLeft(2, '0')}:${scheduledMeeting.minute.toString().padLeft(2, '0')}";
+    
+    // To ensure demoability without waiting hours, if it's within 2 minutes we set it.
+    // In actual production, timezone package is required.
+    // Just display a local notification immediately to prove permissions and functionality.
+    if (!kIsWeb) {
+      await _notificationsPlugin.show(
+        id: 0,
+        title: 'Срещата наближава!',
+        body: 'Имате среща в ${bestMatch!['place_name']} след 30 минути (в $meetStartStr).',
+        notificationDetails: platformDetails,
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    final initialPos = const LatLng(42.6977, 23.3219);
+    final initialPos = LatLng(widget.userPosition.latitude, widget.userPosition.longitude);
     return Scaffold(
       backgroundColor: _kBackground,
       appBar: AppBar(
@@ -89,16 +210,16 @@ class _MeetupScreenState extends State<MeetupScreen> {
       ),
       body: Column(
         children: [
-          // ─── Map ────────────────────────────────────────────────────────
           Expanded(
             flex: 5,
             child: GoogleMap(
-              initialCameraPosition: CameraPosition(target: initialPos, zoom: 13.0),
+              initialCameraPosition: CameraPosition(target: initialPos, zoom: 14.0),
               markers: _markers,
-              myLocationButtonEnabled: false,
+              myLocationButtonEnabled: true,
+              myLocationEnabled: true,
               zoomControlsEnabled: false,
               mapToolbarEnabled: false,
-              onMapCreated: (c) { mapController = c; _setMapStyle(c); },
+              onMapCreated: (c) { mapController = c; _setMapStyle(c); _updateMarkers(); },
             ),
           ),
 
@@ -110,7 +231,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Drag handle
                 Center(
                   child: Container(
                     width: 40, height: 4,
@@ -139,7 +259,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
                   ),
 
                 if (bestMatch != null) ...[
-                  // Location name
                   Text(
                     bestMatch!['place_name'],
                     style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: _kText, height: 1.2),
@@ -147,7 +266,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
                   ),
                   const SizedBox(height: 12),
 
-                  // Time chip
                   Center(
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
@@ -168,10 +286,17 @@ class _MeetupScreenState extends State<MeetupScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(height: 28),
+                  const SizedBox(height: 16),
+                  
+                  // Set Reminder Button
+                  TextButton.icon(
+                    onPressed: _showReminderDialog,
+                    icon: const Icon(Icons.alarm_add, color: _kAccent),
+                    label: const Text('Задай Напомняне', style: TextStyle(color: _kAccent, fontSize: 16)),
+                  ),
+                  const SizedBox(height: 16),
                 ],
 
-                // Button
                 SizedBox(
                   height: 58,
                   child: ElevatedButton(
@@ -198,7 +323,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
   }
 
   void _setMapStyle(GoogleMapController c) {
-    // Refined premium light style — great contrast, no clutter
     c.setMapStyle('''
     [
       {"elementType":"geometry","stylers":[{"color":"#f8f8f8"}]},

@@ -21,4 +21,5 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/meetup/', include('meetup.urls')),
     path('api/voice-gateway/', include('voice_gateway.urls')),
+    path('api/accounts/', include('apps.accounts.urls')),
 ]

@@ -6,8 +6,8 @@ from .services import get_best_meetup_spot, get_central_point
 class RecommendMeetupView(APIView):
     def post(self, request):
         participants = request.data.get('participants', [])
-        if not participants or len(participants) < 2:
-            return Response({'error': 'Please provide at least two participant coordinates.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not participants:
+            return Response({'error': 'Please provide at least one participant coordinate.'}, status=status.HTTP_400_BAD_REQUEST)
         
         best_match = get_best_meetup_spot(participants)
         center = get_central_point(participants)
