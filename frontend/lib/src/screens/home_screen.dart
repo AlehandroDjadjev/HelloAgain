@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart' show AsyncCallback;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 import '../api/agent_client.dart';
 import '../pipeline/orchestrator.dart';
@@ -29,7 +30,8 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     _commandCtrl =
         TextEditingController(text: 'Send hello to Alex on WhatsApp');
-    _urlCtrl = TextEditingController(text: 'http://10.0.2.2:8000');
+    _urlCtrl = TextEditingController(
+        text: dotenv.get('API_BASE_URL', fallback: 'http://10.0.2.2:8000'));
     _orch = PipelineOrchestrator(
       client: AgentClient(baseUrl: _urlCtrl.text),
     );
