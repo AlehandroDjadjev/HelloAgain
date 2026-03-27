@@ -4,11 +4,7 @@ import json
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from voice_gateway.domain.contracts import (
-    BackendSpeakRequest,
-    VoiceConversationRequest,
-    VoiceGatewayRequest,
-)
+from voice_gateway.domain.contracts import VoiceConversationRequest
 from voice_gateway.services.gateway import gateway_core
 from voice_gateway.services.providers import ProviderNotReadyError
 
@@ -54,67 +50,6 @@ def conversation_view(request):
 
         response = gateway_core.process_turn(voice_request, audio_bytes=audio_bytes)
         return JsonResponse(response.to_api_dict())
-    except ProviderNotReadyError as exc:
-        return _provider_error_response(exc)
-    except ValueError as exc:
-        return JsonResponse({"error": str(exc)}, status=400)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON payload."}, status=400)
-    except Exception as exc:
-        return JsonResponse({"error": str(exc)}, status=500)
-
-
-@csrf_exempt
-def interact_view(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "Method not allowed"}, status=405)
-
-    try:
-        data, _ = _parse_request_payload(request)
-        gateway_request = VoiceGatewayRequest(
-            user_id=data.get("user_id", "anonymous"),
-            session_id=data.get("session_id", "default_session"),
-            message=data.get("message", ""),
-        )
-        response = gateway_core.process_user_request(gateway_request)
-        return JsonResponse(
-            {
-                "status": response.status,
-                "spoken_text": response.spoken_text,
-                "structured_data": response.structured_data,
-            }
-        )
-    except ProviderNotReadyError as exc:
-        return _provider_error_response(exc)
-    except ValueError as exc:
-        return JsonResponse({"error": str(exc)}, status=400)
-    except json.JSONDecodeError:
-        return JsonResponse({"error": "Invalid JSON payload."}, status=400)
-    except Exception as exc:
-        return JsonResponse({"error": str(exc)}, status=500)
-
-
-@csrf_exempt
-def agent_speak_view(request):
-    if request.method != "POST":
-        return JsonResponse({"error": "Method not allowed"}, status=405)
-
-    try:
-        data, _ = _parse_request_payload(request)
-        speak_request = BackendSpeakRequest(
-            user_id=data.get("user_id", "anonymous"),
-            session_id=data.get("session_id", "default_session"),
-            agent_name=data.get("agent_name", "UnknownAgent"),
-            raw_data=data.get("raw_data", {}) or {"text": data.get("text", "")},
-        )
-        response = gateway_core.process_agent_request(speak_request)
-        return JsonResponse(
-            {
-                "status": response.status,
-                "spoken_text": response.spoken_text,
-                "structured_data": response.structured_data,
-            }
-        )
     except ProviderNotReadyError as exc:
         return _provider_error_response(exc)
     except ValueError as exc:
