@@ -2,7 +2,12 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 String resolveBackendBaseUrl() {
-  final configured = dotenv.env['API_BASE_URL']?.trim();
+  String? configured;
+  try {
+    configured = dotenv.env['API_BASE_URL']?.trim();
+  } catch (_) {
+    configured = null;
+  }
   if (configured != null && configured.isNotEmpty) {
     return configured;
   }

@@ -10,7 +10,6 @@ import '../api/voice_gateway_client.dart';
 import '../config/backend_base_url.dart';
 import '../pipeline/orchestrator.dart';
 import '../pipeline/pipeline_state.dart';
-import '../theme/app_theme.dart';
 import '../voice/agent_voice_controller.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -764,7 +763,7 @@ class _HomeScreenState extends State<HomeScreen> {
                               child: TextField(
                                 controller: _urlCtrl,
                                 style: const TextStyle(
-                                  fontFamily: kAppFontFamily,
+                                  fontFamily: 'monospace',
                                   fontSize: 13,
                                 ),
                                 decoration: InputDecoration(
@@ -1625,7 +1624,7 @@ class _LogView extends StatelessWidget {
             child: RichText(
               text: TextSpan(
                 style: const TextStyle(
-                  fontFamily: kAppFontFamily,
+                  fontFamily: 'monospace',
                   fontSize: 12,
                   height: 1.5,
                 ),
