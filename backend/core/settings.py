@@ -25,7 +25,6 @@ ALLOWED_HOSTS = ["*"] if DEBUG else [
     host for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if host
 ]
 
-<<<<<<< HEAD
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -34,7 +33,8 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-=======
+]
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -59,7 +59,6 @@ INSTALLED_APPS = [
     'apps.audit_log',
     # GAT Engine
     'recommendations',
->>>>>>> 7cd63273acbbe5f49af277b2dc0cd80f351ff394
 ]
 
 MIDDLEWARE = [
@@ -171,7 +170,6 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-<<<<<<< HEAD
 # ── LLM configuration ─────────────────────────────────────────────────────────
 #
 # Default provider: transformers (Qwen/Qwen3-14B loaded locally).
@@ -223,7 +221,6 @@ LLM_TOKEN_BUDGET_RESPONSE      = int(os.environ.get("LLM_TOKEN_BUDGET_RESPONSE",
 LLM_MAX_CONTEXT                = int(os.environ.get("LLM_MAX_CONTEXT", "12000"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-=======
 CORS_ALLOW_ALL_ORIGINS = True
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "transformers")
@@ -231,7 +228,6 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
->>>>>>> 7cd63273acbbe5f49af277b2dc0cd80f351ff394
 
 LOGGING = {
     "version": 1,
