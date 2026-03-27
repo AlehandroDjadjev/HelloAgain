@@ -1,6 +1,10 @@
 from recommendations.gat.feature_schema import get_default_feature_vector, get_feature_details, get_feature_groups
 from recommendations.gat.feature_schema import get_feature_names
+import logging
 import math
+
+
+logger = logging.getLogger(__name__)
 
 
 # Per-feature importance weights for matching.
@@ -466,6 +470,51 @@ def _friendship_summary(
     )
 
 
+def _semantic_intent_alignment(
+    left_intents: list[dict] | None,
+    right_intents: list[dict] | None,
+) -> tuple[float, int, int, int, list[str]]:
+    left_intents = left_intents or []
+    right_intents = right_intents or []
+    if not left_intents or not right_intents:
+        return 0.5, 0, 0, 0, []
+
+    left_map: dict[str, float] = {}
+    right_map: dict[str, float] = {}
+    for item in left_intents:
+        obj = str(item.get("object", "")).strip().lower()
+        if not obj:
+            continue
+        left_map[obj] = float(item.get("polarity", 0.0))
+    for item in right_intents:
+        obj = str(item.get("object", "")).strip().lower()
+        if not obj:
+            continue
+        right_map[obj] = float(item.get("polarity", 0.0))
+
+    overlap = sorted(set(left_map.keys()) & set(right_map.keys()))
+    if not overlap:
+        return 0.5, 0, 0, 0, []
+
+    aligned = 0
+    contradictions = 0
+    for obj in overlap:
+        l = left_map[obj]
+        r = right_map[obj]
+        if abs(l) < 0.5 or abs(r) < 0.5:
+            continue
+        if l * r < 0:
+            contradictions += 1
+        else:
+            aligned += 1
+
+    compared = max(1, aligned + contradictions)
+    base = aligned / compared
+    contradiction_ratio = contradictions / compared
+    adjusted = _bounded(base - (0.75 * contradiction_ratio))
+    return adjusted, contradictions, aligned, len(overlap), overlap
+
+
 def compare_people(
     left: dict[str, float],
     right: dict[str, float],
@@ -475,6 +524,8 @@ def compare_people(
     graph_score: float = 0.3,
     embedding_score: float = 0.3,
     features: list[str] | None = None,
+    left_intents: list[dict] | None = None,
+    right_intents: list[dict] | None = None,
 ) -> dict:
     selected_features = _selected_features(features)
     groups = get_feature_groups()
@@ -531,7 +582,24 @@ def compare_people(
         confidence_b=right_confidence,
     )
 
-    overall = (0.5 * topic_similarity) + (0.35 * preference_similarity) + (0.15 * behavior_similarity)
+    intent_similarity, intent_contradictions, intent_aligned, intent_overlap_count, intent_overlap_items = _semantic_intent_alignment(
+        left_intents,
+        right_intents,
+    )
+
+    overall = (0.42 * topic_similarity) + (0.28 * preference_similarity) + (0.15 * behavior_similarity) + (0.15 * intent_similarity)
+    semantic_polarity_factor = 1.0
+    if intent_overlap_count > 0 and intent_contradictions > 0:
+        intent_contradiction_ratio = intent_contradictions / max(1, intent_overlap_count)
+        semantic_polarity_factor = max(0.15, 1.0 - (0.90 * intent_contradiction_ratio))
+        overall *= semantic_polarity_factor
+
+    # Hard guard rails for explicit opposite preference statements.
+    if intent_overlap_count > 0 and intent_contradictions > 0 and intent_aligned == 0:
+        overall = min(overall, 0.28)
+    elif intent_overlap_count > 0 and intent_contradictions == 0 and intent_aligned >= 1:
+        overall = max(overall, 0.72)
+
     contradiction_penalty_factor = 1.0
     if contradiction_count > 0:
         if shared_polarity_topics > 0 and contradiction_count >= shared_polarity_topics:
@@ -610,6 +678,11 @@ def compare_people(
         "topic_similarity": round(topic_similarity, 4),
         "preference_similarity": round(preference_similarity, 4),
         "behavior_similarity": round(behavior_similarity, 4),
+        "intent_similarity": round(intent_similarity, 4),
+        "intent_overlap_count": intent_overlap_count,
+        "intent_overlap_items": intent_overlap_items,
+        "intent_contradictions": intent_contradictions,
+        "semantic_polarity_factor": round(semantic_polarity_factor, 4),
         "contradiction_count": contradiction_count,
         "shared_polarity_topics": shared_polarity_topics,
         "contradiction_penalty_factor": round(contradiction_penalty_factor, 4),
@@ -624,6 +697,17 @@ def compare_people(
         "aligned_feature_count": aligned_feature_count,
         "distinctive_aligned_feature_count": distinctive_aligned_feature_count,
     }
+
+    logger.info(
+        "compatibility.semantic_debug intent_similarity=%.3f intent_contradictions=%s intent_overlap=%s raw_topic=%.3f raw_pref=%.3f final=%.3f",
+        intent_similarity,
+        intent_contradictions,
+        intent_overlap_items,
+        topic_similarity,
+        preference_similarity,
+        breakdown["overall"],
+    )
+
     return {
         "compatibility_score": breakdown["overall"],
         "score_breakdown": breakdown,

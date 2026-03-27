@@ -794,6 +794,8 @@ class SessionController extends ChangeNotifier {
       }
     } on ApiException {
       await _clearSession(notifyListenersAfter: false);
+    } on Exception {
+      // Keep startup resilient when the backend is temporarily unreachable.
     } finally {
       isBootstrapping = false;
       notifyListeners();

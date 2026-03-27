@@ -17,7 +17,7 @@ from apps.accounts.services import (
 )
 
 from .models import MeetupInvite
-from .services import get_best_meetup_spot, get_central_point
+from .services import get_best_meetup_spot, get_central_point, get_ranked_meetup_spots
 
 
 def _json_ok(data: dict, status_code: int = 200) -> JsonResponse:
@@ -90,8 +90,57 @@ class RecommendMeetupView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        participant_descriptions = request.data.get('participant_descriptions')
+        if participant_descriptions is not None and not isinstance(participant_descriptions, list):
+            return Response(
+                {
+                    'status': 'error',
+                    'message': 'Invalid request payload.',
+                    'error': 'participant_descriptions must be a list of strings when provided.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        participant_vectors = request.data.get('participant_vectors')
+        if participant_vectors is not None and not isinstance(participant_vectors, list):
+            return Response(
+                {
+                    'status': 'error',
+                    'message': 'Invalid request payload.',
+                    'error': 'participant_vectors must be a list of objects when provided.',
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        preferred_time = None
+        preferred_time_raw = str(request.data.get('preferred_time') or '').strip()
+        if preferred_time_raw:
+            try:
+                preferred_time = datetime.fromisoformat(preferred_time_raw)
+                if preferred_time.tzinfo is None:
+                    preferred_time = timezone.make_aware(preferred_time, timezone.get_current_timezone())
+            except ValueError:
+                return Response(
+                    {
+                        'status': 'error',
+                        'message': 'Invalid request payload.',
+                        'error': 'preferred_time must be an ISO-8601 datetime string.',
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         
-        best_match = get_best_meetup_spot(participants)
+        top_n = int(request.data.get('top_n') or 5)
+        top_n = max(1, min(top_n, 10))
+
+        recommendations = get_ranked_meetup_spots(
+            participants,
+            participant_vectors=participant_vectors,
+            participant_descriptions=participant_descriptions,
+            preferred_time=preferred_time,
+            top_n=top_n,
+        )
+        best_match = recommendations[0] if recommendations else None
         center = get_central_point(participants)
         
         if not best_match:
@@ -108,6 +157,7 @@ class RecommendMeetupView(APIView):
             'status': 'success',
             'message': 'Meetup recommendation generated.',
             'best_match': best_match,
+            'recommendations': recommendations,
             'center': center,
             'participants': participants
         })
@@ -170,10 +220,15 @@ def propose_friend_meetup(request):
         (viewer.elder_profile.feature_vector if viewer.elder_profile_id else {}) or {},
         (friend_profile.elder_profile.feature_vector if friend_profile.elder_profile_id else {}) or {},
     ]
+    participant_descriptions = [
+        viewer.effective_description or viewer.description or '',
+        friend_profile.effective_description or friend_profile.description or '',
+    ]
 
     best_match = get_best_meetup_spot(
         participants,
         participant_vectors=participant_vectors,
+        participant_descriptions=participant_descriptions,
         preferred_time=preferred_time,
     )
     center = get_central_point(participants)

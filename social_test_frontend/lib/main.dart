@@ -620,6 +620,63 @@ class _AppShellState extends State<AppShell> {
   int _index = 0;
   int _refreshToken = 0;
 
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _requestLocationPermissionOnEntry();
+    });
+  }
+
+  Future<void> _requestLocationPermissionOnEntry() async {
+    final currentStatus = await ph.Permission.location.status;
+    if (!mounted) {
+      return;
+    }
+
+    if (currentStatus == ph.PermissionStatus.granted ||
+        currentStatus == ph.PermissionStatus.limited) {
+      return;
+    }
+
+    final requestedStatus = currentStatus == ph.PermissionStatus.denied
+        ? await ph.Permission.location.request()
+        : currentStatus;
+
+    if (!mounted) {
+      return;
+    }
+
+    final messenger = ScaffoldMessenger.of(context);
+    if (requestedStatus == ph.PermissionStatus.granted ||
+        requestedStatus == ph.PermissionStatus.limited) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Location permission granted.')),
+      );
+      return;
+    }
+
+    if (requestedStatus == ph.PermissionStatus.permanentlyDenied ||
+        requestedStatus == ph.PermissionStatus.restricted) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: const Text('Location permission is blocked. Enable it in app settings.'),
+          action: SnackBarAction(
+            label: 'Settings',
+            onPressed: ph.openAppSettings,
+          ),
+        ),
+      );
+      return;
+    }
+
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('Location permission not granted. You can enable it later from settings.'),
+      ),
+    );
+  }
+
   void _refreshAll() {
     setState(() {
       _refreshToken++;
