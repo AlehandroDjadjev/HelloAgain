@@ -2,14 +2,23 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.agent_core.llm_client import LLMError
+from apps.agent_core.services.step_reasoning import ReasonedStep
+from apps.agent_core.services.vision_reasoning import VisionTapTarget
 from apps.agent_sessions.confirmation_service import ConfirmationService
-from apps.agent_sessions.execution_service import CIRCUIT_BREAKER_THRESHOLD, ExecutionService
+from apps.agent_sessions.execution_service import (
+    CIRCUIT_BREAKER_THRESHOLD,
+    ExecutionService,
+    _build_action_from_reasoned,
+    _augment_selector_params,
+    _node_selector_candidates,
+)
 from apps.agent_sessions.models import ConfirmationRecord, SessionStatus
 from apps.agent_sessions.services import SessionService
 from apps.audit_log.models import AuditRecord
+from apps.device_bridge.services import store_screenshot
 
 
 def _screen(
@@ -54,7 +63,73 @@ def _node(
     }
 
 
+@override_settings(AGENT_UNSAFE_AUTOMATION_MODE=False)
 class LLMExecutionLoopTests(TestCase):
+    def test_coordinate_taps_are_transported_as_swipe_for_client_compat(self):
+        reasoned = ReasonedStep(
+            action_type="TAP_COORDINATES",
+            params={"x": 540, "y": 600},
+            reasoning="Tap the visible target by coordinates.",
+            confidence=0.6,
+            is_goal_complete=False,
+            requires_confirmation=False,
+            sensitivity="low",
+        )
+
+        action = _build_action_from_reasoned(reasoned)
+
+        self.assertEqual(action["type"], "SWIPE")
+        self.assertEqual(
+            action["params"],
+            {
+                "start_x": 540,
+                "start_y": 600,
+                "end_x": 540,
+                "end_y": 600,
+                "duration_ms": 50,
+            },
+        )
+
+    def test_node_selector_candidates_include_container_fallbacks(self):
+        container_node = {
+            "ref": "n12",
+            "class_name": "androidx.recyclerview.widget.RecyclerView",
+            "view_id": "com.viber.voip:id/recycler_view",
+            "text": "",
+            "content_desc": "",
+            "clickable": False,
+            "editable": False,
+            "enabled": True,
+        }
+
+        self.assertIn(
+            {"view_id": "com.viber.voip:id/recycler_view", "enabled": True},
+            _node_selector_candidates(container_node),
+        )
+
+    def test_node_selector_candidates_prioritize_exact_text_identity(self):
+        label_node = {
+            "ref": "n37",
+            "class_name": "android.widget.TextView",
+            "view_id": "com.viber.voip:id/from",
+            "text": "Кичо",
+            "content_desc": "",
+            "clickable": False,
+            "editable": False,
+            "enabled": True,
+        }
+
+        candidates = _node_selector_candidates(label_node)
+        self.assertEqual(
+            candidates[0],
+            {
+                "class_name": "android.widget.TextView",
+                "view_id": "com.viber.voip:id/from",
+                "text": "Кичо",
+                "enabled": True,
+            },
+        )
+
     def _make_session(self, goal: str, target_app: str):
         session = SessionService.create(
             user_id="test_user",
@@ -160,6 +235,43 @@ class LLMExecutionLoopTests(TestCase):
             screen_hash_after="focused",
         )
 
+    def _non_clickable_text_target_prefers_generated_selector_candidates_first_legacy(self):
+        params = {"selector": {"element_ref": "n37"}}
+        screen_state = {
+            "nodes": [
+                {
+                    "ref": "n37",
+                    "class_name": "android.widget.TextView",
+                    "view_id": "com.viber.voip:id/from",
+                    "text": "Кичо",
+                    "content_desc": "",
+                    "clickable": False,
+                    "editable": False,
+                    "enabled": True,
+                }
+            ]
+        }
+
+        augmented = _augment_selector_params(
+            "TAP_ELEMENT",
+            params,
+            screen_state=screen_state,
+            target_app="com.viber.voip",
+        )
+        candidates = augmented.get("selector_candidates", [])
+        self.assertTrue(candidates)
+        self.assertEqual(
+            candidates[0],
+            {
+                "class_name": "android.widget.TextView",
+                "view_id": "com.viber.voip:id/from",
+                "text": "ÐšÐ¸Ñ‡Ð¾",
+                "enabled": True,
+            },
+        )
+        self.assertEqual(candidates[-1], {"element_ref": "n37"})
+        return
+
         third = ExecutionService.get_next_action(session, plan=None, screen_state=screens[2])
         self.assertEqual(third.status, "execute")
         self.assertEqual(third.next_action["type"], "TYPE_TEXT")
@@ -181,6 +293,184 @@ class LLMExecutionLoopTests(TestCase):
         session.refresh_from_db()
         self.assertEqual(len(session.step_history), 3)
         self.assertGreater(AuditRecord.objects.filter(session=session).count(), 0)
+
+    def test_non_clickable_text_target_prefers_generated_selector_candidates_first(self):
+        params = {"selector": {"element_ref": "n37"}}
+        screen_state = {
+            "nodes": [
+                {
+                    "ref": "n37",
+                    "class_name": "android.widget.TextView",
+                    "view_id": "com.viber.voip:id/from",
+                    "text": "Kicho",
+                    "content_desc": "",
+                    "clickable": False,
+                    "editable": False,
+                    "enabled": True,
+                }
+            ]
+        }
+
+        augmented = _augment_selector_params(
+            "TAP_ELEMENT",
+            params,
+            screen_state=screen_state,
+            target_app="com.viber.voip",
+        )
+        candidates = augmented.get("selector_candidates", [])
+        self.assertTrue(candidates)
+        self.assertEqual(
+            candidates[0],
+            {
+                "class_name": "android.widget.TextView",
+                "view_id": "com.viber.voip:id/from",
+                "text": "Kicho",
+                "enabled": True,
+            },
+        )
+        self.assertEqual(candidates[-1], {"element_ref": "n37"})
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_open_app_waits_for_target_foreground_before_reasking_llm(self, mock_from_reasoning_provider):
+        mock_client = MagicMock()
+        mock_client.generate.side_effect = [
+            {
+                "action_type": "OPEN_APP",
+                "params": {"package_name": "com.nothing.camera"},
+                "reasoning": "Camera is not open yet.",
+                "confidence": 0.95,
+                "is_goal_complete": False,
+                "requires_confirmation": False,
+                "sensitivity": "low",
+            },
+            {
+                "action_type": "TAP_ELEMENT",
+                "params": {"selector": {"element_ref": "shutter"}},
+                "reasoning": "The camera is in the foreground now, so tap the shutter.",
+                "confidence": 0.92,
+                "is_goal_complete": False,
+                "requires_confirmation": False,
+                "sensitivity": "low",
+            },
+        ]
+        mock_from_reasoning_provider.return_value = mock_client
+
+        session = self._make_session("Open Camera and take a photo", "com.nothing.camera")
+
+        launcher_screen = _screen(
+            "com.android.launcher",
+            "Home",
+            "home",
+            [_node("camera_icon", "android.widget.TextView", text="Camera", clickable=True)],
+        )
+        stale_frontend_screen = _screen(
+            "com.example.frontend",
+            "frontend",
+            "stale",
+            [_node("status", "android.widget.TextView", text="Executing...")],
+        )
+        camera_screen = _screen(
+            "com.nothing.camera",
+            "Camera",
+            "camera",
+            [_node("shutter", "android.widget.ImageView", cdesc="Take Photo", clickable=True)],
+        )
+
+        first = ExecutionService.get_next_action(session, plan=None, screen_state=launcher_screen)
+        self.assertEqual(first.status, "execute")
+        self.assertEqual(first.next_action["type"], "OPEN_APP")
+
+        decision = ExecutionService.decide_after_result(
+            session,
+            plan=None,
+            action_id=first.next_action["id"],
+            result_success=True,
+            result_code="OK",
+            action_type=first.next_action["type"],
+            params=first.next_action["params"],
+            reasoning=first.reasoning,
+            screen_hash_before="home",
+            screen_hash_after="home",
+        )
+        self.assertEqual(decision.status, "retry")
+
+        waiting = ExecutionService.get_next_action(session, plan=None, screen_state=stale_frontend_screen)
+        self.assertEqual(waiting.status, "retry")
+        self.assertEqual(mock_client.generate.call_count, 1)
+
+        resumed = ExecutionService.get_next_action(session, plan=None, screen_state=camera_screen)
+        self.assertEqual(resumed.status, "execute")
+        self.assertEqual(resumed.next_action["type"], "TAP_ELEMENT")
+        self.assertEqual(mock_client.generate.call_count, 2)
+
+    @patch("apps.agent_sessions.execution_service._get_vision_service")
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_successful_llm_requested_screenshot_triggers_vision_followup(
+        self,
+        mock_from_reasoning_provider,
+        mock_get_vision_service,
+    ):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "GET_SCREENSHOT",
+            "params": {"element_hint": "first visible search result row for Венци J"},
+            "reasoning": "The contact row is not reliably exposed in the accessibility tree.",
+            "confidence": 0.73,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_reasoning_provider.return_value = mock_client
+
+        mock_vision = MagicMock()
+        mock_vision.find_tap_target.return_value = VisionTapTarget(
+            x=540,
+            y=600,
+            description="First search result row",
+            confidence=0.8,
+            reasoning="The first rendered result row matches the contact query.",
+        )
+        mock_get_vision_service.return_value = mock_vision
+
+        session = self._make_session("Open the Венци J chat in Viber", "com.viber.voip")
+        sparse_search_screen = _screen(
+            "com.viber.voip",
+            "Viber",
+            "search",
+            [
+                _node("n1", "android.widget.ImageButton", cdesc="Collapse", clickable=True),
+                _node("n3", "android.widget.AutoCompleteTextView", text="Венци J", focused=True),
+                _node("n4", "android.widget.ImageView", cdesc="Clear query", clickable=True),
+                _node("n6", "android.widget.LinearLayout", cdesc="Chats"),
+                _node("n7", "android.widget.TextView", text="CHATS"),
+            ],
+            focused="n3",
+        )
+
+        first = ExecutionService.get_next_action(session, plan=None, screen_state=sparse_search_screen)
+        self.assertEqual(first.status, "execute")
+        self.assertEqual(first.next_action["type"], "GET_SCREENSHOT")
+
+        store_screenshot(str(session.id), "fake-screenshot-b64")
+        ExecutionService.decide_after_result(
+            session,
+            plan=None,
+            action_id=first.next_action["id"],
+            result_success=True,
+            result_code="OK",
+            action_type=first.next_action["type"],
+            params=first.next_action["params"],
+            reasoning=first.reasoning,
+            screen_hash_before="search",
+            screen_hash_after="search",
+        )
+
+        followup = ExecutionService.get_next_action(session, plan=None, screen_state=sparse_search_screen)
+        self.assertEqual(followup.status, "execute")
+        self.assertEqual(followup.next_action["type"], "SWIPE")
+        self.assertEqual(followup.next_action["params"]["start_x"], 540)
+        self.assertEqual(followup.next_action["params"]["start_y"], 600)
+        mock_vision.find_tap_target.assert_called_once()
 
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
     def test_whatsapp_send_with_confirmation(self, mock_from_reasoning_provider):
@@ -316,4 +606,34 @@ class LLMExecutionLoopTests(TestCase):
         self.assertEqual(
             decision.reason,
             "ELEMENT_NOT_CLICKABLE: Search bar exists but is not clickable",
+        )
+
+    def test_stale_tap_is_recorded_as_soft_failure(self):
+        session = self._make_session("Tap a button on Chrome", "com.android.chrome")
+
+        decision = ExecutionService.decide_after_result(
+            session,
+            plan=None,
+            action_id="llm_stale_tap",
+            result_success=True,
+            result_code="OK",
+            result_message="TAP",
+            action_type="TAP_ELEMENT",
+            params={"selector": {"element_ref": "retry_btn"}},
+            reasoning="Tap the visible button.",
+            screen_hash_before="same-screen",
+            screen_hash_after="same-screen",
+        )
+
+        self.assertEqual(decision.status, "continue")
+        self.assertIn("NO_SCREEN_CHANGE", decision.reason)
+        self.assertIn("Screen did not change after this action", decision.reason)
+
+        session.refresh_from_db()
+        self.assertEqual(session.current_step_index, 0)
+        self.assertFalse(session.step_history[-1]["result_success"])
+        self.assertEqual(session.step_history[-1]["result_code"], "NO_SCREEN_CHANGE")
+        self.assertIn(
+            "Screen did not change after this action",
+            session.step_history[-1]["reasoning"],
         )

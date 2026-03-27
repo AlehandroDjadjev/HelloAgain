@@ -5,11 +5,17 @@ import 'dart:ui' show lerpDouble;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'browser_voice_bridge.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations(const [
+    DeviceOrientation.portraitUp,
+  ]);
   runApp(const AgentBoardApp());
 }
 
@@ -19,7 +25,7 @@ class AgentBoardApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Agent Space',
+      title: 'Hello Again',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         scaffoldBackgroundColor: _BoardPalette.appShell,
@@ -34,14 +40,931 @@ class AgentBoardApp extends StatelessWidget {
           displayColor: _BoardPalette.ink,
         ),
         useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFFF5EFE6),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFFBB5A3C),
+          brightness: Brightness.light,
+          surface: const Color(0xFFFFFBF7),
+        ),
       ),
-      home: const AgentBoardScreen(),
+      home: const HelloAgainShell(),
     );
   }
 }
 
+enum HelloAgainStage { booting, intro, onboarding, board }
+
+class HelloAgainShell extends StatefulWidget {
+  const HelloAgainShell({super.key});
+
+  @override
+  State<HelloAgainShell> createState() => _HelloAgainShellState();
+}
+
+class _HelloAgainShellState extends State<HelloAgainShell> {
+  static const _tokenKey = 'hello_again.account_token';
+
+  late final AgentBackendClient _backendClient;
+  late final BrowserVoiceBridge _voiceBridge;
+
+  SharedPreferences? _prefs;
+  HelloAgainStage _stage = HelloAgainStage.booting;
+  AppAccountSession? _session;
+  bool _showContinue = false;
+  bool _isListening = false;
+  bool _isWorking = false;
+  bool _isConfirming = false;
+  int _currentStepIndex = 0;
+  String _statusText = 'Подготвяме Hello Again...';
+  String _promptText = '';
+  String _transcriptPreview = '';
+  final Map<String, String> _answers = <String, String>{};
+
+  static const List<_RegistrationStep> _steps = [
+    _RegistrationStep(
+      id: 'name',
+      title: 'Вашето име',
+      prompt: 'Здравейте. Кажете ми как искате приложението да Ви нарича.',
+    ),
+    _RegistrationStep(
+      id: 'phone_number',
+      title: 'Телефонен номер',
+      prompt:
+          'Сега кажете телефонния си номер бавно, цифра по цифра, за да създам профила Ви.',
+    ),
+    _RegistrationStep(
+      id: 'description',
+      title: 'Няколко думи за Вас',
+      prompt:
+          'Разкажете ми с няколко спокойни изречения какъв човек сте, за да Ви опозная.',
+    ),
+    _RegistrationStep(
+      id: 'ideal_company',
+      title: 'Приятна компания',
+      prompt:
+          'С какви хора се чувствате най-спокойно и приятно да прекарвате време?',
+    ),
+    _RegistrationStep(
+      id: 'favorite_things',
+      title: 'Любими теми',
+      prompt:
+          'За какво най-много обичате да говорите или какво обичате да правите напоследък?',
+    ),
+    _RegistrationStep(
+      id: 'good_meetup',
+      title: 'Хубава среща',
+      prompt: 'Какво прави една среща топла, спокойна и успешна за Вас?',
+    ),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _backendClient = AgentBackendClient();
+    _voiceBridge = createBrowserVoiceBridge();
+    unawaited(_bootstrap());
+  }
+
+  @override
+  void dispose() {
+    _voiceBridge.stopRecognition();
+    _voiceBridge.stopAudio();
+    super.dispose();
+  }
+
+  Future<void> _bootstrap() async {
+    final prefs = await SharedPreferences.getInstance();
+    AppAccountSession? session;
+    final storedToken = prefs.getString(_tokenKey) ?? '';
+    if (storedToken.isNotEmpty) {
+      try {
+        session = await _backendClient.fetchCurrentSession(token: storedToken);
+      } catch (_) {
+        await prefs.remove(_tokenKey);
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _prefs = prefs;
+      _session = session;
+      _stage = HelloAgainStage.intro;
+      _statusText = session == null
+          ? 'Спокойното начало е готово.'
+          : 'Добре дошли отново. Отварям Вашето място.';
+    });
+  }
+
+  void _handleIntroFinished() {
+    if (_session != null) {
+      setState(() {
+        _stage = HelloAgainStage.board;
+      });
+      return;
+    }
+    setState(() {
+      _showContinue = true;
+      _statusText = 'Натиснете „Продължи“ и ще Ви преведа през регистрацията.';
+    });
+  }
+
+  Future<void> _startRegistration() async {
+    if (_isWorking) return;
+    setState(() {
+      _showContinue = false;
+      _stage = HelloAgainStage.onboarding;
+      _currentStepIndex = 0;
+      _answers.clear();
+      _transcriptPreview = '';
+      _isConfirming = false;
+    });
+    await _runCurrentStep();
+  }
+
+  Future<void> _runCurrentStep() async {
+    final step = _steps[_currentStepIndex];
+    if (!mounted) return;
+    setState(() {
+      _promptText = step.prompt;
+      _statusText = 'Сега ще Ви задам въпроса на глас.';
+      _transcriptPreview = '';
+      _isWorking = true;
+      _isListening = false;
+      _isConfirming = false;
+    });
+
+    try {
+      while (mounted) {
+        await _speakOnboardingText(step.prompt);
+        if (!mounted) return;
+        setState(() {
+          _isListening = true;
+          _isConfirming = false;
+          _statusText = 'Слушам Ви внимателно...';
+        });
+
+        final capturedTurn = await _voiceBridge.captureAudioTurn(
+          language: 'bg-BG',
+        );
+        final transcript = await _resolveCapturedTranscript(capturedTurn);
+        final normalized = _normalizeAnswer(step.id, transcript);
+
+        if (normalized.isEmpty) {
+          await _speakOnboardingText(
+            'Не успях да Ви чуя добре. Ще повторя въпроса.',
+          );
+          if (!mounted) return;
+          setState(() {
+            _isListening = false;
+            _statusText = 'Не успях да чуя отговора ясно. Повтарям въпроса.';
+          });
+          continue;
+        }
+
+        if (!mounted) return;
+        setState(() {
+          _transcriptPreview = normalized;
+          _isListening = false;
+          _isConfirming = true;
+          _statusText =
+              'Чух: „$normalized“. Кажете „да“ за потвърждение или „не“ за повторение.';
+        });
+
+        final confirmed = await _confirmTranscript(normalized);
+        if (!mounted) return;
+        if (!confirmed) {
+          setState(() {
+            _isConfirming = false;
+            _statusText = 'Добре, ще задам въпроса отново.';
+          });
+          continue;
+        }
+
+        _answers[step.id] = normalized;
+        break;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _isConfirming = false;
+      });
+
+      if (_currentStepIndex == _steps.length - 1) {
+        await _submitRegistration();
+        return;
+      }
+
+      setState(() {
+        _currentStepIndex += 1;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 260));
+      await _runCurrentStep();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isListening = false;
+        _isConfirming = false;
+        _isWorking = false;
+        _statusText =
+            'Не успях да чуя ясно. Натиснете веднъж и ще повторя текущия въпрос.';
+      });
+    }
+  }
+
+  Future<bool> _confirmTranscript(String transcript) async {
+    await _speakOnboardingText(
+      'Чух: $transcript. Ако това е правилно, кажете да. Ако не е правилно, кажете не и ще повторя въпроса.',
+    );
+
+    while (mounted) {
+      setState(() {
+        _isListening = true;
+        _statusText = 'Моля, кажете само „да“ или „не“.';
+      });
+
+      final capturedTurn = await _voiceBridge.captureAudioTurn(
+        language: 'bg-BG',
+      );
+      final confirmation = await _resolveCapturedTranscript(capturedTurn);
+      final normalized = _normalizeConfirmationAnswer(confirmation);
+      if (normalized != null) {
+        setState(() {
+          _isListening = false;
+        });
+        return normalized;
+      }
+
+      setState(() {
+        _isListening = false;
+        _statusText = 'Не разбрах потвърждението. Ще попитам отново.';
+      });
+      await _speakOnboardingText('Не разбрах. Моля кажете само да или не.');
+    }
+
+    return false;
+  }
+
+  Future<String> _resolveCapturedTranscript(
+    CapturedAudioTurn capturedTurn,
+  ) async {
+    final directTranscript = (capturedTurn.transcript ?? '').trim();
+    if (directTranscript.isNotEmpty) {
+      return directTranscript;
+    }
+    final payload = await _backendClient.transcribeSpeechTurn(
+      audioBase64: capturedTurn.audioBase64,
+      audioMimeType: capturedTurn.mimeType,
+      userId: 'hello_again_registration',
+      sessionId: 'registration_${DateTime.now().millisecondsSinceEpoch}',
+      language: capturedTurn.language,
+    );
+    return (payload['transcript'] ?? payload['message'] ?? '')
+        .toString()
+        .trim();
+  }
+
+  String _normalizeAnswer(String stepId, String transcript) {
+    final clean = transcript.trim();
+    if (stepId != 'phone_number') {
+      return clean;
+    }
+
+    final digitWords = <String, String>{
+      'zero': '0',
+      'oh': '0',
+      'one': '1',
+      'two': '2',
+      'three': '3',
+      'four': '4',
+      'for': '4',
+      'five': '5',
+      'six': '6',
+      'seven': '7',
+      'eight': '8',
+      'nine': '9',
+      'plus': '+',
+      'нула': '0',
+      'едно': '1',
+      'две': '2',
+      'два': '2',
+      'три': '3',
+      'четири': '4',
+      'пет': '5',
+      'шест': '6',
+      'седем': '7',
+      'осем': '8',
+      'девет': '9',
+    };
+
+    digitWords.addAll(const {
+      'нула': '0',
+      'едно': '1',
+      'две': '2',
+      'два': '2',
+      'три': '3',
+      'четири': '4',
+      'пет': '5',
+      'шест': '6',
+      'седем': '7',
+      'осем': '8',
+      'девет': '9',
+      'плюс': '+',
+    });
+
+    final pieces = clean
+        .toLowerCase()
+        .replaceAll('-', ' ')
+        .split(RegExp(r'\s+'))
+        .where((item) => item.trim().isNotEmpty);
+
+    final buffer = StringBuffer();
+    for (final piece in pieces) {
+      if (digitWords.containsKey(piece)) {
+        buffer.write(digitWords[piece]);
+      } else {
+        buffer.write(piece.replaceAll(RegExp(r'[^0-9+]'), ''));
+      }
+    }
+    return buffer.toString().trim();
+  }
+
+  bool? _normalizeConfirmationAnswer(String transcript) {
+    final words = transcript
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-zа-я0-9\s]+', caseSensitive: false), ' ')
+        .split(RegExp(r'\s+'))
+        .where((item) => item.isNotEmpty)
+        .toList();
+
+    const yesWords = {
+      'да',
+      'yes',
+      'yep',
+      'correct',
+      'правилно',
+      'точно',
+      'добре',
+      'става',
+    };
+    const noWords = {'не', 'no', 'wrong', 'грешно', 'повтори', 'отново'};
+
+    if (words.any(yesWords.contains)) {
+      return true;
+    }
+    if (words.any(noWords.contains)) {
+      return false;
+    }
+    return null;
+  }
+
+  Future<void> _speakOnboardingText(String text) async {
+    try {
+      final payload = await _backendClient.speakText(
+        text: text,
+        language: 'bg-BG',
+      );
+      final audioBase64 = (payload['audio_base64'] ?? '').toString().trim();
+      final mimeType = (payload['audio_mime_type'] ?? 'audio/wav')
+          .toString()
+          .trim();
+      if (audioBase64.isNotEmpty) {
+        await _voiceBridge.playBase64Audio(
+          audioBase64: audioBase64,
+          mimeType: mimeType.isEmpty ? 'audio/wav' : mimeType,
+        );
+        return;
+      }
+    } catch (_) {}
+
+    await _voiceBridge.playText(text);
+  }
+
+  Future<void> _submitRegistration() async {
+    if (!mounted) return;
+    setState(() {
+      _statusText = 'Създавам Вашия профил...';
+      _isWorking = true;
+      _isConfirming = false;
+    });
+
+    final onboardingAnswers = <String, String>{
+      'ideal_company': _answers['ideal_company'] ?? '',
+      'favorite_things': _answers['favorite_things'] ?? '',
+      'good_meetup': _answers['good_meetup'] ?? '',
+    };
+
+    try {
+      final session = await _backendClient.registerVoiceProfile(
+        name: _answers['name'] ?? '',
+        phoneNumber: _answers['phone_number'] ?? '',
+        description: _answers['description'] ?? '',
+        onboardingAnswers: onboardingAnswers,
+      );
+      await _prefs?.setString(_tokenKey, session.token);
+      if (!mounted) return;
+      setState(() {
+        _session = session;
+        _stage = HelloAgainStage.board;
+        _isWorking = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isWorking = false;
+        _statusText =
+            'Регистрацията не можа да завърши. Натиснете веднъж и ще повторя текущата стъпка. ${error.toString()}';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    switch (_stage) {
+      case HelloAgainStage.booting:
+        return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      case HelloAgainStage.intro:
+        return IntroOnboardingScreen(
+          showContinue: _showContinue,
+          statusText: _statusText,
+          onFinished: _handleIntroFinished,
+          onContinue: _startRegistration,
+        );
+      case HelloAgainStage.onboarding:
+        final step = _steps[_currentStepIndex];
+        return RegistrationScreen(
+          title: step.title,
+          prompt: _promptText,
+          statusText: _statusText,
+          transcript: _transcriptPreview,
+          isListening: _isListening,
+          isWorking: _isWorking,
+          isConfirming: _isConfirming,
+          stepNumber: _currentStepIndex + 1,
+          stepCount: _steps.length,
+          onRetry: _runCurrentStep,
+        );
+      case HelloAgainStage.board:
+        final session = _session;
+        return AgentBoardScreen(
+          userId: session?.userId.toString() ?? 'whitespace_frontend',
+          accountToken: session?.token,
+          welcomeText: session == null
+              ? null
+              : 'Добре дошли, ${session.displayName}. Вашето място е готово.',
+        );
+    }
+  }
+}
+
+class IntroOnboardingScreen extends StatefulWidget {
+  const IntroOnboardingScreen({
+    super.key,
+    required this.showContinue,
+    required this.statusText,
+    required this.onFinished,
+    required this.onContinue,
+  });
+
+  final bool showContinue;
+  final String statusText;
+  final VoidCallback onFinished;
+  final Future<void> Function() onContinue;
+
+  @override
+  State<IntroOnboardingScreen> createState() => _IntroOnboardingScreenState();
+}
+
+class _IntroOnboardingScreenState extends State<IntroOnboardingScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  bool _finished = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1400),
+    )..forward();
+    _controller.addStatusListener((status) {
+      if (!_finished && status == AnimationStatus.completed) {
+        _finished = true;
+        widget.onFinished();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final slide = Tween<Offset>(
+      begin: const Offset(0, 1.4),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic));
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF4EDE3),
+      body: _WarmPaperBackground(
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 30),
+            child: Column(
+              children: [
+                const Spacer(),
+                SlideTransition(
+                  position: slide,
+                  child: const Text(
+                    'Hello Again',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 48,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF3C2A20),
+                      letterSpacing: -1.2,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  widget.statusText,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 17,
+                    height: 1.45,
+                    color: Color(0xFF6A5447),
+                  ),
+                ),
+                const Spacer(),
+                AnimatedOpacity(
+                  opacity: widget.showContinue ? 1 : 0,
+                  duration: const Duration(milliseconds: 420),
+                  curve: Curves.easeOut,
+                  child: AnimatedSlide(
+                    offset: widget.showContinue
+                        ? Offset.zero
+                        : const Offset(0, 0.16),
+                    duration: const Duration(milliseconds: 420),
+                    curve: Curves.easeOutCubic,
+                    child: IgnorePointer(
+                      ignoring: !widget.showContinue,
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: FilledButton(
+                          onPressed: widget.onContinue,
+                          style: FilledButton.styleFrom(
+                            backgroundColor: const Color(0xFFB56B4D),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 18),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(22),
+                            ),
+                          ),
+                          child: const Text(
+                            'Продължи',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class RegistrationScreen extends StatelessWidget {
+  const RegistrationScreen({
+    super.key,
+    required this.title,
+    required this.prompt,
+    required this.statusText,
+    required this.transcript,
+    required this.isListening,
+    required this.isWorking,
+    required this.isConfirming,
+    required this.stepNumber,
+    required this.stepCount,
+    required this.onRetry,
+  });
+
+  final String title;
+  final String prompt;
+  final String statusText;
+  final String transcript;
+  final bool isListening;
+  final bool isWorking;
+  final bool isConfirming;
+  final int stepNumber;
+  final int stepCount;
+  final Future<void> Function() onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = stepCount == 0 ? 0.0 : stepNumber / stepCount;
+    final indicatorColor = isListening
+        ? const Color(0xFFB56B4D)
+        : isConfirming
+        ? const Color(0xFF7A8B67)
+        : const Color(0xFFC8B6A1);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF4EDE3),
+      body: _WarmPaperBackground(
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
+            child: Column(
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.82),
+                    borderRadius: BorderRadius.circular(28),
+                    border: Border.all(color: const Color(0xFFE5D6C7)),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFF8B6A55).withValues(alpha: 0.09),
+                        blurRadius: 26,
+                        offset: const Offset(0, 12),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Стъпка $stepNumber от $stepCount',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF8E725F),
+                          letterSpacing: 0.2,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(999),
+                        child: LinearProgressIndicator(
+                          value: progress.clamp(0, 1),
+                          minHeight: 6,
+                          backgroundColor: const Color(0xFFE9DDD1),
+                          valueColor: const AlwaysStoppedAnimation<Color>(
+                            Color(0xFFB56B4D),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 22),
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 28,
+                          height: 1.1,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF2F241D),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Text(
+                        prompt,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          height: 1.48,
+                          color: Color(0xFF625247),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Expanded(
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.70),
+                      borderRadius: BorderRadius.circular(28),
+                      border: Border.all(color: const Color(0xFFE8DCCF)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 220),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: indicatorColor.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 10,
+                                height: 10,
+                                decoration: BoxDecoration(
+                                  color: indicatorColor,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                isListening
+                                    ? 'Слушам'
+                                    : isConfirming
+                                    ? 'Чакам потвърждение'
+                                    : 'Вашият отговор',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                  color: indicatorColor,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        Text(
+                          transcript.isEmpty
+                              ? 'Говорете спокойно. Ще попълня отговора вместо Вас.'
+                              : transcript,
+                          style: const TextStyle(
+                            fontSize: 24,
+                            height: 1.42,
+                            color: Color(0xFF312620),
+                          ),
+                        ),
+                        const Spacer(),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF8F1E8),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(
+                            statusText,
+                            style: const TextStyle(
+                              fontSize: 15,
+                              height: 1.45,
+                              color: Color(0xFF6D5A4E),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: isWorking ? null : onRetry,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF6B5444),
+                      side: const BorderSide(color: Color(0xFFD6C4B2)),
+                      backgroundColor: Colors.white.withValues(alpha: 0.60),
+                      padding: const EdgeInsets.symmetric(vertical: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(22),
+                      ),
+                    ),
+                    child: Text(
+                      isListening ? 'Слушам...' : 'Повтори въпроса',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WarmPaperBackground extends StatelessWidget {
+  const _WarmPaperBackground({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        const ColoredBox(color: Color(0xFFF4EDE3)),
+        Positioned(
+          top: -28,
+          right: -10,
+          child: _BackdropOrb(diameter: 180, color: const Color(0xFFE8D7C6)),
+        ),
+        Positioned(
+          top: 120,
+          left: -46,
+          child: _BackdropOrb(diameter: 128, color: const Color(0xFFE3D4C3)),
+        ),
+        Positioned(
+          bottom: -44,
+          right: 18,
+          child: _BackdropOrb(diameter: 168, color: const Color(0xFFDDCBB8)),
+        ),
+        Positioned.fill(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.06),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.22)),
+            ),
+          ),
+        ),
+        child,
+      ],
+    );
+  }
+}
+
+class _BackdropOrb extends StatelessWidget {
+  const _BackdropOrb({required this.diameter, required this.color});
+
+  final double diameter;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: diameter,
+      height: diameter,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: color.withValues(alpha: 0.42),
+        boxShadow: [
+          BoxShadow(
+            color: color.withValues(alpha: 0.22),
+            blurRadius: 48,
+            spreadRadius: 8,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RegistrationStep {
+  const _RegistrationStep({
+    required this.id,
+    required this.title,
+    required this.prompt,
+  });
+
+  final String id;
+  final String title;
+  final String prompt;
+}
+
+class AppAccountSession {
+  const AppAccountSession({
+    required this.token,
+    required this.userId,
+    required this.displayName,
+  });
+
+  final String token;
+  final int userId;
+  final String displayName;
+}
+
 class AgentBoardScreen extends StatefulWidget {
-  const AgentBoardScreen({super.key});
+  const AgentBoardScreen({
+    super.key,
+    required this.userId,
+    this.accountToken,
+    this.welcomeText,
+  });
+
+  final String userId;
+  final String? accountToken;
+  final String? welcomeText;
 
   @override
   State<AgentBoardScreen> createState() => _AgentBoardScreenState();
@@ -53,7 +976,6 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   late final BrowserVoiceBridge _voiceBridge;
   final TextEditingController _promptController = TextEditingController();
   late final String _sessionId;
-  final String _userId = 'whitespace_frontend';
   String _lastSpeech =
       'The board is ready for the whitespace conversation pipeline.';
   String _statusText = 'Loading saved board memory...';
@@ -89,6 +1011,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     _debugNameController = TextEditingController(text: 'style_studio_card');
     _debugTextController = TextEditingController(text: 'Calm, readable memory');
     _sessionId = 'whitespace_${DateTime.now().millisecondsSinceEpoch}';
+    if ((widget.welcomeText ?? '').trim().isNotEmpty) {
+      _lastSpeech = widget.welcomeText!.trim();
+    }
     unawaited(_hydrateBoardFromBackend());
   }
 
@@ -108,7 +1033,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
 
   Future<void> _hydrateBoardFromBackend() async {
     try {
-      final payload = await _backendClient.fetchBoardMemory();
+      final payload = await _backendClient.fetchBoardMemory(
+        token: widget.accountToken,
+      );
       final boardState = Map<String, dynamic>.from(
         payload['board_state'] as Map? ?? const {},
       );
@@ -144,7 +1071,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     try {
       final payload = await _backendClient.openObject(
         object: object.toJson(),
-        userId: _userId,
+        userId: widget.userId,
       );
       await _applyCommands(payload['board_commands']);
       final viewer = Map<String, dynamic>.from(
@@ -333,7 +1260,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         prompt: cleanMessage,
         boardState: _sceneController.exportStateSnapshot(),
         largestEmptySpace: _sceneController.findLargestEmptySpaceSnapshot(),
-        userId: _userId,
+        userId: widget.userId,
         sessionId: _sessionId,
         reasoningProvider: _reasoningProvider,
       );
@@ -368,10 +1295,14 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   }
 
   Future<String> _transcribeCapturedTurn(CapturedAudioTurn capturedTurn) async {
+    final directTranscript = (capturedTurn.transcript ?? '').trim();
+    if (directTranscript.isNotEmpty) {
+      return directTranscript;
+    }
     final payload = await _backendClient.transcribeSpeechTurn(
       audioBase64: capturedTurn.audioBase64,
       audioMimeType: capturedTurn.mimeType,
-      userId: _userId,
+      userId: widget.userId,
       sessionId: _sessionId,
       language: capturedTurn.language,
     );
@@ -422,6 +1353,10 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                 mimeType: audioMimeType,
               )
               .catchError((_) {}),
+        );
+      } else if (speechText.isNotEmpty) {
+        _trackSpeechPlayback(
+          _voiceBridge.playText(speechText).catchError((_) {}),
         );
       }
       return;
@@ -721,6 +1656,10 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
           builder: (context, _) {
             return LayoutBuilder(
               builder: (context, constraints) {
+                final isCompact = constraints.maxWidth < 720;
+                final horizontalPadding = isCompact ? 14.0 : 18.0;
+                final topInset = isCompact ? 14.0 : 18.0;
+                final bottomInset = isCompact ? 14.0 : 18.0;
                 final isCompact = constraints.maxWidth < 1100;
                 final studioWidth = _debugPanelOpen
                     ? math.min(
@@ -885,6 +1824,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                         speech: _lastSpeech,
                         status: _statusText,
                         isBusy: _isBusy,
+                        compact: isCompact,
                       ),
                     ),
                     Positioned(
@@ -1720,6 +2660,7 @@ class _StudioTextField extends StatelessWidget {
 
   final TextEditingController controller;
   final ValueChanged<String>? onChanged;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -2131,6 +3072,9 @@ class AgentBackendClient {
     }
     const localHosts = {'localhost', '127.0.0.1', '::1', '[::1]'};
     if (!kIsWeb) {
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        return 'http://10.0.2.2:8000';
+      }
       return 'http://127.0.0.1:8000';
     }
 
@@ -2149,8 +3093,47 @@ class AgentBackendClient {
     return browserUri.origin;
   }
 
-  Future<Map<String, dynamic>> fetchBoardMemory() {
-    return _getJson('/api/agent/board-memory/');
+  Future<AppAccountSession> fetchCurrentSession({required String token}) async {
+    final payload = await _getJson('/api/accounts/me/', token: token);
+    final profile = Map<String, dynamic>.from(
+      payload['profile'] as Map? ?? const {},
+    );
+    return AppAccountSession(
+      token: token,
+      userId: int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0,
+      displayName: (profile['display_name'] ?? profile['name'] ?? 'Friend')
+          .toString(),
+    );
+  }
+
+  Future<AppAccountSession> registerVoiceProfile({
+    required String name,
+    required String phoneNumber,
+    required String description,
+    required Map<String, String> onboardingAnswers,
+  }) async {
+    final payload = await _postJson('/api/accounts/register/', {
+      'name': name,
+      'phone_number': phoneNumber,
+      'description': description,
+      'onboarding_answers': onboardingAnswers,
+      'phone_permission_granted': true,
+      'microphone_permission_granted': true,
+      'voice_navigation_enabled': true,
+      'onboarding_completed': true,
+    });
+    final profile = Map<String, dynamic>.from(
+      payload['profile'] as Map? ?? const {},
+    );
+    return AppAccountSession(
+      token: (payload['token'] ?? '').toString(),
+      userId: int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0,
+      displayName: (profile['display_name'] ?? name).toString(),
+    );
+  }
+
+  Future<Map<String, dynamic>> fetchBoardMemory({String? token}) {
+    return _getJson('/api/agent/board-memory/', token: token);
   }
 
   Future<Map<String, dynamic>> transcribeSpeechTurn({
@@ -2167,6 +3150,13 @@ class AgentBackendClient {
       'session_id': sessionId,
       'language': language,
     });
+  }
+
+  Future<Map<String, dynamic>> speakText({
+    required String text,
+    String language = 'bg-BG',
+  }) {
+    return _postJson('/api/voice/speak/', {'text': text, 'language': language});
   }
 
   Future<Map<String, dynamic>> startAgentRun({
@@ -2205,10 +3195,10 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> _getJson(String path) async {
+  Future<Map<String, dynamic>> _getJson(String path, {String? token}) async {
     final response = await http.get(
       _baseUri.resolve(path),
-      headers: const {'Accept': 'application/json'},
+      headers: _headers(token: token),
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(
@@ -2220,14 +3210,12 @@ class AgentBackendClient {
 
   Future<Map<String, dynamic>> _postJson(
     String path,
-    Map<String, dynamic> payload,
-  ) async {
+    Map<String, dynamic> payload, {
+    String? token,
+  }) async {
     final response = await http.post(
       _baseUri.resolve(path),
-      headers: const {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Accept': 'application/json',
-      },
+      headers: _headers(token: token),
       body: jsonEncode(payload),
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -2236,6 +3224,17 @@ class AgentBackendClient {
       );
     }
     return _decodeJson(response.body);
+  }
+
+  Map<String, String> _headers({String? token}) {
+    final headers = <String, String>{
+      'Content-Type': 'application/json; charset=utf-8',
+      'Accept': 'application/json',
+    };
+    if ((token ?? '').trim().isNotEmpty) {
+      headers['Authorization'] = 'Token ${token!.trim()}';
+    }
+    return headers;
   }
 
   Map<String, dynamic> _decodeJson(String body) {

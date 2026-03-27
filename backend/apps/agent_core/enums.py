@@ -20,6 +20,8 @@ class ActionType(str, Enum):
     ASSERT_SCREEN = "ASSERT_SCREEN"
     ASSERT_ELEMENT = "ASSERT_ELEMENT"
     ABORT = "ABORT"
+    TAP_COORDINATES = "TAP_COORDINATES"
+    GET_SCREENSHOT = "GET_SCREENSHOT"
 
 
 class ActionSensitivity(str, Enum):

@@ -38,16 +38,19 @@ from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 from uuid import UUID
 
+from django.conf import settings
 from django.db import transaction
 
-from apps.agent_core.enums import ActionErrorCode, ActionResultStatus, ActionType
+from apps.agent_core.enums import ActionErrorCode, ActionResultStatus, ActionSensitivity, ActionType
 from apps.audit_log.models import AuditActor, AuditEventType
 from apps.audit_log.services import AuditService
 
 from apps.agent_core.services.step_reasoning import StepReasoningService
+from apps.agent_core.services.vision_reasoning import VisionReasoningService, VisionTapTarget
 from apps.agent_policy.models import UserAutomationPolicy
 from apps.agent_policy.services import PolicyEnforcer
 from apps.agent_plans.services import PlanService
+from apps.device_bridge.services import pop_screenshot
 
 from .models import AgentSession, ConfirmationRecord, SessionStatus
 from .services import SessionService
@@ -91,6 +94,39 @@ _FATAL_CODES: frozenset[str] = frozenset({
 
 _DISCONNECT_CODES: frozenset[str] = frozenset({
     "SERVICE_DISCONNECTED", "SERVICE_NOT_ENABLED",
+})
+
+_POST_LAUNCH_WAIT_ACTIONS: frozenset[str] = frozenset({
+    ActionType.OPEN_APP.value,
+    ActionType.WAIT_FOR_APP.value,
+})
+
+_SOFT_FAILURE_RESULT_CODE = "NO_SCREEN_CHANGE"
+
+# ── Vision-fallback constants ──────────────────────────────────────────────────
+
+# Accessibility node count at or below which game/custom-renderer mode activates
+_GAME_NODE_THRESHOLD: int = 2
+
+# Standard apps should exhaust accessibility nodes first. Proactive screenshot
+# fallback is only for apps known to use custom-rendered UIs.
+_PROACTIVE_VISION_PACKAGES: frozenset[str] = frozenset({
+    "com.supercell.brawlstars",
+})
+
+# Result codes that trigger the reactive vision fallback on the next /next-step/
+_VISION_TRIGGER_CODES: frozenset[str] = frozenset({
+    ActionErrorCode.ELEMENT_NOT_FOUND.value,
+    ActionErrorCode.ELEMENT_NOT_CLICKABLE.value,
+    "ELEMENT_NOT_FOUND", "ELEMENT_NOT_CLICKABLE",
+    _SOFT_FAILURE_RESULT_CODE,
+})
+
+# Tap-class action types used in stuck-detection
+_TAP_ACTION_TYPES: frozenset[str] = frozenset({
+    ActionType.TAP_ELEMENT.value,
+    ActionType.TAP_COORDINATES.value,
+    ActionType.LONG_PRESS_ELEMENT.value,
 })
 
 
@@ -256,7 +292,11 @@ class ExecutionService:
             )
 
         # ── Sensitive screen (always abort regardless of mode) ─────────────────
-        if screen_state and screen_state.get("is_sensitive"):
+        if (
+            screen_state
+            and screen_state.get("is_sensitive")
+            and not getattr(settings, "AGENT_UNSAFE_AUTOMATION_MODE", False)
+        ):
             _abort_session(session, plan, "sensitive_screen_detected",
                            "Sensitive screen — aborting.")
             return NextActionResponse(
@@ -303,6 +343,16 @@ class ExecutionService:
 
         if session.status in SessionService.TERMINAL:
             return ExecutionDecision("abort", reason="Session is already terminal.")
+
+        result_success, result_code, result_message, reasoning = _normalize_soft_failure(
+            action_type=action_type,
+            result_success=result_success,
+            result_code=result_code,
+            result_message=result_message,
+            reasoning=reasoning,
+            screen_hash_before=screen_hash_before,
+            screen_hash_after=screen_hash_after,
+        )
 
         # ── Record to step_history (LLM mode only — plan mode has its own record) ─
         if llm_mode:
@@ -351,6 +401,18 @@ class ExecutionService:
                 result_code,
                 result_message,
             )
+        _log_execution_result_block(
+            session=session,
+            action_id=action_id,
+            action_type=action_type,
+            params=params or {},
+            result_success=result_success,
+            result_code=result_code,
+            result_message=result_message,
+            reasoning=reasoning,
+            screen_hash_before=screen_hash_before,
+            screen_hash_after=screen_hash_after,
+        )
 
         # ── Pending confirmation still gates execution ─────────────────────────
         pending = ConfirmationRecord.objects.filter(
@@ -381,6 +443,15 @@ class ExecutionService:
 
         # ── LLM mode: always "continue" — LLM sees history next call ──────────
         if llm_mode:
+            if result_success and action_type in _POST_LAUNCH_WAIT_ACTIONS:
+                return ExecutionDecision(
+                    "retry",
+                    reason=(
+                        f"Waiting for '{session.target_app or 'target app'}' to reach the foreground "
+                        "before the next LLM step."
+                    ),
+                    reasoning=reasoning,
+                )
             return ExecutionDecision(
                 "continue",
                 reason=_describe_result_failure(result_code, result_message)
@@ -468,6 +539,136 @@ class ExecutionService:
         return ExecutionDecision("abort")
 
 
+# ── Vision-fallback helpers ────────────────────────────────────────────────────
+
+_vision_service_instances: dict[str, VisionReasoningService] = {}
+
+
+def _get_vision_service(reasoning_provider: Optional[str] = None) -> VisionReasoningService:
+    provider_key = str(reasoning_provider or "").strip().lower() or "__default__"
+    service = _vision_service_instances.get(provider_key)
+    if service is None:
+        service = VisionReasoningService(reasoning_provider=reasoning_provider)
+        _vision_service_instances[provider_key] = service
+    return service
+
+
+def _build_vision_coordinate_step(
+    target: VisionTapTarget,
+    element_hint: str = "",
+) -> "ReasonedStep":
+    from apps.agent_core.services.step_reasoning import ReasonedStep
+    return ReasonedStep(
+        action_type=ActionType.TAP_COORDINATES.value,
+        params={"x": target.x, "y": target.y},
+        reasoning=(
+            f"Vision fallback: '{target.description or element_hint}' located at "
+            f"({target.x}, {target.y}) with confidence {target.confidence:.2f}. "
+            f"{target.reasoning}"
+        ).strip(),
+        confidence=target.confidence * 0.9,   # slight discount vs node-based tap
+        is_goal_complete=False,
+        requires_confirmation=False,
+        sensitivity=ActionSensitivity.LOW.value,
+        source="vision_fallback",
+    )
+
+
+def _try_vision_fallback(
+    session: "AgentSession",
+    last_step: dict,
+    screenshot_b64: str,
+    screen_state: dict,
+) -> "Optional[ReasonedStep]":
+    """
+    Given a failed step and its piggybacked screenshot, ask the VLM where to tap.
+    Returns a ReasonedStep with TAP_COORDINATES, or None if the VLM cannot help.
+    """
+    params   = last_step.get("params") or {}
+    selector = params.get("selector") or {}
+    element_hint = (
+        selector.get("content_desc")
+        or selector.get("text")
+        or (selector.get("view_id") or "").split("/")[-1]
+        or "the target element"
+    )
+
+    target = _get_vision_service(session.reasoning_provider).find_tap_target(
+        goal_description=session.goal or "",
+        element_hint=element_hint,
+        screenshot_b64=screenshot_b64,
+        screen_width=screen_state.get("screen_width", 1080),
+        screen_height=screen_state.get("screen_height", 1920),
+    )
+    if target is None:
+        return None
+    return _build_vision_coordinate_step(target, element_hint=element_hint)
+
+
+def _try_llm_requested_screenshot_followup(
+    session: "AgentSession",
+    last_step: dict,
+    screenshot_b64: str,
+    screen_state: dict,
+) -> "Optional[ReasonedStep]":
+    params = last_step.get("params") or {}
+    element_hint = (
+        params.get("element_hint")
+        or (session.entities or {}).get("target_element")
+        or (session.entities or {}).get("recipient")
+        or session.goal
+        or "the target element"
+    )
+
+    target = _get_vision_service(session.reasoning_provider).find_tap_target(
+        goal_description=session.goal or "",
+        element_hint=str(element_hint)[:120],
+        screenshot_b64=screenshot_b64,
+        screen_width=screen_state.get("screen_width", 1080),
+        screen_height=screen_state.get("screen_height", 1920),
+    )
+    if target is None:
+        return None
+    return _build_vision_coordinate_step(target, element_hint=str(element_hint))
+
+
+def _dispatch_vision_step(
+    session: "AgentSession",
+    reasoned: "ReasonedStep",
+    screen_state: dict,
+) -> NextActionResponse:
+    """Build, audit, and return a NextActionResponse for a vision-derived step."""
+    action_id = f"vis_{uuid.uuid4().hex[:8]}"
+    next_action = _build_action_from_reasoned(
+        reasoned,
+        action_id=action_id,
+        screen_state=screen_state,
+        target_app=session.target_app or "",
+    )
+    AuditService.record(
+        session=session,
+        event_type=AuditEventType.STEP_DISPATCHED,
+        actor=AuditActor.SYSTEM,
+        payload={
+            "action_id":   next_action["id"],
+            "action_type": next_action["type"],
+            "step_index":  session.current_step_index,
+            "reasoning":   reasoned.reasoning,
+            "confidence":  reasoned.confidence,
+            "sensitivity": reasoned.sensitivity,
+            "source":      reasoned.source,
+        },
+    )
+    return NextActionResponse(
+        next_action=next_action,
+        status="execute",
+        executor_hint=session.target_app or "",
+        reason="",
+        reasoning=reasoned.reasoning,
+        confidence=reasoned.confidence,
+    )
+
+
 # ── LLM-mode execution path ────────────────────────────────────────────────────
 
 def _get_next_action_llm(
@@ -482,6 +683,100 @@ def _get_next_action_llm(
             None, "abort", "",
             "No intent data on session. POST to /intent/ first.",
         )
+
+    wait_response = _maybe_wait_for_target_app_after_launch(session, screen_state)
+    if wait_response is not None:
+        return wait_response
+
+    last_step = (session.get_recent_steps(1) or [{}])[-1]
+    last_action_type = str(last_step.get("action_type") or "")
+
+    # ── Trigger 0: LLM explicitly requested a screenshot on the previous turn
+    if last_step.get("result_success") and last_action_type == ActionType.GET_SCREENSHOT.value:
+        screenshot_b64 = pop_screenshot(str(session.id))
+        if screenshot_b64:
+            followup = _try_llm_requested_screenshot_followup(
+                session=session,
+                last_step=last_step,
+                screenshot_b64=screenshot_b64,
+                screen_state=screen_state,
+            )
+            if followup is not None:
+                logger.info(
+                    "Vision follow-up (LLM-requested screenshot): session=%s -> TAP_COORDINATES(%d,%d) conf=%.2f",
+                    session.id,
+                    followup.params["x"],
+                    followup.params["y"],
+                    followup.confidence,
+                )
+                return _dispatch_vision_step(session, followup, screen_state)
+
+    # ── Trigger 1: Reactive — element selector failure with piggybacked screenshot
+    last_code  = str(last_step.get("result_code") or "")
+    if not last_step.get("result_success") and last_code in _VISION_TRIGGER_CODES:
+        screenshot_b64 = pop_screenshot(str(session.id))
+        if screenshot_b64:
+            fallback = _try_vision_fallback(
+                session=session,
+                last_step=last_step,
+                screenshot_b64=screenshot_b64,
+                screen_state=screen_state,
+            )
+            if fallback is not None:
+                logger.info(
+                    "Vision fallback (reactive): session=%s code=%s → TAP_COORDINATES(%d,%d) conf=%.2f",
+                    session.id, last_code,
+                    fallback.params["x"], fallback.params["y"], fallback.confidence,
+                )
+                return _dispatch_vision_step(session, fallback, screen_state)
+
+    # ── Trigger 2: Proactive — only for known custom-renderer apps
+    node_count = len(screen_state.get("nodes") or [])
+    if (
+        session.target_app in _PROACTIVE_VISION_PACKAGES
+        and node_count <= _GAME_NODE_THRESHOLD
+    ):
+        screenshot_b64 = pop_screenshot(str(session.id))
+        if screenshot_b64:
+            element_hint = (session.entities or {}).get("target_element") or session.goal or ""
+            target = _get_vision_service(session.reasoning_provider).find_tap_target(
+                goal_description=session.goal or "",
+                element_hint=str(element_hint)[:80],
+                screenshot_b64=screenshot_b64,
+                screen_width=screen_state.get("screen_width", 1080),
+                screen_height=screen_state.get("screen_height", 1920),
+            )
+            if target is not None:
+                fallback = _build_vision_coordinate_step(target)
+                logger.info(
+                    "Vision fallback (game mode): session=%s nodes=%d → TAP_COORDINATES(%d,%d) conf=%.2f",
+                    session.id, node_count,
+                    fallback.params["x"], fallback.params["y"], fallback.confidence,
+                )
+                return _dispatch_vision_step(session, fallback, screen_state)
+        else:
+            # No cached screenshot yet — request one from the device
+            logger.info(
+                "Game mode: session=%s nodes=%d — requesting screenshot for next vision call",
+                session.id, node_count,
+            )
+            return NextActionResponse(
+                next_action={
+                    "id":                    f"screenshot_{uuid.uuid4().hex[:8]}",
+                    "type":                  ActionType.GET_SCREENSHOT.value,
+                    "params":                {},
+                    "sensitivity":           ActionSensitivity.LOW.value,
+                    "requires_confirmation": False,
+                    "timeout_ms":            5000,
+                    "retry_policy":          {"max_attempts": 1, "backoff_ms": 0},
+                },
+                status="execute",
+                executor_hint=session.target_app or "",
+                reason=(
+                    f"Only {node_count} accessibility node(s) visible — "
+                    "requesting screenshot for vision fallback."
+                ),
+            )
 
     svc = StepReasoningService(reasoning_provider=session.reasoning_provider)
 
@@ -626,6 +921,12 @@ def _get_next_action_llm(
         screen_state=screen_state,
         target_app=session.target_app or "",
     )
+    _log_llm_dispatch_block(
+        session=session,
+        reasoned=reasoned,
+        next_action=next_action,
+        screen_state=screen_state,
+    )
     AuditService.record(
         session=session,
         event_type=AuditEventType.STEP_DISPATCHED,
@@ -738,15 +1039,31 @@ def _build_action_from_reasoned(
     target_app: str = "",
 ) -> dict:
     """Convert a validated ReasonedStep into the action dict the frontend expects."""
+    action_type = reasoned.action_type
+    params = reasoned.params
+    if reasoned.action_type == ActionType.TAP_COORDINATES.value:
+        # Backward-compatible transport: older Flutter clients may not recognize
+        # TAP_COORDINATES, but all supported clients can execute a zero-distance
+        # swipe as a tap gesture.
+        x = int((reasoned.params or {}).get("x", 540))
+        y = int((reasoned.params or {}).get("y", 960))
+        action_type = ActionType.SWIPE.value
+        params = {
+            "start_x": x,
+            "start_y": y,
+            "end_x": x,
+            "end_y": y,
+            "duration_ms": 50,
+        }
     params = _augment_selector_params(
-        reasoned.action_type,
-        reasoned.params,
+        action_type,
+        params,
         screen_state=screen_state or {},
         target_app=target_app,
     )
     return {
         "id":                    action_id or f"llm_{uuid.uuid4().hex[:8]}",
-        "type":                  reasoned.action_type,
+        "type":                  action_type,
         "params":                params,
         "sensitivity":           reasoned.sensitivity,
         "requires_confirmation": reasoned.requires_confirmation,
@@ -847,6 +1164,83 @@ def _describe_result_failure(result_code: str, result_message: str) -> str:
     return ""
 
 
+def _normalize_soft_failure(
+    *,
+    action_type: str,
+    result_success: bool,
+    result_code: str,
+    result_message: str,
+    reasoning: str,
+    screen_hash_before: str,
+    screen_hash_after: str,
+) -> tuple[bool, str, str, str]:
+    if (
+        action_type not in _TAP_ACTION_TYPES
+        or not result_success
+        or not screen_hash_before
+        or not screen_hash_after
+        or screen_hash_before != screen_hash_after
+    ):
+        return result_success, result_code, result_message, reasoning
+
+    hint = "Screen did not change after this action — the element may not have been the right target."
+    normalized_reasoning = reasoning or ""
+    if hint not in normalized_reasoning:
+        normalized_reasoning = (
+            f"{normalized_reasoning} {hint}".strip()
+            if normalized_reasoning else hint
+        )
+
+    normalized_message = result_message or ""
+    if hint not in normalized_message:
+        normalized_message = (
+            f"{normalized_message} {hint}".strip()
+            if normalized_message else hint
+        )
+
+    return False, _SOFT_FAILURE_RESULT_CODE, normalized_message, normalized_reasoning
+
+
+def _maybe_wait_for_target_app_after_launch(
+    session: AgentSession,
+    screen_state: dict,
+) -> Optional[NextActionResponse]:
+    if not session.target_app:
+        return None
+
+    history = session.get_recent_steps(1)
+    if not history:
+        return None
+
+    last_step = history[-1] or {}
+    if not last_step.get("result_success"):
+        return None
+
+    action_type = str(last_step.get("action_type") or "").strip()
+    if action_type not in _POST_LAUNCH_WAIT_ACTIONS:
+        return None
+
+    params = last_step.get("params") or {}
+    expected_pkg = str(params.get("package_name") or session.target_app or "").strip()
+    actual_pkg = str(screen_state.get("foreground_package") or "").strip()
+    if expected_pkg and actual_pkg == expected_pkg:
+        return None
+
+    step_id = f"launch_{last_step.get('step_index', session.get_step_count())}"
+    status, reason = _handle_foreground_mismatch(
+        session,
+        step_id,
+        actual_pkg or "(unknown)",
+        expected_pkg or session.target_app,
+    )
+    return NextActionResponse(
+        None,
+        status,
+        expected_pkg or session.target_app,
+        reason,
+    )
+
+
 def _handle_foreground_mismatch(
     session: AgentSession,
     step_id: str,
@@ -940,15 +1334,26 @@ def _augment_selector_params(
         return params
 
     candidates: list[dict] = []
-    _append_candidate(candidates, selector)
-
     node = _find_node_for_selector(screen_state, selector)
+    generated_first = bool(
+        node
+        and selector.get("element_ref")
+        and not bool(node.get("clickable"))
+        and (str(node.get("text") or "").strip() or str(node.get("content_desc") or "").strip())
+    )
+
+    if not generated_first:
+        _append_candidate(candidates, selector)
+
     if node:
         for candidate in _node_selector_candidates(node):
             _append_candidate(candidates, candidate)
 
         for candidate in _executor_selector_candidates(target_app, node):
             _append_candidate(candidates, candidate)
+
+    if generated_first:
+        _append_candidate(candidates, selector)
 
     if len(candidates) > 1:
         params["selector_candidates"] = candidates
@@ -983,8 +1388,8 @@ def _node_selector_candidates(node: dict) -> list[dict]:
     enabled = node.get("enabled")
     clickable = node.get("clickable")
 
-    if view_id:
-        candidate = {"view_id": view_id}
+    if class_name and view_id and text:
+        candidate = {"class_name": class_name, "view_id": view_id, "text": text}
         if isinstance(enabled, bool):
             candidate["enabled"] = enabled
         candidates.append(candidate)
@@ -995,8 +1400,20 @@ def _node_selector_candidates(node: dict) -> list[dict]:
             candidate["enabled"] = enabled
         candidates.append(candidate)
 
+    if class_name and view_id and content_desc:
+        candidate = {"class_name": class_name, "view_id": view_id, "content_desc": content_desc}
+        if isinstance(enabled, bool):
+            candidate["enabled"] = enabled
+        candidates.append(candidate)
+
     if class_name and content_desc:
         candidate = {"class_name": class_name, "content_desc": content_desc}
+        if isinstance(enabled, bool):
+            candidate["enabled"] = enabled
+        candidates.append(candidate)
+
+    if view_id:
+        candidate = {"view_id": view_id}
         if isinstance(enabled, bool):
             candidate["enabled"] = enabled
         candidates.append(candidate)
@@ -1050,6 +1467,79 @@ def _append_candidate(candidates: list[dict], candidate: dict) -> None:
         return
     if cleaned not in candidates:
         candidates.append(cleaned)
+
+
+def _log_llm_dispatch_block(
+    *,
+    session: AgentSession,
+    reasoned: "ReasonedStep",
+    next_action: dict,
+    screen_state: dict,
+) -> None:
+    logger.info(
+        "\n%s\nDISPATCH\nsession=%s action_id=%s action=%s\nscreen=%s\nplan=%s\nreason=%s\n%s",
+        "=" * 72,
+        session.id,
+        next_action.get("id", ""),
+        next_action.get("type", ""),
+        screen_state.get("screen_hash", ""),
+        _debug_action_summary(next_action),
+        _debug_truncate(reasoned.reasoning or "(no reasoning)", 320),
+        "=" * 72,
+    )
+
+
+def _log_execution_result_block(
+    *,
+    session: AgentSession,
+    action_id: str,
+    action_type: str,
+    params: dict,
+    result_success: bool,
+    result_code: str,
+    result_message: str,
+    reasoning: str,
+    screen_hash_before: str,
+    screen_hash_after: str,
+) -> None:
+    logger.info(
+        "\n%s\nRESULT\nsession=%s action_id=%s action=%s outcome=%s code=%s\nscreen=%s -> %s\nplan=%s\nreason=%s\nmessage=%s\n%s",
+        "=" * 72,
+        session.id,
+        action_id,
+        action_type or "UNKNOWN",
+        "success" if result_success else "failure",
+        result_code or "OK",
+        screen_hash_before or "?",
+        screen_hash_after or "?",
+        _debug_action_summary({"type": action_type, "params": params}),
+        _debug_truncate(reasoning or "(no reasoning)", 240),
+        _debug_truncate(result_message or "(no message)", 200),
+        "=" * 72,
+    )
+
+
+def _debug_action_summary(action: dict) -> str:
+    action_type = str(action.get("type") or "").strip()
+    params = action.get("params") or {}
+    if action_type == ActionType.OPEN_APP.value:
+        return f"open {params.get('package_name', '(missing package_name)')}"
+    if action_type == ActionType.TYPE_TEXT.value:
+        text = str(params.get("text") or "")
+        return f"type '{_debug_truncate(text, 64)}'"
+
+    selector = params.get("selector")
+    if isinstance(selector, dict):
+        return f"selector={selector}"
+    if params:
+        return str(params)
+    return "(no params)"
+
+
+def _debug_truncate(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[: max(0, limit - 3)]}..."
 
 
 def _abort_session(

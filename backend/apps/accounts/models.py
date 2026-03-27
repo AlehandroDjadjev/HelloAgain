@@ -62,6 +62,11 @@ class AccountProfile(models.Model):
     dynamic_profile_summary = models.TextField(blank=True)
     profile_notes = models.TextField(blank=True)
     onboarding_answers = models.JSONField(default=dict, blank=True)
+    onboarding_completed = models.BooleanField(default=False)
+    voice_navigation_enabled = models.BooleanField(default=True)
+    microphone_permission_granted = models.BooleanField(default=False)
+    phone_permission_granted = models.BooleanField(default=False)
+    phone_permission_granted_at = models.DateTimeField(null=True, blank=True)
     contacts_permission_granted = models.BooleanField(default=False)
     contacts_permission_granted_at = models.DateTimeField(null=True, blank=True)
     share_phone_with_friends = models.BooleanField(default=True)
@@ -73,6 +78,13 @@ class AccountProfile(models.Model):
 
     class Meta:
         ordering = ["display_name", "user_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["normalized_phone_number"],
+                condition=~Q(normalized_phone_number=""),
+                name="unique_account_profile_normalized_phone_number",
+            ),
+        ]
 
     def __str__(self):
         return self.display_name or self.user.username
@@ -90,6 +102,10 @@ class AccountProfile(models.Model):
         self.normalized_phone_number = normalize_phone_number(self.phone_number)
         if not self.display_name:
             self.display_name = self.user.get_full_name().strip() or self.user.username
+        if self.phone_permission_granted and not self.phone_permission_granted_at:
+            self.phone_permission_granted_at = timezone.now()
+        if not self.phone_permission_granted:
+            self.phone_permission_granted_at = None
         if self.contacts_permission_granted and not self.contacts_permission_granted_at:
             self.contacts_permission_granted_at = timezone.now()
         if not self.contacts_permission_granted:
@@ -102,10 +118,44 @@ class AccountProfile(models.Model):
                 {
                     "normalized_phone_number",
                     "display_name",
+                    "phone_permission_granted_at",
                     "contacts_permission_granted_at",
                 }
             )
             kwargs["update_fields"] = list(fields)
+        super().save(*args, **kwargs)
+
+
+class OnboardingDraft(models.Model):
+    class Mode(models.TextChoices):
+        COLLECTING = "collecting", "Collecting"
+        LOGIN_CONFIRMATION = "login_confirmation", "Login Confirmation"
+        READY_TO_REGISTER = "ready_to_register", "Ready To Register"
+        COMPLETED = "completed", "Completed"
+
+    session_id = models.CharField(max_length=64, unique=True)
+    display_name = models.CharField(max_length=120, blank=True)
+    phone_number = models.CharField(max_length=32, blank=True)
+    normalized_phone_number = models.CharField(max_length=32, blank=True, db_index=True)
+    dynamic_profile_summary = models.TextField(blank=True)
+    conversation_history = models.JSONField(default=list, blank=True)
+    current_mode = models.CharField(
+        max_length=32,
+        choices=Mode.choices,
+        default=Mode.COLLECTING,
+    )
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-id"]
+
+    def __str__(self):
+        return self.session_id
+
+    def save(self, *args, **kwargs):
+        self.normalized_phone_number = normalize_phone_number(self.phone_number)
         super().save(*args, **kwargs)
 
 

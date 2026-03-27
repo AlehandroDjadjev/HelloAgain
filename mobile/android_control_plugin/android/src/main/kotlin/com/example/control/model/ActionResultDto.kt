@@ -10,19 +10,22 @@ data class ActionResultDto(
     val code: String,
     val message: String? = null,
     val updatedScreenState: ScreenStateDto? = null,
+    /** JPEG bytes captured at the moment of failure; null on success or API < 30. */
+    val screenshotJpeg: ByteArray? = null,
 ) {
     fun toMap(): Map<String, Any?> = mapOf(
         "success" to success,
         "code" to code,
         "message" to message,
         "updatedScreenState" to updatedScreenState?.toMap(),
+        "screenshotJpeg" to screenshotJpeg,
     )
 
     companion object {
         fun success(message: String? = null, screen: ScreenStateDto? = null) =
             ActionResultDto(true, "OK", message, screen)
 
-        fun failure(code: String, message: String) =
-            ActionResultDto(false, code, message, null)
+        fun failure(code: String, message: String, screenshot: ByteArray? = null) =
+            ActionResultDto(false, code, message, null, screenshot)
     }
 }

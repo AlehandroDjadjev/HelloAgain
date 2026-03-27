@@ -1,12 +1,14 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:whitespace/main.dart';
 
 void main() {
-  testWidgets('agent board app renders', (WidgetTester tester) async {
+  testWidgets('hello again intro renders', (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const AgentBoardApp());
+    await tester.pump();
 
-    expect(find.text('Agent Space'), findsNothing);
-    expect(find.textContaining('Semi Agent'), findsOneWidget);
+    expect(find.text('Hello Again'), findsOneWidget);
   });
 }
