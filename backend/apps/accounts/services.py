@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import math
 import re
 import secrets
+import time
+from dataclasses import dataclass
 from typing import Iterable
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils.text import slugify
@@ -26,6 +33,89 @@ from .models import (
     RecommendationActivity,
     normalize_email,
 )
+
+
+@dataclass(frozen=True)
+class IssuedAuthToken:
+    key: str
+    session_key: str
+
+
+_ACCOUNT_JWT_ALGORITHM = "HS256"
+_ACCOUNT_JWT_TYPE = "hello_again_access"
+_ACCOUNT_JWT_TTL_SECONDS = 60 * 60 * 24 * 30
+
+
+def _jwt_secret() -> bytes:
+    secret = getattr(settings, "ACCOUNT_JWT_SECRET", "") or settings.SECRET_KEY
+    return str(secret).encode("utf-8")
+
+
+def _base64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _base64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(f"{value}{padding}".encode("ascii"))
+
+
+def _jwt_sign(signing_input: str) -> str:
+    digest = hmac.new(
+        _jwt_secret(),
+        signing_input.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return _base64url_encode(digest)
+
+
+def _encode_account_jwt(payload: dict[str, object]) -> str:
+    header_segment = _base64url_encode(
+        json.dumps(
+            {"alg": _ACCOUNT_JWT_ALGORITHM, "typ": "JWT"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    payload_segment = _base64url_encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    signing_input = f"{header_segment}.{payload_segment}"
+    signature_segment = _jwt_sign(signing_input)
+    return f"{signing_input}.{signature_segment}"
+
+
+def _decode_account_jwt(token: str) -> dict[str, object] | None:
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return None
+    header_segment, payload_segment, signature_segment = parts
+    signing_input = f"{header_segment}.{payload_segment}"
+    expected_signature = _jwt_sign(signing_input)
+    if not hmac.compare_digest(signature_segment, expected_signature):
+        return None
+    try:
+        header = json.loads(_base64url_decode(header_segment).decode("utf-8"))
+        payload = json.loads(_base64url_decode(payload_segment).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        return None
+    if header.get("alg") != _ACCOUNT_JWT_ALGORITHM:
+        return None
+    if payload.get("token_type") != _ACCOUNT_JWT_TYPE:
+        return None
+    now = int(time.time())
+    try:
+        exp = int(payload.get("exp", 0) or 0)
+        iat = int(payload.get("iat", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if exp <= now or iat > now + 60:
+        return None
+    return payload
 
 
 def split_display_name(display_name: str) -> tuple[str, str]:
@@ -85,24 +175,52 @@ def ensure_account_profile(user: User) -> AccountProfile:
     return profile
 
 
-def issue_token(user: User) -> AccountToken:
+def issue_token(user: User) -> IssuedAuthToken:
+    profile = ensure_account_profile(user)
     token, _ = AccountToken.objects.update_or_create(
         user=user,
         defaults={"key": secrets.token_hex(24)},
     )
-    return token
+    now = int(time.time())
+    ttl_seconds = int(
+        getattr(settings, "ACCOUNT_JWT_TTL_SECONDS", _ACCOUNT_JWT_TTL_SECONDS)
+    )
+    jwt_token = _encode_account_jwt(
+        {
+            "sub": str(user.pk),
+            "user_id": user.pk,
+            "phone_number": profile.phone_number or "",
+            "display_name": profile.display_name or user.get_full_name().strip() or user.username,
+            "jti": token.key,
+            "iat": now,
+            "exp": now + max(60, ttl_seconds),
+            "token_type": _ACCOUNT_JWT_TYPE,
+        }
+    )
+    return IssuedAuthToken(key=jwt_token, session_key=token.key)
 
 
 def profile_for_token(token_key: str | None) -> AccountProfile | None:
     if not token_key:
         return None
+    payload = _decode_account_jwt(token_key)
+    if payload is None:
+        return None
+    try:
+        user_id = int(payload.get("user_id", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    session_key = str(payload.get("jti") or "").strip()
+    if user_id <= 0 or not session_key:
+        return None
     token = (
         AccountToken.objects.select_related("user", "user__account_profile", "user__account_profile__elder_profile")
-        .filter(key=token_key)
+        .filter(key=session_key, user_id=user_id)
         .first()
     )
     if not token:
         return None
+    token.save(update_fields=["last_used_at"])
     return ensure_account_profile(token.user)
 
 

@@ -7,6 +7,8 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
+import 'package:permission_handler/permission_handler.dart' as permission;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'src/config/backend_base_url.dart';
 
@@ -49,6 +51,8 @@ class MeetupScreen extends StatefulWidget {
 }
 
 class _MeetupScreenState extends State<MeetupScreen> {
+  static const _shownNotificationIdsKey =
+      'hello_again.meetup.shown_notification_ids';
   final FlutterLocalNotificationsPlugin _notificationsPlugin =
       FlutterLocalNotificationsPlugin();
   final Set<Marker> _markers = {};
@@ -61,7 +65,11 @@ class _MeetupScreenState extends State<MeetupScreen> {
   int? _selectedFriendUserId;
   bool _isLoadingFriends = true;
   bool _isLoading = false;
+  bool _notificationsPermissionGranted = false;
+  bool _notificationPermissionChecked = false;
   String? _errorMessage;
+  Timer? _notificationsPollTimer;
+  Set<int> _shownNotificationIds = <int>{};
 
   @override
   void initState() {
@@ -72,6 +80,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
 
   @override
   void dispose() {
+    _notificationsPollTimer?.cancel();
     super.dispose();
   }
 
@@ -95,8 +104,142 @@ class _MeetupScreenState extends State<MeetupScreen> {
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    await androidImpl?.requestNotificationsPermission();
-    await androidImpl?.requestExactAlarmsPermission();
+    final prefs = await SharedPreferences.getInstance();
+    _shownNotificationIds =
+        (prefs.getStringList(_shownNotificationIdsKey) ?? const [])
+            .map(int.tryParse)
+            .whereType<int>()
+            .toSet();
+    final granted = await _ensureNotificationPermission(
+      androidImpl: androidImpl,
+    );
+    if (!mounted) return;
+    setState(() {
+      _notificationsPermissionGranted = granted;
+      _notificationPermissionChecked = true;
+    });
+    if (granted) {
+      _startNotificationsPolling();
+      unawaited(_pollMeetupNotifications());
+    }
+  }
+
+  Future<bool> _ensureNotificationPermission({
+    AndroidFlutterLocalNotificationsPlugin? androidImpl,
+  }) async {
+    if (kIsWeb) return false;
+    final status = await permission.Permission.notification.status;
+    if (status.isGranted) {
+      await androidImpl?.requestExactAlarmsPermission();
+      return true;
+    }
+    final requested = await permission.Permission.notification.request();
+    final pluginGranted =
+        await androidImpl?.requestNotificationsPermission() ?? false;
+    final granted = requested.isGranted || pluginGranted;
+    if (granted) {
+      await androidImpl?.requestExactAlarmsPermission();
+    }
+    return granted;
+  }
+
+  void _startNotificationsPolling() {
+    _notificationsPollTimer?.cancel();
+    _notificationsPollTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(_pollMeetupNotifications()),
+    );
+  }
+
+  Future<void> _pollMeetupNotifications() async {
+    final token = (widget.accountToken ?? '').trim();
+    if (kIsWeb || !_notificationsPermissionGranted || token.isEmpty) {
+      return;
+    }
+    try {
+      final response = await http.get(
+        Uri.parse('${_backendBaseUrl()}/api/meetup/friends/notifications/'),
+        headers: _authHeaders(),
+      );
+      if (response.statusCode != 200) {
+        return;
+      }
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final notifications = (data['notifications'] as List? ?? const [])
+          .whereType<Map>()
+          .map((row) => row.cast<String, dynamic>())
+          .toList();
+      final dueReminders = (data['due_reminders'] as List? ?? const [])
+          .whereType<Map>()
+          .map((row) => row.cast<String, dynamic>())
+          .toList();
+
+      final deliverable = <Map<String, dynamic>>[
+        ...notifications.where((item) => item['read_at'] == null),
+        ...dueReminders.where((item) => item['read_at'] == null),
+      ];
+      final unseen = deliverable
+          .where(
+            (item) => !_shownNotificationIds.contains(_notificationId(item)),
+          )
+          .toList();
+      if (unseen.isEmpty) {
+        return;
+      }
+
+      final shownIds = <int>[];
+      for (final item in unseen) {
+        final notificationId = _notificationId(item);
+        if (notificationId <= 0) {
+          continue;
+        }
+        await _notificationsPlugin.show(
+          id: notificationId,
+          title: (item['title'] ?? 'Hello Again').toString(),
+          body: (item['body'] ?? '').toString(),
+          notificationDetails: _meetupNotificationDetails(),
+        );
+        shownIds.add(notificationId);
+        _shownNotificationIds.add(notificationId);
+      }
+
+      if (shownIds.isNotEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setStringList(
+          _shownNotificationIdsKey,
+          _shownNotificationIds.map((item) => item.toString()).toList(),
+        );
+        await _markNotificationsRead(shownIds);
+      }
+    } catch (_) {}
+  }
+
+  int _notificationId(Map<String, dynamic> item) {
+    return int.tryParse((item['id'] ?? '0').toString()) ?? 0;
+  }
+
+  NotificationDetails _meetupNotificationDetails() {
+    const androidDetails = AndroidNotificationDetails(
+      'meetup_channel',
+      'Meetup Reminders',
+      channelDescription: 'Meetup invites and reminders from Hello Again',
+      importance: Importance.max,
+      priority: Priority.high,
+    );
+    return const NotificationDetails(android: androidDetails);
+  }
+
+  Future<void> _markNotificationsRead(List<int> ids) async {
+    if (ids.isEmpty) {
+      return;
+    }
+    try {
+      await http.post(
+        Uri.parse('${_backendBaseUrl()}/api/meetup/friends/notifications/'),
+        headers: _authHeaders(withJson: true),
+        body: jsonEncode({'notification_ids': ids}),
+      );
+    } catch (_) {}
   }
 
   Map<String, String> _authHeaders({bool withJson = false}) {
@@ -196,10 +339,9 @@ class _MeetupScreenState extends State<MeetupScreen> {
 
       if (response.statusCode != 201 && response.statusCode != 200) {
         final body = jsonDecode(response.body);
-        final apiError =
-            body is Map<String, dynamic>
-                ? (body['error'] as String? ?? body['message'] as String?)
-                : null;
+        final apiError = body is Map<String, dynamic>
+            ? (body['error'] as String? ?? body['message'] as String?)
+            : null;
         setState(() {
           _errorMessage =
               apiError ?? 'Не успях да намеря подходящо място за среща.';
@@ -211,10 +353,11 @@ class _MeetupScreenState extends State<MeetupScreen> {
       final data = jsonDecode(response.body) as Map<String, dynamic>;
       final invite = data['invite'] as Map<String, dynamic>?;
       final payloadData = invite?['payload'] as Map<String, dynamic>?;
-      final bestMatch =
-          (payloadData?['best_match'] as Map?)?.cast<String, dynamic>();
-      final recommendations =
-          bestMatch == null ? const <Map<String, dynamic>>[] : [bestMatch];
+      final bestMatch = (payloadData?['best_match'] as Map?)
+          ?.cast<String, dynamic>();
+      final recommendations = bestMatch == null
+          ? const <Map<String, dynamic>>[]
+          : [bestMatch];
 
       _lastParticipants = [
         {
@@ -300,14 +443,40 @@ class _MeetupScreenState extends State<MeetupScreen> {
   }
 
   Future<void> _showReminderDialog() async {
+    if (!_notificationsPermissionGranted) {
+      final androidImpl = _notificationsPlugin
+          .resolvePlatformSpecificImplementation<
+            AndroidFlutterLocalNotificationsPlugin
+          >();
+      final granted = await _ensureNotificationPermission(
+        androidImpl: androidImpl,
+      );
+      if (!mounted) return;
+      setState(() {
+        _notificationsPermissionGranted = granted;
+        _notificationPermissionChecked = true;
+      });
+      if (!granted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Разреши известията на телефона, за да получаваш напомняния за срещи.',
+            ),
+          ),
+        );
+        return;
+      }
+      _startNotificationsPolling();
+    }
+
     final selectedTime = await showTimePicker(
       context: context,
       initialTime: TimeOfDay.now(),
       builder: (context, child) {
         return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: const ColorScheme.light(primary: _kAccent),
-          ),
+          data: Theme.of(
+            context,
+          ).copyWith(colorScheme: const ColorScheme.light(primary: _kAccent)),
           child: child!,
         );
       },
@@ -319,7 +488,9 @@ class _MeetupScreenState extends State<MeetupScreen> {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('Напомнянето е записано за ${selectedTime.format(context)}.'),
+        content: Text(
+          'Напомнянето е записано за ${selectedTime.format(context)}.',
+        ),
       ),
     );
   }
@@ -340,24 +511,14 @@ class _MeetupScreenState extends State<MeetupScreen> {
       scheduled = scheduled.add(const Duration(days: 1));
     }
 
-    const androidDetails = AndroidNotificationDetails(
-      'meetup_channel',
-      'Meetup Reminders',
-      channelDescription: 'Reminders for your meetups',
-      importance: Importance.max,
-      priority: Priority.high,
-    );
-    const platformDetails = NotificationDetails(android: androidDetails);
-
     final meetStartStr =
         '${scheduled.hour.toString().padLeft(2, '0')}:'
         '${scheduled.minute.toString().padLeft(2, '0')}';
     await _notificationsPlugin.show(
       id: 0,
       title: 'Напомняне за среща',
-      body:
-          'Имаш среща в ${_bestMatch!['place_name']} около $meetStartStr.',
-      notificationDetails: platformDetails,
+      body: 'Имаш среща в ${_bestMatch!['place_name']} около $meetStartStr.',
+      notificationDetails: _meetupNotificationDetails(),
     );
   }
 
@@ -456,7 +617,8 @@ class _MeetupScreenState extends State<MeetupScreen> {
                         Builder(
                           builder: (context) {
                             final selected = _friends.where(
-                              (friend) => friend.userId == _selectedFriendUserId,
+                              (friend) =>
+                                  friend.userId == _selectedFriendUserId,
                             );
                             if (selected.isEmpty) {
                               return const SizedBox.shrink();
@@ -464,7 +626,8 @@ class _MeetupScreenState extends State<MeetupScreen> {
                             final friend = selected.first;
                             final description = friend.description.trim();
                             final locationText =
-                                (friend.homeLat != null && friend.homeLng != null)
+                                (friend.homeLat != null &&
+                                    friend.homeLng != null)
                                 ? 'Локация: ${friend.homeLat!.toStringAsFixed(5)}, ${friend.homeLng!.toStringAsFixed(5)}'
                                 : 'Локация: липсва в профила на приятеля';
                             return Column(
@@ -495,6 +658,57 @@ class _MeetupScreenState extends State<MeetupScreen> {
                   ),
                 ),
                 const SizedBox(height: 14),
+                if (_notificationPermissionChecked &&
+                    !_notificationsPermissionGranted) ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFFF7ED),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: const Color(0xFFFCD34D)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.notifications_off_outlined,
+                          color: Color(0xFFB45309),
+                        ),
+                        const SizedBox(width: 10),
+                        const Expanded(
+                          child: Text(
+                            'Разреши известията, за да получаваш покани и напомняния за срещи на телефона.',
+                            style: TextStyle(
+                              color: Color(0xFF92400E),
+                              fontSize: 12.5,
+                            ),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            final androidImpl = _notificationsPlugin
+                                .resolvePlatformSpecificImplementation<
+                                  AndroidFlutterLocalNotificationsPlugin
+                                >();
+                            final granted = await _ensureNotificationPermission(
+                              androidImpl: androidImpl,
+                            );
+                            if (!mounted) return;
+                            setState(() {
+                              _notificationsPermissionGranted = granted;
+                              _notificationPermissionChecked = true;
+                            });
+                            if (granted) {
+                              _startNotificationsPolling();
+                              unawaited(_pollMeetupNotifications());
+                            }
+                          },
+                          child: const Text('Разреши'),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                ],
                 if (_errorMessage != null) ...[
                   Text(
                     _errorMessage!,
@@ -529,7 +743,10 @@ class _MeetupScreenState extends State<MeetupScreen> {
                   ),
                   const SizedBox(height: 10),
                   Text(
-                    (_bestMatch!['recommended_when_bg'] ?? _bestMatch!['recommended_time'] ?? '').toString(),
+                    (_bestMatch!['recommended_when_bg'] ??
+                            _bestMatch!['recommended_time'] ??
+                            '')
+                        .toString(),
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       fontSize: 16,
@@ -556,10 +773,16 @@ class _MeetupScreenState extends State<MeetupScreen> {
                     const SizedBox(height: 12),
                     const Text(
                       'Още предложения',
-                      style: TextStyle(fontWeight: FontWeight.w700, color: _kText),
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        color: _kText,
+                      ),
                     ),
                     const SizedBox(height: 8),
-                    ..._recommendations.skip(1).take(3).map(
+                    ..._recommendations
+                        .skip(1)
+                        .take(3)
+                        .map(
                           (item) => Container(
                             margin: const EdgeInsets.only(bottom: 8),
                             padding: const EdgeInsets.all(10),
@@ -580,7 +803,10 @@ class _MeetupScreenState extends State<MeetupScreen> {
                                 const SizedBox(height: 4),
                                 Text(
                                   'Среща: ${(item['recommended_when_bg'] ?? item['recommended_time'] ?? '').toString()}',
-                                  style: const TextStyle(color: _kMuted, fontSize: 12.5),
+                                  style: const TextStyle(
+                                    color: _kMuted,
+                                    fontSize: 12.5,
+                                  ),
                                 ),
                               ],
                             ),

@@ -6,6 +6,8 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
+from recommendations.gat.feature_schema import get_default_feature_vector
+from recommendations.services.compatibility_engine import compare_people
 
 
 _WEATHER_BG_MAP = {
@@ -135,6 +137,112 @@ _SEMANTIC_RULES = {
 }
 
 _WEATHER_WEIGHT = 0.20
+_GRAPH_PLACE_BONUS_WEIGHT = 0.10
+
+_PLACE_FEATURE_PRIORS = {
+    'park': {
+        'interest_nature': 0.92,
+        'activity_level': 0.74,
+        'adventure_comfort': 0.66,
+        'mobility_confidence': 0.62,
+        'tolerance_for_noise': 0.40,
+        'prefers_small_groups': 0.58,
+    },
+    'playground': {
+        'interest_nature': 0.82,
+        'activity_level': 0.70,
+        'adventure_comfort': 0.62,
+        'mobility_confidence': 0.60,
+    },
+    'tourist_attraction': {
+        'interest_nature': 0.68,
+        'interest_history': 0.60,
+        'openness': 0.62,
+        'activity_level': 0.58,
+    },
+    'cafe': {
+        'emotional_warmth': 0.68,
+        'conversation_depth': 0.68,
+        'prefers_small_groups': 0.76,
+        'formality': 0.42,
+        'activity_level': 0.42,
+        'tolerance_for_noise': 0.60,
+    },
+    'coffee_shop': {
+        'emotional_warmth': 0.66,
+        'conversation_depth': 0.66,
+        'prefers_small_groups': 0.74,
+        'formality': 0.40,
+        'activity_level': 0.42,
+        'tolerance_for_noise': 0.62,
+    },
+    'bakery': {
+        'emotional_warmth': 0.62,
+        'conversation_depth': 0.58,
+        'prefers_small_groups': 0.68,
+        'formality': 0.38,
+    },
+    'library': {
+        'interest_books': 0.94,
+        'conversation_depth': 0.80,
+        'prefers_small_groups': 0.84,
+        'tolerance_for_noise': 0.22,
+        'activity_level': 0.30,
+    },
+    'book_store': {
+        'interest_books': 0.88,
+        'conversation_depth': 0.72,
+        'prefers_small_groups': 0.76,
+        'tolerance_for_noise': 0.30,
+    },
+    'museum': {
+        'interest_history': 0.86,
+        'interest_arts': 0.78,
+        'conversation_depth': 0.74,
+        'prefers_small_groups': 0.68,
+        'activity_level': 0.44,
+    },
+    'art_gallery': {
+        'interest_arts': 0.88,
+        'openness': 0.70,
+        'conversation_depth': 0.68,
+        'prefers_small_groups': 0.62,
+    },
+    'restaurant': {
+        'formality': 0.72,
+        'interest_cooking': 0.62,
+        'emotional_warmth': 0.62,
+        'prefers_small_groups': 0.64,
+        'financial_caution': 0.40,
+    },
+    'shopping_mall': {
+        'activity_level': 0.60,
+        'tolerance_for_noise': 0.80,
+        'schedule_flexibility': 0.62,
+        'openness': 0.58,
+    },
+}
+
+_MEETUP_GRAPH_FEATURES = [
+    'emotional_warmth',
+    'openness',
+    'interest_nature',
+    'interest_arts',
+    'interest_books',
+    'interest_history',
+    'interest_music',
+    'interest_sports',
+    'interest_cooking',
+    'formality',
+    'conversation_depth',
+    'prefers_small_groups',
+    'activity_level',
+    'tolerance_for_noise',
+    'mobility_confidence',
+    'adventure_comfort',
+    'schedule_flexibility',
+    'financial_caution',
+]
 
 
 def _bounded(value):
@@ -255,16 +363,136 @@ def _semantic_profile_from_description(description):
 
 
 def _vector_from_semantic_profile(profile):
-    return {
-        'interest_nature': profile['features']['nature'],
-        'interest_arts': _bounded((profile['features']['history'] * 0.55) + (profile['features']['music'] * 0.45)),
-        'interest_books': profile['features']['books'],
-        'interest_history': profile['features']['history'],
-        'interest_sports': profile['features']['sports'],
-        'interest_music': profile['features']['music'],
-        'prefers_small_groups': _bounded((profile['social_style']['deep_talk'] * 0.66) + 0.20),
-        'activity_level': profile['activity_level'],
-    }
+    vector = get_default_feature_vector()
+    vector.update(
+        {
+            'emotional_warmth': _bounded(
+                (profile['social_style']['casual_hangout'] * 0.45) + 0.30
+            ),
+            'openness': _bounded(
+                (profile['features']['history'] * 0.25)
+                + (profile['features']['music'] * 0.20)
+                + (profile['features']['nature'] * 0.20)
+                + 0.20
+            ),
+            'interest_nature': profile['features']['nature'],
+            'interest_arts': _bounded(
+                (profile['features']['history'] * 0.55)
+                + (profile['features']['music'] * 0.45)
+            ),
+            'interest_books': profile['features']['books'],
+            'interest_history': profile['features']['history'],
+            'interest_sports': profile['features']['sports'],
+            'interest_music': profile['features']['music'],
+            'formality': _bounded(
+                0.65 - (profile['social_style']['casual_hangout'] * 0.25)
+            ),
+            'conversation_depth': _bounded(
+                (profile['social_style']['deep_talk'] * 0.70) + 0.15
+            ),
+            'prefers_small_groups': _bounded(
+                (profile['social_style']['deep_talk'] * 0.66) + 0.20
+            ),
+            'activity_level': profile['activity_level'],
+            'tolerance_for_noise': _bounded(
+                (profile['environment']['outdoor'] * 0.35)
+                + (profile['social_style']['casual_hangout'] * 0.25)
+                + 0.20
+            ),
+            'mobility_confidence': _bounded(
+                (profile['activity_level'] * 0.45)
+                + (profile['environment']['outdoor'] * 0.25)
+                + 0.20
+            ),
+            'adventure_comfort': _bounded(
+                (profile['meeting_type']['active'] * 0.55)
+                + (profile['environment']['outdoor'] * 0.20)
+                + 0.20
+            ),
+            'schedule_flexibility': _bounded(0.35 + (profile['confidence'] * 0.30)),
+            'financial_caution': 0.50,
+        }
+    )
+    return vector
+
+
+def _place_feature_vector(place_types, averaged_profile=None):
+    vector = get_default_feature_vector()
+    priors = []
+    for place_type in place_types or []:
+        prior = _PLACE_FEATURE_PRIORS.get(place_type)
+        if prior:
+            priors.append(prior)
+    if not priors:
+        return vector
+
+    for feature_name in _MEETUP_GRAPH_FEATURES:
+        prior_values = [
+            float(prior[feature_name])
+            for prior in priors
+            if feature_name in prior
+        ]
+        if prior_values:
+            vector[feature_name] = sum(prior_values) / len(prior_values)
+
+    explicit = (averaged_profile or {}).get('explicit_preferences', {})
+    if explicit:
+        vector['interest_nature'] = _bounded(
+            (0.75 * vector.get('interest_nature', 0.5))
+            + (0.25 * float(explicit.get('park', 0.5)))
+        )
+        vector['conversation_depth'] = _bounded(
+            (0.80 * vector.get('conversation_depth', 0.5))
+            + (0.20 * float(explicit.get('cafe', 0.5)))
+        )
+    return vector
+
+
+def _graph_place_affinity_score(place_types, participant_vectors, averaged_profile):
+    vectors = [
+        item for item in (participant_vectors or []) if isinstance(item, dict) and item
+    ]
+    if not vectors:
+        return 0.5
+
+    place_vector = _place_feature_vector(place_types, averaged_profile)
+    place_scores = []
+    for vector in vectors:
+        comparison = compare_people(
+            vector,
+            place_vector,
+            graph_score=0.5,
+            embedding_score=0.5,
+            features=_MEETUP_GRAPH_FEATURES,
+        )
+        place_scores.append(float(comparison.get('compatibility_score', 0.5)))
+
+    if not place_scores:
+        return 0.5
+
+    pairwise_scores = []
+    if len(vectors) >= 2:
+        for index in range(len(vectors)):
+            for offset in range(index + 1, len(vectors)):
+                comparison = compare_people(
+                    vectors[index],
+                    vectors[offset],
+                    graph_score=0.5,
+                    embedding_score=0.5,
+                    features=_MEETUP_GRAPH_FEATURES,
+                )
+                pairwise_scores.append(
+                    float(comparison.get('compatibility_score', 0.5))
+                )
+
+    avg_place_score = sum(place_scores) / len(place_scores)
+    min_place_score = min(place_scores)
+    pair_cohesion = (
+        sum(pairwise_scores) / len(pairwise_scores) if pairwise_scores else avg_place_score
+    )
+    return _bounded(
+        (0.55 * avg_place_score) + (0.25 * min_place_score) + (0.20 * pair_cohesion)
+    )
 
 
 def _pair_user_similarity(profiles):
@@ -741,12 +969,21 @@ def get_ranked_meetup_spots(
                 amenities_score += 1.2
 
             place_compatibility = _bounded(min(1.0, (amenities_score / 14.0)))
-            total_score_01 = _bounded(
+            graph_place_score = _graph_place_affinity_score(
+                types,
+                merged_vectors,
+                averaged_profile,
+            )
+            base_score_01 = _bounded(
                 (0.38 * place_compatibility)
                 + (_WEATHER_WEIGHT * context_weather)
                 + (0.18 * dist_score)
                 + (0.10 * reviews_score)
                 + (0.14 * user_similarity)
+            )
+            total_score_01 = _bounded(
+                base_score_01
+                + (_GRAPH_PLACE_BONUS_WEIGHT * (graph_place_score - 0.5))
             )
             match_score = int(round(100 * total_score_01))
 
@@ -794,6 +1031,9 @@ def get_ranked_meetup_spots(
                     'distance': round(dist_score, 4),
                     'reviews': round(reviews_score, 4),
                     'user_similarity': round(user_similarity, 4),
+                    'graph_place_score': round(graph_place_score, 4),
+                    'graph_place_bonus_weight': _GRAPH_PLACE_BONUS_WEIGHT,
+                    'base_score': round(base_score_01, 4),
                 },
             }
             recommendation.update(_format_meetup_when_bg(vh['time']))

@@ -45,6 +45,27 @@ class AccountApiTests(TestCase):
             contacts_permission_granted=contacts_permission_granted,
         )
 
+    def test_issue_token_returns_jwt_and_me_accepts_it(self):
+        profile = self._create_profile(
+            username="jwt-user",
+            email="jwt@example.com",
+            phone_number="+359888111999",
+            display_name="JWT User",
+        )
+        token = issue_token(profile.user)
+
+        self.assertEqual(len(token.key.split(".")), 3)
+
+        response = self.client.get(
+            "/api/accounts/me/",
+            **{"HTTP_AUTHORIZATION": f"Token {token.key}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["profile"]["user_id"], profile.user_id)
+        self.assertEqual(payload["profile"]["phone_number"], "+359888111999")
+
     @patch("apps.accounts.views.seed_social_graph_for_profile")
     @patch("apps.accounts.views.sync_profile_to_recommendations")
     def test_register_and_login_support_phone_first_voice_profile_fields(

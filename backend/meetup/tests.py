@@ -6,7 +6,8 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.accounts.models import AccountProfile, AccountToken, FriendRequest
+from apps.accounts.models import AccountProfile, FriendRequest
+from apps.accounts.services import issue_token
 from .models import MeetupInvite, MeetupNotification
 
 from .services import get_ranked_meetup_spots
@@ -111,6 +112,8 @@ class MeetupSemanticRankingTests(TestCase):
 
 		self.assertTrue(rows)
 		self.assertEqual(rows[0]['types'][0], 'park')
+		self.assertIn('graph_place_score', rows[0]['score_breakdown'])
+		self.assertGreaterEqual(rows[0]['score_breakdown']['graph_place_score'], 0.5)
 
 	def test_similar_interests_different_tone_remain_high(self, *_):
 		rows = get_ranked_meetup_spots(
@@ -191,8 +194,8 @@ class MeetupInviteNotificationApiTests(TestCase):
 			status=FriendRequest.Status.ACCEPTED,
 		)
 
-		self.requester_token = AccountToken.objects.create(user=self.requester_user, key='token-requester')
-		self.invited_token = AccountToken.objects.create(user=self.invited_user, key='token-invited')
+		self.requester_token = issue_token(self.requester_user)
+		self.invited_token = issue_token(self.invited_user)
 
 	def _headers(self, token_key: str) -> dict:
 		return {'HTTP_AUTHORIZATION': f'Token {token_key}'}
@@ -248,6 +251,14 @@ class MeetupInviteNotificationApiTests(TestCase):
 			center_lat=42.689,
 			center_lng=23.336,
 		)
+		request_note = MeetupNotification.objects.create(
+			recipient_profile=self.invited_profile,
+			invite=invite,
+			notification_type=MeetupNotification.Type.INVITE_REQUEST,
+			title='Нова покана за среща',
+			body='Alice предлага среща.',
+			payload={'requires_response': True},
+		)
 
 		response = self.client.post(
 			f'/api/meetup/friends/invites/{invite.id}/respond/',
@@ -258,10 +269,12 @@ class MeetupInviteNotificationApiTests(TestCase):
 
 		self.assertEqual(response.status_code, 200)
 		invite.refresh_from_db()
+		request_note.refresh_from_db()
 		self.assertEqual(invite.status, MeetupInvite.Status.ACCEPTED)
+		self.assertIsNotNone(request_note.read_at)
 
 		notes = MeetupNotification.objects.filter(invite=invite)
-		self.assertEqual(notes.count(), 3)
+		self.assertEqual(notes.count(), 4)
 		self.assertEqual(
 			notes.filter(notification_type=MeetupNotification.Type.INVITE_ACCEPTED).count(),
 			1,
@@ -271,6 +284,48 @@ class MeetupInviteNotificationApiTests(TestCase):
 		expected_time = invite.proposed_time - timedelta(minutes=20)
 		for reminder in reminders:
 			self.assertEqual(reminder.scheduled_for, expected_time)
+
+	def test_notifications_feed_hides_future_reminders_until_due(self):
+		invite = MeetupInvite.objects.create(
+			requester_profile=self.requester_profile,
+			invited_profile=self.invited_profile,
+			status=MeetupInvite.Status.ACCEPTED,
+			proposed_time=timezone.now() + timedelta(hours=1),
+			place_name='Talk Cafe',
+			place_lat=42.688,
+			place_lng=23.335,
+			center_lat=42.689,
+			center_lng=23.336,
+		)
+		future_reminder = MeetupNotification.objects.create(
+			recipient_profile=self.requester_profile,
+			invite=invite,
+			notification_type=MeetupNotification.Type.REMINDER_20M,
+			title='Напомняне',
+			body='Срещата започва скоро.',
+			scheduled_for=timezone.now() + timedelta(minutes=25),
+		)
+		ready_reminder = MeetupNotification.objects.create(
+			recipient_profile=self.requester_profile,
+			invite=invite,
+			notification_type=MeetupNotification.Type.REMINDER_20M,
+			title='Напомняне',
+			body='Срещата започва след 20 минути.',
+			scheduled_for=timezone.now() - timedelta(minutes=1),
+		)
+
+		response = self.client.get(
+			'/api/meetup/friends/notifications/',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 200)
+		body = response.json()
+		notification_ids = {item['id'] for item in body['notifications']}
+		due_ids = {item['id'] for item in body['due_reminders']}
+		self.assertNotIn(future_reminder.id, notification_ids)
+		self.assertIn(ready_reminder.id, notification_ids)
+		self.assertEqual(due_ids, {ready_reminder.id})
 
 	def test_decline_notifies_requester_that_no_one_accepted(self):
 		invite = MeetupInvite.objects.create(
@@ -283,6 +338,14 @@ class MeetupInviteNotificationApiTests(TestCase):
 			center_lat=42.689,
 			center_lng=23.336,
 		)
+		request_note = MeetupNotification.objects.create(
+			recipient_profile=self.invited_profile,
+			invite=invite,
+			notification_type=MeetupNotification.Type.INVITE_REQUEST,
+			title='Нова покана за среща',
+			body='Alice предлага среща.',
+			payload={'requires_response': True},
+		)
 
 		response = self.client.post(
 			f'/api/meetup/friends/invites/{invite.id}/respond/',
@@ -293,8 +356,10 @@ class MeetupInviteNotificationApiTests(TestCase):
 
 		self.assertEqual(response.status_code, 200)
 		body = response.json()
+		request_note.refresh_from_db()
 		self.assertEqual(body['notifications'][0]['type'], MeetupNotification.Type.INVITE_DECLINED)
 		self.assertTrue(body['notifications'][0]['payload']['all_declined'])
+		self.assertIsNotNone(request_note.read_at)
 
 		requester_notes = MeetupNotification.objects.filter(
 			recipient_profile=self.requester_profile,

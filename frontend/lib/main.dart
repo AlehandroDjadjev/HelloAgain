@@ -174,7 +174,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
 
     /*
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
-      return true;
+      retur  n true;
     }
 
     final current = await permission.Permission.phone.status;

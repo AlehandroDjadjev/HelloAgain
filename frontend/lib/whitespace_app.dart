@@ -77,8 +77,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     _RegistrationStep(
       id: 'name',
       title: 'Вашето име',
-      prompt:
-          'Здравейте. Кажете ми как искате приложението да Ви нарича.',
+      prompt: 'Здравейте. Кажете ми как искате приложението да Ви нарича.',
     ),
     _RegistrationStep(
       id: 'phone_number',
@@ -107,8 +106,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     _RegistrationStep(
       id: 'good_meetup',
       title: 'Хубава среща',
-      prompt:
-          'Какво прави една среща топла, спокойна и успешна за Вас?',
+      prompt: 'Какво прави една среща топла, спокойна и успешна за Вас?',
     ),
   ];
 
@@ -277,7 +275,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         _statusText = 'Моля, кажете само „да“ или „не“.';
       });
 
-      final capturedTurn = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
+      final capturedTurn = await _voiceBridge.captureAudioTurn(
+        language: 'bg-BG',
+      );
       final confirmation = await _resolveCapturedTranscript(capturedTurn);
       final normalized = _normalizeConfirmationAnswer(confirmation);
       if (normalized != null) {
@@ -297,7 +297,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     return false;
   }
 
-  Future<String> _resolveCapturedTranscript(CapturedAudioTurn capturedTurn) async {
+  Future<String> _resolveCapturedTranscript(
+    CapturedAudioTurn capturedTurn,
+  ) async {
     final directTranscript = (capturedTurn.transcript ?? '').trim();
     if (directTranscript.isNotEmpty) {
       return directTranscript;
@@ -309,7 +311,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       sessionId: 'registration_${DateTime.now().millisecondsSinceEpoch}',
       language: capturedTurn.language,
     );
-    return (payload['transcript'] ?? payload['message'] ?? '').toString().trim();
+    return (payload['transcript'] ?? payload['message'] ?? '')
+        .toString()
+        .trim();
   }
 
   String _normalizeAnswer(String stepId, String transcript) {
@@ -396,14 +400,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       'добре',
       'става',
     };
-    const noWords = {
-      'не',
-      'no',
-      'wrong',
-      'грешно',
-      'повтори',
-      'отново',
-    };
+    const noWords = {'не', 'no', 'wrong', 'грешно', 'повтори', 'отново'};
 
     if (words.any(yesWords.contains)) {
       return true;
@@ -421,8 +418,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         language: 'bg-BG',
       );
       final audioBase64 = (payload['audio_base64'] ?? '').toString().trim();
-      final mimeType =
-          (payload['audio_mime_type'] ?? 'audio/wav').toString().trim();
+      final mimeType = (payload['audio_mime_type'] ?? 'audio/wav')
+          .toString()
+          .trim();
       if (audioBase64.isNotEmpty) {
         await _voiceBridge.playBase64Audio(
           audioBase64: audioBase64,
@@ -477,9 +475,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   Widget build(BuildContext context) {
     switch (_stage) {
       case HelloAgainStage.booting:
-        return const Scaffold(
-          body: Center(child: CircularProgressIndicator()),
-        );
+        return const Scaffold(body: Center(child: CircularProgressIndicator()));
       case HelloAgainStage.intro:
         return IntroOnboardingScreen(
           showContinue: _showContinue,
@@ -692,9 +688,7 @@ class RegistrationScreen extends StatelessWidget {
                   decoration: BoxDecoration(
                     color: Colors.white.withValues(alpha: 0.82),
                     borderRadius: BorderRadius.circular(28),
-                    border: Border.all(
-                      color: const Color(0xFFE5D6C7),
-                    ),
+                    border: Border.all(color: const Color(0xFFE5D6C7)),
                     boxShadow: [
                       BoxShadow(
                         color: const Color(0xFF8B6A55).withValues(alpha: 0.09),
@@ -757,9 +751,7 @@ class RegistrationScreen extends StatelessWidget {
                     decoration: BoxDecoration(
                       color: Colors.white.withValues(alpha: 0.70),
                       borderRadius: BorderRadius.circular(28),
-                      border: Border.all(
-                        color: const Color(0xFFE8DCCF),
-                      ),
+                      border: Border.all(color: const Color(0xFFE8DCCF)),
                     ),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -879,34 +871,23 @@ class _WarmPaperBackground extends StatelessWidget {
         Positioned(
           top: -28,
           right: -10,
-          child: _BackdropOrb(
-            diameter: 180,
-            color: const Color(0xFFE8D7C6),
-          ),
+          child: _BackdropOrb(diameter: 180, color: const Color(0xFFE8D7C6)),
         ),
         Positioned(
           top: 120,
           left: -46,
-          child: _BackdropOrb(
-            diameter: 128,
-            color: const Color(0xFFE3D4C3),
-          ),
+          child: _BackdropOrb(diameter: 128, color: const Color(0xFFE3D4C3)),
         ),
         Positioned(
           bottom: -44,
           right: 18,
-          child: _BackdropOrb(
-            diameter: 168,
-            color: const Color(0xFFDDCBB8),
-          ),
+          child: _BackdropOrb(diameter: 168, color: const Color(0xFFDDCBB8)),
         ),
         Positioned.fill(
           child: DecoratedBox(
             decoration: BoxDecoration(
               color: Colors.white.withValues(alpha: 0.06),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.22),
-              ),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.22)),
             ),
           ),
         ),
@@ -917,10 +898,7 @@ class _WarmPaperBackground extends StatelessWidget {
 }
 
 class _BackdropOrb extends StatelessWidget {
-  const _BackdropOrb({
-    required this.diameter,
-    required this.color,
-  });
+  const _BackdropOrb({required this.diameter, required this.color});
 
   final double diameter;
   final Color color;
@@ -962,11 +940,27 @@ class AppAccountSession {
     required this.token,
     required this.userId,
     required this.displayName,
+    this.phoneNumber = '',
   });
 
   final String token;
   final int userId;
   final String displayName;
+  final String phoneNumber;
+
+  AppAccountSession copyWith({
+    String? token,
+    int? userId,
+    String? displayName,
+    String? phoneNumber,
+  }) {
+    return AppAccountSession(
+      token: token ?? this.token,
+      userId: userId ?? this.userId,
+      displayName: displayName ?? this.displayName,
+      phoneNumber: phoneNumber ?? this.phoneNumber,
+    );
+  }
 }
 
 class AgentBoardScreen extends StatefulWidget {
@@ -1349,7 +1343,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
               .catchError((_) {}),
         );
       } else if (speechText.isNotEmpty) {
-        _trackSpeechPlayback(_voiceBridge.playText(speechText).catchError((_) {}));
+        _trackSpeechPlayback(
+          _voiceBridge.playText(speechText).catchError((_) {}),
+        );
       }
       return;
     }
@@ -1571,8 +1567,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                               decoration: InputDecoration(
                                 hintText: _isListening
                                     ? (kIsWeb
-                                        ? 'Listening in the browser...'
-                                        : 'Listening on your phone...')
+                                          ? 'Listening in the browser...'
+                                          : 'Listening on your phone...')
                                     : _voiceLoopEnabled
                                     ? 'Voice mode is on. Speak your next request...'
                                     : 'Write a prompt or use the mic...',
@@ -1604,14 +1600,17 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                       borderRadius: BorderRadius.circular(20),
                                       boxShadow: [
                                         BoxShadow(
-                                          color: const Color(0xFFB85A40).withValues(alpha: 0.26),
+                                          color: const Color(
+                                            0xFFB85A40,
+                                          ).withValues(alpha: 0.26),
                                           blurRadius: 18,
                                           offset: const Offset(0, 10),
                                         ),
                                       ],
                                     ),
                                     child: Row(
-                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
                                       children: [
                                         Icon(
                                           (_isListening || _voiceLoopEnabled)
@@ -1621,7 +1620,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                         ),
                                         const SizedBox(width: 10),
                                         Text(
-                                          _voiceLoopEnabled ? 'Voice On' : 'Voice',
+                                          _voiceLoopEnabled
+                                              ? 'Voice On'
+                                              : 'Voice',
                                           style: const TextStyle(
                                             color: Colors.white,
                                             fontSize: 15,
@@ -1636,14 +1637,20 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                               const SizedBox(width: 12),
                               Expanded(
                                 child: GestureDetector(
-                                  onTap: (_isBusy || _isListening) ? null : _sendPrompt,
+                                  onTap: (_isBusy || _isListening)
+                                      ? null
+                                      : _sendPrompt,
                                   child: Container(
                                     height: 54,
                                     decoration: BoxDecoration(
-                                      color: Colors.white.withValues(alpha: 0.88),
+                                      color: Colors.white.withValues(
+                                        alpha: 0.88,
+                                      ),
                                       borderRadius: BorderRadius.circular(20),
                                       border: Border.all(
-                                        color: Colors.black.withValues(alpha: 0.08),
+                                        color: Colors.black.withValues(
+                                          alpha: 0.08,
+                                        ),
                                         width: 0.8,
                                       ),
                                     ),
@@ -1655,7 +1662,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                             ? 'Listening'
                                             : 'Send Prompt',
                                         style: TextStyle(
-                                          color: Colors.black.withValues(alpha: 0.74),
+                                          color: Colors.black.withValues(
+                                            alpha: 0.74,
+                                          ),
                                           fontSize: 14,
                                           fontWeight: FontWeight.w700,
                                         ),
@@ -1833,7 +1842,8 @@ class AgentUserProfileView extends StatelessWidget {
         ? Map<String, dynamic>.from(user['match_summary'] as Map)
         : null;
     final whyTheyMatch = (matchSummary?['why_they_match'] as List?) ?? const [];
-    final sharedInterests = (matchSummary?['shared_interests'] as List?) ?? const [];
+    final sharedInterests =
+        (matchSummary?['shared_interests'] as List?) ?? const [];
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -1844,15 +1854,9 @@ class AgentUserProfileView extends StatelessWidget {
           value: (user['display_name'] ?? user['username'] ?? 'Unknown user')
               .toString(),
         ),
-        _UserSectionLabel(
-          text: 'Friend status',
-          value: friendStatus,
-        ),
+        _UserSectionLabel(text: 'Friend status', value: friendStatus),
         if (description.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Description',
-            value: description,
-          ),
+          _UserSectionLabel(text: 'Description', value: description),
         if (topTraits.isNotEmpty)
           _UserSectionLabel(
             text: 'Top traits',
@@ -1875,25 +1879,16 @@ class AgentUserProfileView extends StatelessWidget {
             value: whyTheyMatch.map((item) => item.toString()).join(' '),
           ),
         if (email != null && email.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Email',
-            value: email,
-          ),
+          _UserSectionLabel(text: 'Email', value: email),
         if (phoneNumber != null && phoneNumber.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Phone',
-            value: phoneNumber,
-          ),
+          _UserSectionLabel(text: 'Phone', value: phoneNumber),
       ],
     );
   }
 }
 
 class _UserSectionLabel extends StatelessWidget {
-  const _UserSectionLabel({
-    required this.text,
-    required this.value,
-  });
+  const _UserSectionLabel({required this.text, required this.value});
 
   final String text;
   final String value;
@@ -1955,6 +1950,7 @@ class AgentBackendClient {
       userId: int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0,
       displayName: (profile['display_name'] ?? profile['name'] ?? 'Friend')
           .toString(),
+      phoneNumber: (profile['phone_number'] ?? '').toString().trim(),
     );
   }
 
@@ -1981,6 +1977,7 @@ class AgentBackendClient {
       token: (payload['token'] ?? '').toString(),
       userId: int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0,
       displayName: (profile['display_name'] ?? name).toString(),
+      phoneNumber: (profile['phone_number'] ?? phoneNumber).toString().trim(),
     );
   }
 
@@ -2012,9 +2009,7 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> completeOnboarding({
-    required String sessionId,
-  }) {
+  Future<Map<String, dynamic>> completeOnboarding({required String sessionId}) {
     return _postJson('/api/accounts/onboarding/complete/', {
       'session_id': sessionId,
       'microphone_permission_granted': true,
@@ -2046,10 +2041,7 @@ class AgentBackendClient {
     required String text,
     String language = 'bg-BG',
   }) {
-    return _postJson('/api/voice/speak/', {
-      'text': text,
-      'language': language,
-    });
+    return _postJson('/api/voice/speak/', {'text': text, 'language': language});
   }
 
   Future<Map<String, dynamic>> startAgentRun({
@@ -2102,9 +2094,9 @@ class AgentBackendClient {
 
   Future<Map<String, dynamic>> _postJson(
     String path,
-    Map<String, dynamic> payload,
-    {String? token}
-  ) async {
+    Map<String, dynamic> payload, {
+    String? token,
+  }) async {
     final response = await _sendWithTimeout(
       () => http.post(
         _baseUri.resolve(path),
