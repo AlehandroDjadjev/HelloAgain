@@ -9,6 +9,18 @@ from recommendations.gat.feature_schema import get_default_feature_vector, get_f
 from recommendations.services.intake_clarification import build_clarification_signal_map
 
 _TOKEN_RE = re.compile(r"[a-zA-Z']+")
+_NEGATION_WORDS = {"not", "no", "never", "dont", "don't", "cannot", "can't", "avoid", "avoids", "dislike", "dislikes", "hate", "hates"}
+
+
+def _normalize_token(token: str) -> str:
+    normalized = token.lower().strip()
+    if normalized.endswith("'s"):
+        normalized = normalized[:-2]
+    if len(normalized) > 4 and normalized.endswith("ies"):
+        normalized = normalized[:-3] + "y"
+    elif len(normalized) > 3 and normalized.endswith("s") and not normalized.endswith("ss"):
+        normalized = normalized[:-1]
+    return normalized
 
 _FEATURE_RUBRICS: dict[str, dict[str, tuple[str, ...]]] = {
     "extroversion": {
@@ -49,7 +61,7 @@ _FEATURE_RUBRICS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "interest_nature": {
         "positive": ("nature", "garden", "gardening", "park", "flowers", "walking"),
-        "negative": (),
+        "negative": ("hate park", "hate parks", "dislike park", "dislike parks", "avoid park", "avoid parks"),
     },
     "interest_family": {
         "positive": ("family", "grandchildren", "children", "relatives", "home"),
@@ -144,8 +156,24 @@ _FEATURE_RUBRICS: dict[str, dict[str, tuple[str, ...]]] = {
         "negative": (),
     },
     "interest_sports": {
-        "positive": ("sports", "football", "basketball", "tennis", "match", "training", "exercise"),
-        "negative": (),
+        "positive": (
+            "sports",
+            "football",
+            "basketball",
+            "tennis",
+            "volleyball",
+            "match",
+            "training",
+            "exercise",
+        ),
+        "negative": (
+            "hate sports",
+            "dislike sports",
+            "avoid sports",
+            "hate volleyball",
+            "dislike volleyball",
+            "avoid volleyball",
+        ),
     },
     "interest_games": {
         "positive": ("games", "cards", "chess", "board games", "puzzles"),
@@ -271,7 +299,22 @@ _FEATURE_RUBRICS: dict[str, dict[str, tuple[str, ...]]] = {
 
 
 def _tokenize(text: str) -> list[str]:
-    return [token.lower() for token in _TOKEN_RE.findall(text)]
+    return [_normalize_token(token) for token in _TOKEN_RE.findall(text)]
+
+
+def _phrase_is_negated(tokens: list[str], phrase: str) -> bool:
+    phrase_tokens = [_normalize_token(token) for token in _TOKEN_RE.findall(phrase)]
+    if not phrase_tokens:
+        return False
+    size = len(phrase_tokens)
+    for index in range(0, max(0, len(tokens) - size + 1)):
+        if tokens[index : index + size] != phrase_tokens:
+            continue
+        window_start = max(0, index - 3)
+        context = tokens[window_start:index]
+        if any(token in _NEGATION_WORDS for token in context):
+            return True
+    return False
 
 
 def _clamp(value: float) -> float:
@@ -326,8 +369,38 @@ def _rubric_score(tokens: list[str], description: str, feature_name: str) -> tup
     rubric = _FEATURE_RUBRICS.get(feature_name, {"positive": (), "negative": ()})
     positives = rubric.get("positive") or ()
     negatives = rubric.get("negative") or ()
-    positive_hits = [phrase for phrase in positives if phrase in description or phrase in tokens]
-    negative_hits = [phrase for phrase in negatives if phrase in description or phrase in tokens]
+    positive_hits: list[str] = []
+    negative_hits: list[str] = []
+    negated_positive_hits: list[str] = []
+    negated_negative_hits: list[str] = []
+
+    for phrase in positives:
+        phrase_lc = phrase.lower()
+        phrase_tokens = [_normalize_token(token) for token in _TOKEN_RE.findall(phrase_lc)]
+        phrase_present = (phrase_lc in description) or (
+            len(phrase_tokens) == 1 and phrase_tokens[0] in tokens
+        )
+        if not phrase_present:
+            continue
+        if _phrase_is_negated(tokens, phrase_lc):
+            negated_positive_hits.append(phrase)
+            negative_hits.append(phrase)
+        else:
+            positive_hits.append(phrase)
+
+    for phrase in negatives:
+        phrase_lc = phrase.lower()
+        phrase_tokens = [_normalize_token(token) for token in _TOKEN_RE.findall(phrase_lc)]
+        phrase_present = (phrase_lc in description) or (
+            len(phrase_tokens) == 1 and phrase_tokens[0] in tokens
+        )
+        if not phrase_present:
+            continue
+        if _phrase_is_negated(tokens, phrase_lc):
+            negated_negative_hits.append(phrase)
+            positive_hits.append(phrase)
+        else:
+            negative_hits.append(phrase)
     score = 0.5
     if positive_hits:
         score += min(0.42, 0.18 * len(positive_hits))
@@ -336,6 +409,8 @@ def _rubric_score(tokens: list[str], description: str, feature_name: str) -> tup
     return _clamp(score), {
         "positive_hits": positive_hits[:5],
         "negative_hits": negative_hits[:5],
+        "negated_positive_hits": negated_positive_hits[:5],
+        "negated_negative_hits": negated_negative_hits[:5],
         "signal_strength": round(
             abs(len(positive_hits) - len(negative_hits)) / max(1, len(positives) + len(negatives)),
             4,

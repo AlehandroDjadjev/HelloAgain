@@ -1,0 +1,137 @@
+{
+  "name": "home_launcher",
+  "screen_state": {
+    "foreground_package": "com.android.launcher",
+    "window_title": "Home",
+    "screen_hash": "home_0",
+    "focused_element_ref": null,
+    "is_sensitive": false,
+    "nodes": [
+      {
+        "ref": "root",
+        "class_name": "android.widget.FrameLayout",
+        "text": null,
+        "content_desc": null,
+        "clickable": false,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 0, "top": 0, "right": 1080, "bottom": 2400 },
+        "children": ["search_bar", "chrome_icon", "maps_icon", "whatsapp_icon", "dock"]
+      },
+      {
+        "ref": "search_bar",
+        "class_name": "android.widget.TextView",
+        "text": "Search",
+        "content_desc": "Search",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 80, "top": 90, "right": 1000, "bottom": 180 },
+        "children": []
+      },
+      {
+        "ref": "chrome_icon",
+        "class_name": "android.widget.TextView",
+        "text": "Chrome",
+        "content_desc": "Chrome",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 120, "top": 420, "right": 320, "bottom": 620 },
+        "children": []
+      },
+      {
+        "ref": "maps_icon",
+        "class_name": "android.widget.TextView",
+        "text": "Maps",
+        "content_desc": "Maps",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 380, "top": 420, "right": 580, "bottom": 620 },
+        "children": []
+      },
+      {
+        "ref": "whatsapp_icon",
+        "class_name": "android.widget.TextView",
+        "text": "WhatsApp",
+        "content_desc": "WhatsApp",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 640, "top": 420, "right": 840, "bottom": 620 },
+        "children": []
+      },
+      {
+        "ref": "dock",
+        "class_name": "android.widget.LinearLayout",
+        "text": null,
+        "content_desc": null,
+        "clickable": false,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 0, "top": 2150, "right": 1080, "bottom": 2400 },
+        "children": ["phone_icon", "messages_icon", "camera_icon", "browser_icon"]
+      },
+      {
+        "ref": "phone_icon",
+        "class_name": "android.widget.ImageView",
+        "text": null,
+        "content_desc": "Phone",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 90, "top": 2200, "right": 210, "bottom": 2320 },
+        "children": []
+      },
+      {
+        "ref": "messages_icon",
+        "class_name": "android.widget.ImageView",
+        "text": null,
+        "content_desc": "Messages",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 320, "top": 2200, "right": 440, "bottom": 2320 },
+        "children": []
+      },
+      {
+        "ref": "camera_icon",
+        "class_name": "android.widget.ImageView",
+        "text": null,
+        "content_desc": "Camera",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 550, "top": 2200, "right": 670, "bottom": 2320 },
+        "children": []
+      },
+      {
+        "ref": "browser_icon",
+        "class_name": "android.widget.ImageView",
+        "text": null,
+        "content_desc": "Browser",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 780, "top": 2200, "right": 900, "bottom": 2320 },
+        "children": []
+      }
+    ]
+  },
+  "result": {
+    "success": true,
+    "code": "OK",
+    "screen_hash_after": "chrome_newtab_1"
+  }
+}

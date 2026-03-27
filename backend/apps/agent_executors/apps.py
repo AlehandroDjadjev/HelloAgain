@@ -10,3 +10,7 @@ class AgentExecutorsConfig(AppConfig):
     def ready(self) -> None:
         # Importing each executor module triggers @ExecutorRegistry.register
         import apps.agent_executors.whatsapp.executor  # noqa: F401
+        import apps.agent_executors.maps.executor      # noqa: F401
+        import apps.agent_executors.chrome.executor    # noqa: F401
+        import apps.agent_executors.gmail.executor     # noqa: F401
+        import apps.agent_executors.brawlstars.executor  # noqa: F401

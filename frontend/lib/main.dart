@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:geolocator/geolocator.dart';
 
+import 'src/screens/permission_screen.dart';
 import 'meetup_screen.dart';
 import 'voice_lab_screen.dart';
 import 'weather_screen.dart';
@@ -31,8 +32,7 @@ class HelloAgainApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
-      themeMode: ThemeMode.system,
-      home: const MainShell(),
+      home: const PermissionScreen(),
     );
   }
 
@@ -45,6 +45,10 @@ class HelloAgainApp extends StatelessWidget {
       colorScheme: ColorScheme.fromSeed(
         seedColor: seed,
         brightness: brightness,
+        surface: isDark ? const Color(0xFF0F172A) : Colors.white,
+        surfaceContainerHighest: isDark
+            ? const Color(0xFF1E293B)
+            : const Color(0xFFF1F5F9),
       ),
       scaffoldBackgroundColor: isDark
           ? const Color(0xFF0F172A)
@@ -189,6 +193,16 @@ class _MainShellState extends State<MainShell> {
           ),
         ],
       ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+      ),
+        style: OutlinedButton.styleFrom(
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
     );
   }
 }
@@ -196,7 +210,6 @@ class _MainShellState extends State<MainShell> {
 class _LocationFeaturePlaceholder extends StatelessWidget {
   const _LocationFeaturePlaceholder({
     required this.title,
-    required this.description,
     required this.icon,
     required this.isLoading,
     required this.errorMessage,

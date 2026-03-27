@@ -426,18 +426,26 @@ def _match_row(
     score_breakdown = comparison.get("score_breakdown", {}) if comparison else {}
     feature_alignment = float(score_breakdown.get("feature_alignment", 0.5))
     certainty_score = float((comparison or {}).get("certainty_score", 0.0))
+    requester_fit_score = float((comparison or {}).get("compatibility_score", 0.0))
     row["discovery_mode"] = discovery_mode
     row["raw_score"] = round(_bounded(raw_score), 4)
-    row["match_percent"] = calibrate_match_percent(
-        raw_score,
-        feature_alignment=feature_alignment,
-        certainty_score=certainty_score,
-        graph_score=graph_score,
-    )
+    if discovery_mode == RecommendationActivity.DiscoveryMode.DESCRIBE_SOMEONE and query_comparison:
+        query_fit_score = float((query_comparison or {}).get("compatibility_score", 0.0))
+        row["match_percent"] = int(round(100 * _bounded(query_fit_score)))
+    elif comparison:
+        # Keep the displayed percentage consistent with match_summary text.
+        row["match_percent"] = int(round(100 * _bounded(requester_fit_score)))
+    else:
+        row["match_percent"] = calibrate_match_percent(
+            raw_score,
+            feature_alignment=feature_alignment,
+            certainty_score=certainty_score,
+            graph_score=graph_score,
+        )
     row["score_components"] = {
         "graph_score": round(_bounded(graph_score), 4),
         "activity_score": round(_bounded(activity_score), 4),
-        "requester_fit_score": round(_bounded((comparison or {}).get("compatibility_score", 0.0)), 4),
+        "requester_fit_score": round(_bounded(requester_fit_score), 4),
         "query_fit_score": round(_bounded((query_comparison or {}).get("compatibility_score", 0.0)), 4),
         "keyword_fit_score": round(
             _bounded(((query_comparison or {}).get("score_breakdown") or {}).get("keyword_fit_score", 0.0)),
@@ -547,32 +555,34 @@ def recommend_profiles_for_description(
 ) -> list[dict]:
     query_profile = extract_query_profile(description)
     matched_contact_ids = matched_profile_ids_for_owner(viewer)
+    graph_scores = graph_scores_for_profile(viewer)
     rows: list[dict] = []
     queryset = AccountProfile.objects.select_related("user", "elder_profile").exclude(pk=viewer.pk)
     for target in queryset[: max(limit * 5, 40)]:
         if not target.elder_profile_id:
             continue
+        target_graph_score = float(graph_scores.get(target.elder_profile_id or -1, 0.0))
         query_comparison = compare_people(
             query_profile["feature_vector"],
             target.elder_profile.feature_vector or {},
             left_confidence=query_profile["feature_confidence"],
             right_confidence=target.elder_profile.feature_confidence or {},
-            graph_score=0.0,
-            embedding_score=0.0,
+            graph_score=target_graph_score,
+            embedding_score=target_graph_score,
         )
-        requester_comparison = build_match_summary(viewer, target, graph_score=0.0)
+        requester_comparison = build_match_summary(viewer, target, graph_score=target_graph_score)
         semantic_query_fit = float(query_comparison.get("compatibility_score", 0.0))
         keyword_fit = keyword_overlap_score(description, target.description)
         query_fit = (0.72 * semantic_query_fit) + (0.28 * keyword_fit)
         requester_fit = float((requester_comparison or {}).get("compatibility_score", 0.0))
         activity_score = activity_affinity_for_pair(viewer, target)
-        raw_score = (0.75 * query_fit) + (0.15 * requester_fit) + (0.10 * activity_score)
+        raw_score = (0.60 * query_fit) + (0.15 * requester_fit) + (0.10 * activity_score) + (0.15 * target_graph_score)
         rows.append(
             _match_row(
                 viewer=viewer,
                 target=target,
                 matched_contact_ids=matched_contact_ids,
-                graph_score=0.0,
+                graph_score=target_graph_score,
                 activity_score=activity_score,
                 raw_score=raw_score,
                 discovery_mode=RecommendationActivity.DiscoveryMode.DESCRIBE_SOMEONE,

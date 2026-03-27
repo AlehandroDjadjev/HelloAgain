@@ -2,8 +2,6 @@ enum PipelinePhase {
   idle,
   creatingSession,
   parsingIntent,
-  buildingPlan,
-  approvingPlan,
   executing,
   awaitingConfirmation,
   completed,
@@ -13,19 +11,18 @@ enum PipelinePhase {
 
 extension PipelinePhaseLabel on PipelinePhase {
   String get label => switch (this) {
-        PipelinePhase.idle => 'Idle',
-        PipelinePhase.creatingSession => 'Creating session…',
-        PipelinePhase.parsingIntent => 'Parsing intent…',
-        PipelinePhase.buildingPlan => 'Building plan…',
-        PipelinePhase.approvingPlan => 'Approving plan…',
-        PipelinePhase.executing => 'Executing…',
-        PipelinePhase.awaitingConfirmation => 'Awaiting confirmation',
-        PipelinePhase.completed => 'Completed',
-        PipelinePhase.failed => 'Failed',
-        PipelinePhase.cancelled => 'Cancelled',
-      };
+    PipelinePhase.idle => 'Idle',
+    PipelinePhase.creatingSession => 'Creating session...',
+    PipelinePhase.parsingIntent => 'Parsing intent...',
+    PipelinePhase.executing => 'Executing...',
+    PipelinePhase.awaitingConfirmation => 'Awaiting confirmation',
+    PipelinePhase.completed => 'Completed',
+    PipelinePhase.failed => 'Failed',
+    PipelinePhase.cancelled => 'Cancelled',
+  };
 
-  bool get isTerminal => this == PipelinePhase.completed ||
+  bool get isTerminal =>
+      this == PipelinePhase.completed ||
       this == PipelinePhase.failed ||
       this == PipelinePhase.cancelled;
 
@@ -53,12 +50,14 @@ class StepEntry {
   final String id;
   final String type;
   final String label;
+  final String reasoning;
   StepStatus status;
 
   StepEntry({
     required this.id,
     required this.type,
     required this.label,
+    this.reasoning = '',
     this.status = StepStatus.pending,
   });
 }

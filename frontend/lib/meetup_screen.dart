@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
@@ -7,10 +9,9 @@ import 'package:geolocator/geolocator.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 
-// Palette
 const _kBackground = Color(0xFFF9FAFB);
 const _kCard = Colors.white;
-const _kAccent = Color(0xFF2563EB); // Electric blue
+const _kAccent = Color(0xFF2563EB);
 const _kText = Color(0xFF111827);
 const _kMapStyle = '''
 [
@@ -39,6 +40,12 @@ class MeetupScreen extends StatefulWidget {
 }
 
 class _MeetupScreenState extends State<MeetupScreen> {
+  final List<Map<String, double>> mockParticipants = const [
+    {'lat': 42.6977, 'lng': 23.3219},
+    {'lat': 42.6895, 'lng': 23.3197},
+    {'lat': 42.6993, 'lng': 23.3238},
+  ];
+
   Map<String, dynamic>? bestMatch;
   bool isLoading = false;
   String? errorMessage;
@@ -87,7 +94,11 @@ class _MeetupScreenState extends State<MeetupScreen> {
   }
 
   Future<void> fetchRecommendation() async {
-    setState(() { isLoading = true; errorMessage = null; });
+    setState(() {
+      isLoading = true;
+      errorMessage = null;
+    });
+
     try {
       final response = await http.post(
         Uri.parse('${_backendBaseUrl()}/api/meetup/recommend/'),
@@ -98,18 +109,28 @@ class _MeetupScreenState extends State<MeetupScreen> {
           ]
         }),
       );
+
       if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
         setState(() {
-          bestMatch = data['best_match'];
+          bestMatch = data['best_match'] as Map<String, dynamic>?;
           _updateMarkers();
         });
+
         if (bestMatch != null && mapController != null) {
-          mapController!.animateCamera(CameraUpdate.newLatLngZoom(
-            LatLng(bestMatch!['place_lat'], bestMatch!['place_lng']), 15.5,
-          ));
+          mapController!.animateCamera(
+            CameraUpdate.newLatLngZoom(
+              LatLng(
+                bestMatch!['place_lat'] as double,
+                bestMatch!['place_lng'] as double,
+              ),
+              15.5,
+            ),
+          );
         }
       } else {
+        setState(() {
+          errorMessage = 'Не можахме да намерим подходящо място.';
         final body = jsonDecode(response.body);
         final apiError = body is Map<String, dynamic> ? body['error'] as String? : null;
         setState(() {
@@ -117,9 +138,13 @@ class _MeetupScreenState extends State<MeetupScreen> {
         });
       }
     } catch (_) {
-      setState(() { errorMessage = 'Няма връзка със сървъра.'; });
+      setState(() {
+        errorMessage = 'Няма връзка със сървъра.';
+      });
     } finally {
-      setState(() { isLoading = false; });
+      setState(() {
+        isLoading = false;
+      });
     }
   }
 
@@ -132,11 +157,11 @@ class _MeetupScreenState extends State<MeetupScreen> {
         position: LatLng(bestMatch!['place_lat'], bestMatch!['place_lng']),
         icon: BitmapDescriptor.defaultMarkerWithHue(220),
         infoWindow: InfoWindow(
-          title: bestMatch!['place_name'],
+          title: bestMatch!['place_name'] as String?,
           snippet: 'Среща',
         ),
-      ));
-    }
+      ),
+    );
   }
 
   Future<void> _showReminderDialog() async {
@@ -213,8 +238,14 @@ class _MeetupScreenState extends State<MeetupScreen> {
     return Scaffold(
       backgroundColor: _kBackground,
       appBar: AppBar(
-        title: const Text('Среща С Приятели',
-            style: TextStyle(fontWeight: FontWeight.w700, fontSize: 20, color: _kText)),
+        title: const Text(
+          'Среща С Приятели',
+          style: TextStyle(
+            fontWeight: FontWeight.w700,
+            fontSize: 20,
+            color: _kText,
+          ),
+        ),
         backgroundColor: _kCard,
         elevation: 0,
         centerTitle: true,
@@ -234,8 +265,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
               onMapCreated: (c) { mapController = c; },
             ),
           ),
-
-          // ─── Info Card ───────────────────────────────────────────────────
           Container(
             color: _kCard,
             padding: const EdgeInsets.fromLTRB(28, 28, 28, 36),
@@ -245,7 +274,8 @@ class _MeetupScreenState extends State<MeetupScreen> {
               children: [
                 Center(
                   child: Container(
-                    width: 40, height: 4,
+                    width: 40,
+                    height: 4,
                     margin: const EdgeInsets.only(bottom: 24),
                     decoration: BoxDecoration(
                       color: const Color(0xFFE5E7EB),
@@ -253,34 +283,53 @@ class _MeetupScreenState extends State<MeetupScreen> {
                     ),
                   ),
                 ),
-
                 if (errorMessage != null)
                   Padding(
                     padding: const EdgeInsets.only(bottom: 20),
-                    child: Text(errorMessage!,
-                        style: const TextStyle(color: Color(0xFFDC2626), fontSize: 15),
-                        textAlign: TextAlign.center),
+                    child: Text(
+                      errorMessage!,
+                      style: const TextStyle(
+                        color: Color(0xFFDC2626),
+                        fontSize: 15,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
                   ),
-
                 if (bestMatch == null && !isLoading && errorMessage == null)
                   const Padding(
                     padding: EdgeInsets.only(bottom: 24),
-                    child: Text('Намерете идеалния момент за среща',
-                        style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700, color: _kText),
-                        textAlign: TextAlign.center),
+                    child: Text(
+                      'Намерете идеалния момент за среща',
+                      style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.w700,
+                        color: _kText,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
                   ),
-
                 if (bestMatch != null) ...[
                   Text(
-                    bestMatch!['place_name'],
-                    style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800, color: _kText, height: 1.2),
+                    bestMatch!['place_name'] as String,
+                    style: const TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.w800,
+                      color: _kText,
+                      height: 1.2,
+                    ),
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 12),
+<<<<<<< HEAD
+=======
 
+>>>>>>> 7cd63273acbbe5f49af277b2dc0cd80f351ff394
                   Center(
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 10,
+                      ),
                       decoration: BoxDecoration(
                         color: const Color(0xFFEFF6FF),
                         borderRadius: BorderRadius.circular(50),
@@ -288,11 +337,22 @@ class _MeetupScreenState extends State<MeetupScreen> {
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          const Icon(Icons.schedule_rounded, color: _kAccent, size: 20),
+                          const Icon(
+                            Icons.schedule_rounded,
+                            color: _kAccent,
+                            size: 20,
+                          ),
                           const SizedBox(width: 8),
                           Text(
-                            bestMatch!['recommended_time'].toString().split(' ').last,
-                            style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700, color: _kAccent),
+                            bestMatch!['recommended_time']
+                                .toString()
+                                .split(' ')
+                                .last,
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w700,
+                              color: _kAccent,
+                            ),
                           ),
                         ],
                       ),
@@ -308,7 +368,10 @@ class _MeetupScreenState extends State<MeetupScreen> {
                   ),
                   const SizedBox(height: 16),
                 ],
+<<<<<<< HEAD
+=======
 
+>>>>>>> 7cd63273acbbe5f49af277b2dc0cd80f351ff394
                 SizedBox(
                   height: 58,
                   child: ElevatedButton(
@@ -317,13 +380,26 @@ class _MeetupScreenState extends State<MeetupScreen> {
                       backgroundColor: _kAccent,
                       foregroundColor: Colors.white,
                       elevation: 0,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
                     ),
                     child: isLoading
-                        ? const SizedBox(width: 24, height: 24,
-                            child: CircularProgressIndicator(color: Colors.white, strokeWidth: 3))
-                        : const Text('Намери Място',
-                            style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+                        ? const SizedBox(
+                            width: 24,
+                            height: 24,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 3,
+                            ),
+                          )
+                        : const Text(
+                            'Намери Място',
+                            style: TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
                   ),
                 ),
               ],
@@ -333,5 +409,8 @@ class _MeetupScreenState extends State<MeetupScreen> {
       ),
     );
   }
+<<<<<<< HEAD
+=======
 
+>>>>>>> 7cd63273acbbe5f49af277b2dc0cd80f351ff394
 }

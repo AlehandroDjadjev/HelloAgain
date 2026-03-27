@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import AgentSession, ConfirmationRecord
+from .models import AgentSession, ConfirmationRecord, ReasoningProvider
 
 
 # ---------------------------------------------------------------------------
@@ -11,7 +11,7 @@ class AgentSessionSerializer(serializers.ModelSerializer):
     class Meta:
         model = AgentSession
         fields = [
-            "id", "user_id", "device_id", "input_mode",
+            "id", "user_id", "device_id", "input_mode", "reasoning_provider",
             "supported_packages", "status", "current_step_index",
             "created_at", "updated_at",
         ]
@@ -22,7 +22,7 @@ class AgentSessionDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = AgentSession
         fields = [
-            "id", "user_id", "device_id", "input_mode",
+            "id", "user_id", "device_id", "input_mode", "reasoning_provider",
             "supported_packages", "status", "previous_status",
             "current_step_index", "last_heartbeat_at",
             "created_at", "updated_at",
@@ -41,6 +41,10 @@ class AgentSessionCreateSerializer(serializers.Serializer):
     """
     device_id = serializers.CharField(max_length=255, required=False, allow_blank=True, default="")
     input_mode = serializers.ChoiceField(choices=["voice", "text"], default="voice")
+    reasoning_provider = serializers.ChoiceField(
+        choices=ReasoningProvider.values,
+        default=ReasoningProvider.LOCAL,
+    )
     supported_packages = serializers.ListField(
         child=serializers.CharField(max_length=255),
         required=False,
@@ -51,6 +55,7 @@ class AgentSessionCreateSerializer(serializers.Serializer):
 class SessionCreateResponseSerializer(serializers.Serializer):
     session_id = serializers.UUIDField()
     status = serializers.CharField()
+    reasoning_provider = serializers.ChoiceField(choices=ReasoningProvider.values)
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +91,16 @@ class LastActionResultSerializer(serializers.Serializer):
 
 
 class NextStepRequestSerializer(serializers.Serializer):
-    plan_id = serializers.UUIDField()
+    """
+    POST /api/agent/sessions/{id}/next-step/
+
+    LLM mode  (no plan): only screen_state is required.
+    Plan mode (backward compat): plan_id may be supplied; completed_action_ids
+      and last_action_result are accepted but ignored (history is in step_history).
+    """
+    plan_id = serializers.UUIDField(required=False, allow_null=True, default=None)
     screen_state = serializers.JSONField(required=False, allow_null=True, default=None)
+    # Kept for backward compatibility — ignored in LLM flow
     completed_action_ids = serializers.ListField(
         child=serializers.CharField(), required=False, default=list
     )
@@ -104,19 +117,53 @@ class ActionResultInputSerializer(serializers.Serializer):
 class ActionResultV2Serializer(serializers.Serializer):
     """
     POST /api/agent/sessions/{id}/action-result/
-    New shape: action_id (not step_id), nested result object.
+
+    LLM mode: plan_id is optional. action_type and reasoning are new optional
+      fields that carry back what the LLM decided so decide_after_result()
+      can record them in step_history without another lookup.
+    Plan mode (backward compat): plan_id still accepted.
     """
-    plan_id = serializers.UUIDField()
-    action_id = serializers.CharField()          # maps to step_id
+    plan_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+    action_id = serializers.CharField()
     result = ActionResultInputSerializer()
     screen_state = serializers.JSONField(required=False, allow_null=True, default=None)
     duration_ms = serializers.IntegerField(min_value=0, default=0)
     executed_at = serializers.DateTimeField(required=False, allow_null=True, default=None)
+    # LLM-mode extras (ignored in plan mode)
+    action_type = serializers.CharField(required=False, allow_blank=True, default="")
+    reasoning   = serializers.CharField(required=False, allow_blank=True, default="")
+    screen_hash_before = serializers.CharField(required=False, allow_blank=True, default="")
 
 
 class ExecutionDecisionSerializer(serializers.Serializer):
     status = serializers.CharField()
     next_action_id = serializers.CharField(required=False, allow_null=True, default=None)
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    reasoning = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class ReasonedStepResponseSerializer(serializers.Serializer):
+    """
+    Embeds LLM decision metadata in the next-step response so the Flutter UI
+    can display the agent's reasoning to the user in real time.
+    """
+    action_type           = serializers.CharField()
+    params                = serializers.DictField()
+    reasoning             = serializers.CharField()
+    confidence            = serializers.FloatField()
+    requires_confirmation = serializers.BooleanField()
+    sensitivity           = serializers.CharField()
+
+
+class IntentReadyResponseSerializer(serializers.Serializer):
+    """
+    Response from POST /sessions/{id}/intent/ in LLM-mode.
+    execution_ready=True means the frontend can start calling /next-step/ immediately.
+    """
+    intent            = serializers.DictField()
+    execution_ready   = serializers.BooleanField()
+    can_auto_compile  = serializers.BooleanField()
+    session_status    = serializers.CharField()
 
 
 # ---------------------------------------------------------------------------

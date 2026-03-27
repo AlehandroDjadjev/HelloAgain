@@ -746,6 +746,7 @@ class _HomeTabState extends State<HomeTab> {
   final _searchController = TextEditingController();
   final _descriptionController = TextEditingController();
   DiscoveryModeChoice _mode = DiscoveryModeChoice.forYou;
+  int _loadGeneration = 0;
   bool _loading = true;
   String? _error;
   List<AppProfile> _profiles = const <AppProfile>[];
@@ -772,12 +773,18 @@ class _HomeTabState extends State<HomeTab> {
   }
 
   Future<void> _load() async {
+    final generation = ++_loadGeneration;
+    final modeSnapshot = _mode;
+    final searchSnapshot = _searchController.text;
+    final descriptionSnapshot = _descriptionController.text.trim();
+
     setState(() {
       _loading = true;
       _error = null;
+      _profiles = const <AppProfile>[];
     });
-    if (_mode == DiscoveryModeChoice.describeSomeone &&
-        _descriptionController.text.trim().isEmpty) {
+    if (modeSnapshot == DiscoveryModeChoice.describeSomeone &&
+        descriptionSnapshot.isEmpty) {
       setState(() {
         _profiles = const <AppProfile>[];
         _loading = false;
@@ -786,36 +793,36 @@ class _HomeTabState extends State<HomeTab> {
       return;
     }
     try {
-      final profiles = _mode == DiscoveryModeChoice.forYou
+      final profiles = modeSnapshot == DiscoveryModeChoice.forYou
           ? await widget.session.api.fetchDiscovery(
-              query: _searchController.text,
+              query: searchSnapshot,
             )
           : await widget.session.api.fetchDescriptionDiscovery(
-              description: _descriptionController.text.trim(),
+              description: descriptionSnapshot,
               limit: 8,
             );
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
         _profiles = profiles;
       });
     } on ApiException catch (error) {
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
         _error = error.message;
       });
     } catch (_) {
-      if (!mounted) {
+      if (!mounted || generation != _loadGeneration) {
         return;
       }
       setState(() {
         _error = 'Discovery is unavailable right now.';
       });
     } finally {
-      if (mounted) {
+      if (mounted && generation == _loadGeneration) {
         setState(() {
           _loading = false;
         });
@@ -1656,7 +1663,7 @@ class _UserProfilePageState extends State<UserProfilePage> {
                               ),
                             if (_profile.matchPercent != null)
                               ScoreChip(
-                                label: 'Match ${_profile.matchPercent}%',
+                                label: 'Compatibility ${_profile.matchPercent}%',
                               ),
                             if (_profile.matchedFromContacts)
                               const StatusChip(label: 'In contacts'),
@@ -1784,7 +1791,7 @@ class PersonCard extends StatelessWidget {
                   ),
                   if (profile.matchPercent != null)
                     ScoreChip(
-                      label: '${profile.matchPercent}% fit',
+                      label: '${profile.matchPercent}% compatibility',
                     ),
                 ],
               ),

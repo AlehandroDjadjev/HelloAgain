@@ -27,6 +27,7 @@ _APP_EXECUTOR_MAP = {
     "com.google.android.apps.maps": "maps_navigate_v1",
     "com.android.chrome": "chrome_browse_v1",
     "com.google.android.gm": "gmail_compose_v1",
+    "com.supercell.brawlstars": "generic_v1",
 }
 
 

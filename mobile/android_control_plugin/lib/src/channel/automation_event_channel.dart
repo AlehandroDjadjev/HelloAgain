@@ -12,8 +12,7 @@ import '../events/automation_event.dart';
 ///     }
 ///   });
 class AutomationEventChannel {
-  static const _eventChannel =
-      EventChannel('com.example.control/events');
+  static const _eventChannel = EventChannel('com.example.control/events');
 
   static Stream<AutomationEvent>? _broadcast;
 
@@ -24,14 +23,18 @@ class AutomationEventChannel {
     _broadcast ??= _eventChannel
         .receiveBroadcastStream()
         .where((raw) => raw is Map)
-        .map((raw) => AutomationEvent.fromMap(
-              (raw as Map).cast<Object?, Object?>(),
-            ))
+        .map(
+          (raw) =>
+              AutomationEvent.fromMap((raw as Map).cast<Object?, Object?>()),
+        )
         .where((event) => event != null)
         .cast<AutomationEvent>()
         .asBroadcastStream();
     return _broadcast!;
   }
+
+  static Stream<T> _eventsOfType<T extends AutomationEvent>() =>
+      events.where((event) => event is T).cast<T>();
 
   /// Convenience filter: only [ScreenStateUpdated] events.
   static Stream<ScreenStateUpdated> get screenStateUpdates =>
