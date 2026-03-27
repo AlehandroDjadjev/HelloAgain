@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -15,6 +16,11 @@ import 'whitespace_app.dart' as whitespace show AgentBoardScreen;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await dotenv.load(fileName: '.env');
+  } catch (_) {
+    // Keep startup resilient when the optional env file is not present yet.
+  }
   await SystemChrome.setPreferredOrientations(const [
     DeviceOrientation.portraitUp,
   ]);
@@ -52,6 +58,7 @@ class HelloAgainShell extends StatefulWidget {
   State<HelloAgainShell> createState() => _HelloAgainShellState();
 }
 
+class _HelloAgainShellState extends State<HelloAgainShell> {
   static const _tokenKey = 'hello_again.account_token';
   static const _onboardingSessionKey = 'hello_again.onboarding_session_id';
 

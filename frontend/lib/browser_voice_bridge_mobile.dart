@@ -122,10 +122,7 @@ class BrowserVoiceBridge {
     await _tts.stop();
     await _player.stop();
     await _player.play(BytesSource(base64Decode(clean)));
-    await _player.onPlayerComplete.first.timeout(
-      const Duration(seconds: 30),
-      onTimeout: () {},
-    );
+    await _waitForPlaybackToFinish();
   }
 
   Future<void> playText(String text) async {
@@ -162,6 +159,20 @@ class BrowserVoiceBridge {
       localeId.toLowerCase().startsWith('bg') ? 'bg-BG' : 'en-US',
     );
     _initialized = true;
+  }
+
+  Future<void> _waitForPlaybackToFinish() async {
+    try {
+      await Future.any<void>([
+        _player.onPlayerComplete.first,
+        _player.onPlayerStateChanged.firstWhere(
+          (state) => state != PlayerState.playing,
+        ),
+      ]).timeout(const Duration(seconds: 12));
+    } on TimeoutException {
+      // Some Android devices do not emit a reliable completion signal for
+      // bytes playback, so do not block the next turn indefinitely.
+    }
   }
 
   Future<String> _resolveLocale(String preferredLanguage) async {

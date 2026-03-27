@@ -10,6 +10,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'browser_voice_bridge.dart';
+import 'src/config/backend_base_url.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -1926,6 +1927,8 @@ class _UserSectionLabel extends StatelessWidget {
 }
 
 class AgentBackendClient {
+  static const _requestTimeout = Duration(seconds: 20);
+
   AgentBackendClient({String? baseUrl})
     : _baseUri = Uri.parse(baseUrl ?? _resolveDefaultBaseUrl());
 
@@ -1936,27 +1939,7 @@ class AgentBackendClient {
     if (configuredBaseUrl.isNotEmpty) {
       return configuredBaseUrl;
     }
-    const localHosts = {'localhost', '127.0.0.1', '::1', '[::1]'};
-    if (!kIsWeb) {
-      if (defaultTargetPlatform == TargetPlatform.android) {
-        return 'http://10.0.2.2:8000';
-      }
-      return 'http://127.0.0.1:8000';
-    }
-
-    final browserUri = Uri.base;
-    if (localHosts.contains(browserUri.host.toLowerCase()) &&
-        browserUri.port != 8000) {
-      // `flutter run -d chrome` serves the app on a random port, while Django
-      // listens on 8000 by default.
-      return Uri(
-        scheme: browserUri.scheme.isEmpty ? 'http' : browserUri.scheme,
-        host: browserUri.host,
-        port: 8000,
-      ).toString();
-    }
-
-    return browserUri.origin;
+    return resolveBackendBaseUrl();
   }
 
   Future<AppAccountSession> fetchCurrentSession({required String token}) async {
@@ -2101,16 +2084,17 @@ class AgentBackendClient {
   }
 
   Future<Map<String, dynamic>> _getJson(String path, {String? token}) async {
-    final response = await http.get(
-      _baseUri.resolve(path),
-      headers: _headers(token: token),
+    final response = await _sendWithTimeout(
+      () => http.get(_baseUri.resolve(path), headers: _headers(token: token)),
+      'GET',
+      path,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(
-        'GET $path failed with ${response.statusCode}: ${response.body}',
+        'GET $path failed with ${response.statusCode}: ${utf8.decode(response.bodyBytes)}',
       );
     }
-    return _decodeJson(response.body);
+    return _decodeJson(utf8.decode(response.bodyBytes));
   }
 
   Future<Map<String, dynamic>> _postJson(
@@ -2118,17 +2102,35 @@ class AgentBackendClient {
     Map<String, dynamic> payload,
     {String? token}
   ) async {
-    final response = await http.post(
-      _baseUri.resolve(path),
-      headers: _headers(token: token),
-      body: jsonEncode(payload),
+    final response = await _sendWithTimeout(
+      () => http.post(
+        _baseUri.resolve(path),
+        headers: _headers(token: token),
+        body: jsonEncode(payload),
+      ),
+      'POST',
+      path,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(
-        'POST $path failed with ${response.statusCode}: ${response.body}',
+        'POST $path failed with ${response.statusCode}: ${utf8.decode(response.bodyBytes)}',
       );
     }
-    return _decodeJson(response.body);
+    return _decodeJson(utf8.decode(response.bodyBytes));
+  }
+
+  Future<http.Response> _sendWithTimeout(
+    Future<http.Response> Function() request,
+    String method,
+    String path,
+  ) async {
+    try {
+      return await request().timeout(_requestTimeout);
+    } on TimeoutException {
+      throw Exception(
+        '$method $path timed out after ${_requestTimeout.inSeconds}s while contacting ${_baseUri.origin}.',
+      );
+    }
   }
 
   Map<String, String> _headers({String? token}) {
