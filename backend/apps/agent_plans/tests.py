@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 from django.test import SimpleTestCase
 
 from apps.agent_plans.services.intent_service import IntentService
@@ -25,3 +27,23 @@ class BrawlStarsSupportTests(SimpleTestCase):
             PlanService.get_executor_hint("com.supercell.brawlstars"),
             "generic_v1",
         )
+
+    def test_parse_intent_falls_back_when_llm_returns_blank_target_app(self):
+        client = Mock()
+        client.generate.return_value = {
+            "goal": "Search Jeffrey Epstein on Chrome",
+            "goal_type": "search",
+            "target_app": "",
+            "entities": {"query": "Jeffrey Epstein"},
+            "risk_level": "medium",
+            "confidence": 0.8,
+            "ambiguity_flags": [],
+        }
+
+        result = IntentService(client=client).parse_intent(
+            "Search up Jeffrey Epstien on Chrome"
+        )
+
+        self.assertEqual(result.app_package, "com.android.chrome")
+        self.assertEqual(result.goal_type, "search")
+        self.assertIn("keyword detection fallback", " ".join(result.ambiguity_flags))
