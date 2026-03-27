@@ -1,13 +1,10 @@
+import base64
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
 
 @dataclass
 class MemoryContext:
-    """
-    STRICTLY LIGHTWEIGHT session state.
-    Used ONLY for UI tracking and current operation context (e.g. knowing if we are waiting for a user confirmation).
-    Not a long-term vector DB memory store.
-    """
     user_id: str
     session_id: str
     current_action: Optional[str] = None
@@ -16,10 +13,6 @@ class MemoryContext:
 
 @dataclass
 class VoiceGatewayRequest:
-    """
-    Incoming request FROM the user to the Gateway.
-    The message has been transcribed by Faster-Whisper (STT) or sent as text.
-    """
     user_id: str
     session_id: str
     message: str
@@ -27,9 +20,6 @@ class VoiceGatewayRequest:
 
 @dataclass
 class BackendSpeakRequest:
-    """
-    Request FROM a backend agent TO the Voice Gateway, asking it to speak to the user.
-    """
     user_id: str
     session_id: str
     agent_name: str
@@ -38,20 +28,68 @@ class BackendSpeakRequest:
 
 @dataclass
 class VoiceGatewayResponse:
-    """
-    The output format pushed to the user (via Piper TTS).
-    """
-    spoken_text: str  # Short, calm, easy to understand Bulgarian sentence
+    spoken_text: str
     status: str = "success"
     structured_data: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class ConversationTurn:
-    """
-    Minimal ledger for debugging.
-    """
     source_message: Optional[str] = None
     agent_name: Optional[str] = None
     shaped_response: Optional[VoiceGatewayResponse] = None
     error: Optional[str] = None
+
+
+@dataclass
+class VoiceConversationRequest:
+    user_id: str = "anonymous"
+    session_id: str = "default_session"
+    message: str = ""
+    language: Optional[str] = None
+
+
+@dataclass
+class TranscriptionResult:
+    text: str
+    source: str
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LLMResult:
+    text: str
+    source: str
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SpeechSynthesisResult:
+    audio_bytes: bytes
+    source: str
+    mime_type: str = "audio/wav"
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class VoiceConversationResponse:
+    transcript: str
+    assistant_text: str
+    assistant_audio_bytes: bytes
+    assistant_audio_mime_type: str = "audio/wav"
+    status: str = "success"
+    provider_status: Dict[str, str] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+
+    def to_api_dict(self) -> Dict[str, Any]:
+        return {
+            "status": self.status,
+            "transcript": self.transcript,
+            "assistant_text": self.assistant_text,
+            "assistant_audio_base64": base64.b64encode(
+                self.assistant_audio_bytes,
+            ).decode("ascii"),
+            "assistant_audio_mime_type": self.assistant_audio_mime_type,
+            "provider_status": self.provider_status,
+            "warnings": self.warnings,
+        }

@@ -26,6 +26,7 @@ aiohttp==3.11.12
 torch
 torch-geometric
 sentence-transformers==5.3.0
+piper-tts==1.4.1
 
 # Testing
 pytest==9.0.2

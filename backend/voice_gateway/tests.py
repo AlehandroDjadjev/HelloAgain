@@ -1,65 +1,128 @@
+import base64
 import json
-from django.test import TestCase, Client
-from voice_gateway.domain.contracts import VoiceGatewayRequest
-from voice_gateway.services.shaping import response_shaper
-from voice_gateway.services.routing import agent_dispatcher
+from unittest.mock import patch
 
-class VoiceGatewayUnitTests(TestCase):
-    def test_routing_logic(self):
-        """Test the dispatcher properly assigns agents based on simple triggers"""
-        req_account = VoiceGatewayRequest(user_id="1", session_id="1", message="Искам да проверя моята сметка")
-        agent_name = agent_dispatcher.dispatch_request(req_account)
-        self.assertEqual(agent_name, "AccountAgent")
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import Client, TestCase
 
-        req_greet = VoiceGatewayRequest(user_id="1", session_id="1", message="Здравейте, трябва ми помощ")
-        agent_greet = agent_dispatcher.dispatch_request(req_greet)
-        self.assertEqual(agent_greet, "GreetingAgent")
+from voice_gateway.domain.contracts import (
+    LLMResult,
+    SpeechSynthesisResult,
+    TranscriptionResult,
+)
 
-    def test_shaping_logic(self):
-        """Test the shaping layer produces short, Bulgarian text."""
-        # Account formatting
-        text_account = response_shaper.shape_response("AccountAgent", {"status": "success", "balance": "100"})
-        self.assertIn("100", text_account)
-        self.assertIn("сметката", text_account)
 
-        # Fallback formatting
-        text_fallback = response_shaper.shape_response("FallbackAgent", {"status": "success"})
-        self.assertIn("повторили", text_fallback)
+class _FakeSTTProvider:
+    def transcribe(self, audio_data, language=None):
+        return TranscriptionResult(
+            text="Recognized speech",
+            source="fake_stt",
+            warnings=[],
+        )
 
-    def test_user_api_endpoint(self):
-        """Test E2E flow via the user interact API View."""
-        client = Client()
-        payload = {
-            "user_id": "test_user_01",
-            "session_id": "session_01",
-            "message": "Здравейте!"
+    def status(self):
+        return "ready"
+
+
+class _FakeLLMProvider:
+    def generate_reply(self, prompt, session_id, user_id):
+        return LLMResult(
+            text=f"Reply for: {prompt}",
+            source="fake_llm",
+            warnings=[],
+        )
+
+    def status(self):
+        return "ready"
+
+
+class _FakeTTSProvider:
+    def synthesize(self, text, voice_id=None):
+        wav_bytes = base64.b64decode(
+            "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=",
+        )
+        return SpeechSynthesisResult(
+            audio_bytes=wav_bytes,
+            source="fake_tts",
+            mime_type="audio/wav",
+            warnings=[],
+        )
+
+    def status(self):
+        return "ready"
+
+
+class VoiceGatewayTests(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.providers = {
+            "stt_provider": _FakeSTTProvider(),
+            "llm_provider": _FakeLLMProvider(),
+            "tts_provider": _FakeTTSProvider(),
         }
-        
-        response = client.post('/api/voice-gateway/interact/', data=json.dumps(payload), content_type='application/json')
-        
+
+    def test_transcribe_endpoint(self):
+        with patch.multiple("voice_gateway.views.gateway_core", **self.providers):
+            response = self.client.post(
+                "/api/voice-gateway/transcribe/",
+                data={"audio": self._make_audio_file()},
+            )
+
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        
         self.assertEqual(data["status"], "success")
-        self.assertIn("Здравейте", data["spoken_text"])
-        self.assertEqual(data["structured_data"]["agent_used"], "GreetingAgent")
+        self.assertEqual(data["transcript"], "Recognized speech")
+        self.assertEqual(data["provider"], "fake_stt")
 
-    def test_agent_speak_endpoint(self):
-        """Test E2E flow for an agent pushing a message."""
-        client = Client()
-        payload = {
-            "user_id": "test_user_01",
-            "session_id": "session_01",
-            "agent_name": "AccountAgent",
-            "raw_data": {"status": "success", "balance": "550"}
-        }
+    def test_speak_endpoint(self):
+        with patch.multiple("voice_gateway.views.gateway_core", **self.providers):
+            response = self.client.post(
+                "/api/voice-gateway/speak/",
+                data=json.dumps({"text": "Hello from test"}),
+                content_type="application/json",
+            )
 
-        response = client.post('/api/voice-gateway/agent-speak/', data=json.dumps(payload), content_type='application/json')
-        
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        
         self.assertEqual(data["status"], "success")
-        self.assertIn("550", data["spoken_text"])
-        self.assertEqual(data["structured_data"]["agent_used"], "AccountAgent")
+        self.assertEqual(data["text"], "Hello from test")
+        self.assertEqual(data["provider"], "fake_tts")
+        self.assertTrue(data["audio_base64"])
+        self.assertEqual(data["audio_mime_type"], "audio/wav")
 
+    def test_conversation_endpoint(self):
+        with patch.multiple("voice_gateway.views.gateway_core", **self.providers):
+            response = self.client.post(
+                "/api/voice-gateway/conversation/",
+                data={"audio": self._make_audio_file()},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["transcript"], "Recognized speech")
+        self.assertEqual(data["assistant_text"], "Reply for: Recognized speech")
+        self.assertEqual(
+            data["provider_status"],
+            {"stt": "fake_stt", "llm": "fake_llm", "tts": "fake_tts"},
+        )
+        self.assertTrue(data["assistant_audio_base64"])
+
+    def test_health_endpoint(self):
+        with patch.multiple("voice_gateway.views.gateway_core", **self.providers):
+            response = self.client.get("/api/voice-gateway/health/")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(
+            data["providers"],
+            {"stt": "ready", "llm": "ready", "tts": "ready"},
+        )
+
+    def _make_audio_file(self):
+        return SimpleUploadedFile(
+            "test.wav",
+            b"RIFF....WAVEfmt ",
+            content_type="audio/wav",
+        )
