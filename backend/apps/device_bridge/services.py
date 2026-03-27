@@ -36,15 +36,17 @@ class DeviceBridgeService:
         captured_at: datetime,
         focused_element_ref: str = "",
     ) -> DeviceScreenState:
+        # Android payloads may legitimately send null for optional text fields.
+        # Normalize them here so SQLite never sees NULL for non-null CharFields.
         state = DeviceScreenState.objects.create(
             session=session,
-            step_id=step_id,
-            foreground_package=foreground_package,
-            window_title=window_title,
-            screen_hash=screen_hash,
-            focused_element_ref=focused_element_ref,
+            step_id=_coerce_text(step_id),
+            foreground_package=_coerce_text(foreground_package),
+            window_title=_coerce_text(window_title),
+            screen_hash=_coerce_text(screen_hash),
+            focused_element_ref=_coerce_text(focused_element_ref),
             is_sensitive=is_sensitive,
-            nodes=nodes,
+            nodes=nodes or [],
             captured_at=captured_at,
         )
         if is_sensitive:
@@ -129,3 +131,9 @@ class DeviceBridgeService:
                 )
 
         return event
+
+
+def _coerce_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value)

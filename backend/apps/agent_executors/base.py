@@ -1,6 +1,9 @@
 """
 AppExecutor — interface every app-specific executor must implement.
 
+Executors provide optional screen hints and selector references for the LLM.
+They are NOT required for execution; the LLM still decides what action to take.
+
 Executors live in agent_executors/ only. They provide three capabilities
 on top of the generic execution loop:
 

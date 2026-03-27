@@ -18,6 +18,7 @@
         <package android:name="com.google.android.apps.maps" />
         <package android:name="com.android.chrome" />
         <package android:name="com.google.android.gm" />
+        <package android:name="com.supercell.brawlstars" />
     </queries>
 
     <application>

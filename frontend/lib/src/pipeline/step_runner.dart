@@ -5,26 +5,12 @@ import 'package:android_control_plugin/android_control_plugin.dart';
 import '../api/agent_client.dart';
 import 'pipeline_state.dart';
 
-/// Drives the step-by-step execution loop.
-///
-/// The [StepRunner] is the only place that directly calls [DeviceControlChannel]
-/// and [AgentClient] during execution. [PipelineOrchestrator] instantiates one
-/// [StepRunner] per session and delegates [runLoop] to it.
-///
-/// Resilience notes:
-///   - If the network drops, the next [getNextStep] call will throw; the runner
-///     logs it and retries after [_networkRetryDelay].
-///   - On app resume from background the orchestrator can call [runLoop] again
-///     on the same [StepRunner] instance — it resumes from [_completedIds].
-///   - Unexpected foreground app changes are detected via screen state and
-///     reported to [onUnexpectedAppChange]; the backend will return
-///     "retry" / "manual_takeover" accordingly.
+/// Drives the backend-directed execution loop.
 class StepRunner {
   StepRunner({
     required this.client,
     required this.gateway,
     required this.sessionId,
-    required this.planId,
     required this.expectedPackage,
     required this.onStepStarted,
     required this.onStepCompleted,
@@ -38,88 +24,63 @@ class StepRunner {
 
   final AgentClient client;
   final DeviceControlChannel gateway;
-
   final String sessionId;
-  final String planId;
-
-  /// Package name we expect to be in the foreground during execution
-  /// (e.g. "com.whatsapp"). Empty string disables the check.
   final String expectedPackage;
 
-  // ── Callbacks (wired by orchestrator) ────────────────────────────────────
-
-  final void Function(String stepId) onStepStarted;
+  final void Function(StepEntry step) onStepStarted;
   final void Function(String stepId, ActionResult result) onStepCompleted;
   final void Function(String message, LogLevel level) onLog;
-
-  /// Called when the backend returns "confirm".
-  /// The runner STOPS and waits — the orchestrator must call [continueAfterConfirm].
-  final Future<void> Function(Map<String, dynamic> confirmAction) onConfirmation;
-
+  final Future<void> Function(Map<String, dynamic> confirmAction)
+  onConfirmation;
   final void Function() onComplete;
   final void Function(String reason) onAbort;
   final void Function(String reason) onManualTakeover;
-
-  /// Fired whenever the foreground package differs from [expectedPackage].
   final void Function(String? actualPackage) onUnexpectedAppChange;
 
-  // ── Limits ────────────────────────────────────────────────────────────────
+  static const _sessionTimeout = Duration(minutes: 5);
+  static const _pollInterval = Duration(milliseconds: 300);
+  static const _networkRetryDelay = Duration(seconds: 2);
+  static const _maxNetworkRetries = 3;
+  static const _defaultStepTimeout = Duration(seconds: 10);
 
-  static const _sessionTimeout     = Duration(minutes: 5);
-  static const _pollInterval        = Duration(milliseconds: 300);
-  static const _networkRetryDelay   = Duration(seconds: 2);
-  static const _maxNetworkRetries   = 3;
-  static const _defaultStepTimeout  = Duration(seconds: 10);
-
-  // ── Mutable execution state (persists across resume) ─────────────────────
-
-  final _completedIds = <String>[];
-  Map<String, dynamic>? _lastResult;
-  final _retryCounts = <String, int>{};  // client-side retry count
+  final _retryCounts = <String, int>{};
   DateTime? _sessionStart;
   bool _cancelled = false;
 
-  // ── Public API ────────────────────────────────────────────────────────────
-
   void cancel() => _cancelled = true;
 
-  /// Drives the execution loop until it completes, aborts, or pauses for
-  /// confirmation. Safe to call again after a confirmation is approved.
   Future<void> runLoop() async {
     _sessionStart ??= DateTime.now();
     _cancelled = false;
 
     while (!_cancelled) {
-      // ── Session-level timeout ───────────────────────────────────────────
       if (DateTime.now().difference(_sessionStart!) > _sessionTimeout) {
-        _log('Session timeout (${_sessionTimeout.inMinutes} min exceeded).', LogLevel.error);
+        _log(
+          'Session timeout (${_sessionTimeout.inMinutes} min exceeded).',
+          LogLevel.error,
+        );
         onAbort('Session timeout');
         return;
       }
 
-      // ── Get fresh screen state ──────────────────────────────────────────
       final screenState = await _safeGetScreenState();
 
-      // Detect unexpected foreground app before asking backend
       if (screenState != null && expectedPackage.isNotEmpty) {
         final fg = screenState['foreground_package'] as String?;
         if (fg != null && fg.isNotEmpty && fg != expectedPackage) {
           onUnexpectedAppChange(fg);
-          _log('Unexpected foreground: $fg (expected $expectedPackage)', LogLevel.warning);
-          // Still proceed — backend will decide retry vs manual_takeover
+          _log(
+            'Unexpected foreground: $fg (expected $expectedPackage)',
+            LogLevel.warning,
+          );
         }
       }
 
-      // ── Ask backend for next action ─────────────────────────────────────
       Map<String, dynamic> resp;
       try {
-        resp = await _withNetworkRetry(() => client.getNextStep(
-          sessionId,
-          planId: planId,
-          screenState: screenState,
-          completedActionIds: List.unmodifiable(_completedIds),
-          lastActionResult: _lastResult,
-        ));
+        resp = await _withNetworkRetry(
+          () => client.getNextStep(sessionId, screenState: screenState),
+        );
       } catch (e) {
         _log('Backend unreachable: $e', LogLevel.error);
         onAbort('Network error: $e');
@@ -129,39 +90,58 @@ class StepRunner {
       final backendStatus = resp['status'] as String? ?? 'execute';
       final action = (resp['next_action'] as Map?)?.cast<String, dynamic>();
       final reason = resp['reason'] as String? ?? '';
+      final reasoning = resp['reasoning'] as String? ?? '';
 
       switch (backendStatus) {
         case 'complete':
+          if (reasoning.isNotEmpty) {
+            _log('Reasoning: $reasoning', LogLevel.info);
+          }
           _log('All steps complete.', LogLevel.success);
           onComplete();
           return;
 
         case 'abort':
+          if (reasoning.isNotEmpty) {
+            _log('Reasoning: $reasoning', LogLevel.warning);
+          }
           _log('Backend aborted: $reason', LogLevel.error);
           onAbort(reason.isNotEmpty ? reason : 'Execution aborted by backend');
           return;
 
         case 'manual_takeover':
+          if (reasoning.isNotEmpty) {
+            _log('Reasoning: $reasoning', LogLevel.warning);
+          }
           _log('Manual takeover required: $reason', LogLevel.warning);
           onManualTakeover(reason);
           return;
 
         case 'confirm':
           if (action != null) {
+            if (reasoning.isNotEmpty) {
+              final params =
+                  (action['params'] as Map?)?.cast<String, dynamic>() ?? {};
+              params.putIfAbsent('content_preview', () => reasoning);
+              action['params'] = params;
+              _log('Reasoning: $reasoning', LogLevel.info);
+            }
             _log('Confirmation required for ${action['id']}', LogLevel.warning);
             await onConfirmation(action);
-            return; // orchestrator resumes via runLoop() after approval
+            return;
           }
-          // No action provided — treat as a transient backend state; retry
           await Future.delayed(_pollInterval);
+          break;
 
         case 'retry':
           final stepId = action?['id'] as String? ?? '';
-          final count  = (_retryCounts[stepId] ?? 0) + 1;
+          final count = (_retryCounts[stepId] ?? 0) + 1;
           _retryCounts[stepId] = count;
+          if (reasoning.isNotEmpty) {
+            _log('Reasoning: $reasoning', LogLevel.info);
+          }
           _log(
-            'Backend says retry${reason.isNotEmpty ? ': $reason' : ''} '
-            '(client count: $count)',
+            'Backend says retry${reason.isNotEmpty ? ': $reason' : ''} (client count: $count)',
             LogLevel.warning,
           );
           if (count > 5) {
@@ -169,34 +149,43 @@ class StepRunner {
             return;
           }
           await Future.delayed(_pollInterval);
+          break;
 
         case 'execute':
         default:
           if (action == null) {
-            // Shouldn't happen — treat as complete
             onComplete();
             return;
           }
-          final done = await _executeStep(action, screenState);
-          if (!done) return; // onAbort already called
+          final done = await _executeStep(action, reasoning);
+          if (!done) return;
       }
     }
   }
 
-  // ── Step execution ────────────────────────────────────────────────────────
-
-  /// Returns false if the loop must stop (abort triggered inside).
   Future<bool> _executeStep(
     Map<String, dynamic> action,
-    Map<String, dynamic>? screenStateBeforeAction,
+    String reasoning,
   ) async {
-    final stepId      = action['id'] as String;
-    final stepType    = action['type'] as String;
-    final params      = (action['params'] as Map?)?.cast<String, dynamic>() ?? {};
-    final timeoutMs   = (action['timeout_ms'] as int?) ?? _defaultStepTimeout.inMilliseconds;
+    final stepId = action['id'] as String;
+    final stepType = action['type'] as String;
+    final params = (action['params'] as Map?)?.cast<String, dynamic>() ?? {};
+    final timeoutMs =
+        (action['timeout_ms'] as int?) ?? _defaultStepTimeout.inMilliseconds;
 
-    _log('▶ [$stepId] $stepType  timeout=${timeoutMs}ms');
-    onStepStarted(stepId);
+    final step = StepEntry(
+      id: stepId,
+      type: stepType,
+      label: _stepLabel(stepType, reasoning),
+      reasoning: reasoning,
+      status: StepStatus.running,
+    );
+    onStepStarted(step);
+
+    _log('[$stepId] $stepType timeout=${timeoutMs}ms', LogLevel.info);
+    if (reasoning.isNotEmpty) {
+      _log('Reasoning: $reasoning', LogLevel.info);
+    }
 
     final stopwatch = Stopwatch()..start();
     ActionResult result;
@@ -204,61 +193,88 @@ class StepRunner {
     try {
       result = await _dispatchWithTimeout(stepType, params, timeoutMs);
     } catch (e) {
-      result = ActionResult(success: false, code: 'EXCEPTION', message: e.toString());
+      result = ActionResult(
+        success: false,
+        code: 'EXCEPTION',
+        message: e.toString(),
+      );
     }
 
     stopwatch.stop();
     onStepCompleted(stepId, result);
 
-    // Get screen state after action for the result payload
     final screenAfter = await _safeGetScreenState();
 
     _log(
-      '${result.success ? '✓' : '✗'} [$stepId]  '
-      'code=${result.code.isEmpty ? 'OK' : result.code}  '
+      '[$stepId] ${result.success ? 'OK' : 'FAIL'} '
+      'code=${result.code.isEmpty ? 'OK' : result.code} '
       '${stopwatch.elapsedMilliseconds}ms',
       result.success ? LogLevel.success : LogLevel.error,
     );
+    if ((result.message ?? '').trim().isNotEmpty) {
+      _log('[$stepId] message=${result.message}', LogLevel.error);
+    }
 
-    // Post result to backend
     Map<String, dynamic> decision;
     try {
-      decision = await _withNetworkRetry(() => client.postActionResult(
-        sessionId,
-        planId: planId,
-        actionId: stepId,
-        success: result.success,
-        code: result.code,
-        message: result.message ?? '',
-        screenState: screenAfter,
-        durationMs: stopwatch.elapsedMilliseconds,
-      ));
+      decision = await _withNetworkRetry(
+        () => client.postActionResult(
+          sessionId,
+          actionId: stepId,
+          success: result.success,
+          code: result.code,
+          message: result.message ?? '',
+          screenState: screenAfter,
+          durationMs: stopwatch.elapsedMilliseconds,
+          actionType: stepType,
+          reasoning: reasoning,
+        ),
+      );
     } catch (e) {
       _log('Failed to post result for $stepId: $e', LogLevel.error);
       onAbort('Network error posting result: $e');
       return false;
     }
 
-    _lastResult = {'success': result.success, 'code': result.code};
-
     if (result.success) {
-      _completedIds.add(stepId);
-      // Reset client-side retry counter on success
       _retryCounts.remove(stepId);
     }
 
     final decisionStatus = decision['status'] as String? ?? 'continue';
-    _log('Decision: $decisionStatus');
+    final decisionReason = decision['reason'] as String? ?? '';
+    final decisionReasoning = decision['reasoning'] as String? ?? '';
+    if (decisionReasoning.isNotEmpty) {
+      _log('Post-step reasoning: $decisionReasoning', LogLevel.info);
+    }
+    _log(
+      decisionReason.isNotEmpty
+          ? 'Decision: $decisionStatus ($decisionReason)'
+          : 'Decision: $decisionStatus',
+      decisionStatus == 'abort' ? LogLevel.error : LogLevel.info,
+    );
 
     if (decisionStatus == 'abort') {
-      onAbort('Backend aborted after result (code=${result.code})');
+      onAbort(
+        decisionReason.isNotEmpty
+            ? decisionReason
+            : (result.message?.trim().isNotEmpty ?? false)
+            ? result.message!.trim()
+            : 'Backend aborted after result (code=${result.code})',
+      );
+      return false;
+    }
+
+    if (decisionStatus == 'manual_takeover') {
+      onManualTakeover(
+        decisionReason.isNotEmpty
+            ? decisionReason
+            : 'Manual takeover required after result (code=${result.code})',
+      );
       return false;
     }
 
     return true;
   }
-
-  // ── Action dispatch ───────────────────────────────────────────────────────
 
   Future<ActionResult> _dispatchWithTimeout(
     String type,
@@ -283,11 +299,17 @@ class StepRunner {
   ) async {
     switch (type) {
       case 'OPEN_APP':
-        return gateway.launchApp(params['package'] as String? ?? '');
+        return gateway.launchApp(
+          params['package_name'] as String? ??
+              params['package'] as String? ??
+              '',
+        );
 
       case 'WAIT_FOR_APP':
         return _waitForApp(
-          params['package'] as String? ?? '',
+          params['package_name'] as String? ??
+              params['package'] as String? ??
+              '',
           Duration(milliseconds: timeoutMs),
         );
 
@@ -320,9 +342,9 @@ class StepRunner {
         return gateway.tapElement(_selectorFromParams(params));
 
       case 'LONG_PRESS_ELEMENT':
-        final lpCandidates = _selectorCandidates(params);
-        if (lpCandidates.isNotEmpty) {
-          return _longPressWithFallback(lpCandidates);
+        final longPressCandidates = _selectorCandidates(params);
+        if (longPressCandidates.isNotEmpty) {
+          return _longPressWithFallback(longPressCandidates);
         }
         return gateway.longPressElement(_selectorFromParams(params));
 
@@ -396,18 +418,15 @@ class StepRunner {
     }
   }
 
-  // ── Selector-candidate fallback helpers ───────────────────────────────────
-
-  /// Extract the selector_candidates list from params (empty if not present).
   List<Map<String, dynamic>> _selectorCandidates(Map<String, dynamic> params) {
     final raw = params['selector_candidates'];
     if (raw is! List) return const [];
     return raw.map((e) => (e as Map).cast<String, dynamic>()).toList();
   }
 
-  /// Try each candidate selector for TAP until one succeeds.
   Future<ActionResult> _tapWithFallback(
-      List<Map<String, dynamic>> candidates) async {
+    List<Map<String, dynamic>> candidates,
+  ) async {
     final tried = <String>[];
     for (final candidate in candidates) {
       tried.add(_candidateLabel(candidate));
@@ -420,13 +439,15 @@ class StepRunner {
   }
 
   Future<ActionResult> _longPressWithFallback(
-      List<Map<String, dynamic>> candidates) async {
+    List<Map<String, dynamic>> candidates,
+  ) async {
     final tried = <String>[];
     for (final candidate in candidates) {
       tried.add(_candidateLabel(candidate));
       try {
-        final result =
-            await gateway.longPressElement(_selectorFromMap(candidate));
+        final result = await gateway.longPressElement(
+          _selectorFromMap(candidate),
+        );
         if (result.success) return result;
       } catch (_) {}
     }
@@ -434,7 +455,8 @@ class StepRunner {
   }
 
   Future<ActionResult> _focusWithFallback(
-      List<Map<String, dynamic>> candidates) async {
+    List<Map<String, dynamic>> candidates,
+  ) async {
     final tried = <String>[];
     for (final candidate in candidates) {
       tried.add(_candidateLabel(candidate));
@@ -447,14 +469,19 @@ class StepRunner {
   }
 
   Future<ActionResult> _findWithFallback(
-      List<Map<String, dynamic>> candidates) async {
+    List<Map<String, dynamic>> candidates,
+  ) async {
     final node = await _findAnyCandidate(candidates);
     if (node != null) return ActionResult(success: true, code: 'OK');
-    return _allSelectorsFailed('FIND', candidates.map(_candidateLabel).toList());
+    return _allSelectorsFailed(
+      'FIND',
+      candidates.map(_candidateLabel).toList(),
+    );
   }
 
   Future<UiNode?> _findAnyCandidate(
-      List<Map<String, dynamic>> candidates) async {
+    List<Map<String, dynamic>> candidates,
+  ) async {
     for (final candidate in candidates) {
       try {
         final node = await gateway.findElement(_selectorFromMap(candidate));
@@ -464,42 +491,72 @@ class StepRunner {
     return null;
   }
 
-  ActionResult _allSelectorsFailed(String action, List<String> tried) =>
-      ActionResult(
-        success: false,
-        code: 'ALL_SELECTORS_FAILED',
-        message: '$action: all ${tried.length} selectors failed. '
-            'Tried: ${tried.join(' | ')}',
-      );
+  ActionResult _allSelectorsFailed(
+    String action,
+    List<String> tried,
+  ) => ActionResult(
+    success: false,
+    code: 'ALL_SELECTORS_FAILED',
+    message:
+        '$action: all ${tried.length} selectors failed. Tried: ${tried.join(' | ')}',
+  );
 
-  /// Build a Selector from a raw map (without the wrapping "selector" key).
   Selector _selectorFromMap(Map<String, dynamic> sel) => Selector(
-        viewId:              sel['view_id']               as String?,
-        textEquals:          sel['text']                  as String?,
-        textContains:        sel['text_contains']         as String?,
-        contentDescEquals:   sel['content_desc']          as String?,
-        contentDescContains: sel['content_desc_contains'] as String?,
-        className:           sel['class_name']            as String?,
-        clickable:           sel['clickable']             as bool?,
-        indexInParent:       (sel['index_in_parent'] as num?)?.toInt(),
-      );
+    elementRef: _stringValue(sel, 'element_ref', 'elementRef', 'ref'),
+    viewId: _stringValue(sel, 'view_id', 'viewId'),
+    textEquals: _stringValue(sel, 'text', 'textEquals'),
+    textContains: _stringValue(sel, 'text_contains', 'textContains'),
+    contentDescEquals: _stringValue(
+      sel,
+      'content_desc',
+      'contentDesc',
+      'contentDescEquals',
+    ),
+    contentDescContains: _stringValue(
+      sel,
+      'content_desc_contains',
+      'contentDescContains',
+    ),
+    className: _stringValue(sel, 'class_name', 'className'),
+    packageName: _stringValue(sel, 'package_name', 'packageName'),
+    clickable: _boolValue(sel, 'clickable'),
+    enabled: _boolValue(sel, 'enabled'),
+    focused: _boolValue(sel, 'focused'),
+    indexInParent: _intValue(sel, 'index_in_parent', 'indexInParent'),
+  );
 
   String _candidateLabel(Map<String, dynamic> sel) {
     final parts = <String>[];
     for (final k in const [
-      'view_id', 'content_desc', 'content_desc_contains',
-      'text', 'text_contains', 'class_name',
+      'element_ref',
+      'elementRef',
+      'ref',
+      'view_id',
+      'viewId',
+      'content_desc',
+      'contentDesc',
+      'contentDescEquals',
+      'content_desc_contains',
+      'contentDescContains',
+      'text',
+      'textEquals',
+      'text_contains',
+      'textContains',
+      'class_name',
+      'className',
     ]) {
       if (sel[k] != null) parts.add('$k=${sel[k]}');
     }
     return parts.isEmpty ? sel.toString() : parts.join(', ');
   }
 
-  // ── Polling helpers ───────────────────────────────────────────────────────
-
   Future<ActionResult> _waitForApp(String pkg, Duration timeout) async {
     if (pkg.isEmpty) {
-      return ActionResult(success: false, code: 'MISSING_PARAM', message: 'package not specified');
+      return ActionResult(
+        success: false,
+        code: 'MISSING_PARAM',
+        message: 'package not specified',
+      );
     }
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {
@@ -516,7 +573,10 @@ class StepRunner {
     );
   }
 
-  Future<ActionResult> _waitForElement(Selector selector, Duration timeout) async {
+  Future<ActionResult> _waitForElement(
+    Selector selector,
+    Duration timeout,
+  ) async {
     final deadline = DateTime.now().add(timeout);
     while (DateTime.now().isBefore(deadline)) {
       final node = await gateway.findElement(selector);
@@ -530,23 +590,22 @@ class StepRunner {
     );
   }
 
-  // ── Network retry ─────────────────────────────────────────────────────────
-
   Future<T> _withNetworkRetry<T>(Future<T> Function() call) async {
-    int attempt = 0;
+    var attempt = 0;
     while (true) {
       try {
         return await call();
       } catch (e) {
         attempt++;
         if (attempt >= _maxNetworkRetries) rethrow;
-        _log('Network error (attempt $attempt/$_maxNetworkRetries): $e', LogLevel.warning);
+        _log(
+          'Network error (attempt $attempt/$_maxNetworkRetries): $e',
+          LogLevel.warning,
+        );
         await Future.delayed(_networkRetryDelay);
       }
     }
   }
-
-  // ── Misc helpers ──────────────────────────────────────────────────────────
 
   Future<Map<String, dynamic>?> _safeGetScreenState() async {
     try {
@@ -559,16 +618,42 @@ class StepRunner {
 
   Selector _selectorFromParams(Map<String, dynamic> params) {
     final sel = (params['selector'] as Map?)?.cast<String, dynamic>() ?? params;
-    return Selector(
-      viewId:              sel['view_id']               as String?,
-      textEquals:          sel['text']                  as String?,
-      textContains:        sel['text_contains']         as String?,
-      contentDescEquals:   sel['content_desc']          as String?,
-      contentDescContains: sel['content_desc_contains'] as String?,
-      className:           sel['class_name']            as String?,
-      clickable:           sel['clickable']             as bool?,
-      indexInParent:       (sel['index_in_parent'] as num?)?.toInt(),
-    );
+    return _selectorFromMap(sel);
+  }
+
+  String? _stringValue(Map<String, dynamic> sel, String key, [String? alt1, String? alt2]) {
+    for (final candidate in [key, alt1, alt2]) {
+      if (candidate == null) continue;
+      final value = sel[candidate];
+      if (value is String && value.isNotEmpty) return value;
+    }
+    return null;
+  }
+
+  bool? _boolValue(Map<String, dynamic> sel, String key, [String? alt1]) {
+    for (final candidate in [key, alt1]) {
+      if (candidate == null) continue;
+      final value = sel[candidate];
+      if (value is bool) return value;
+    }
+    return null;
+  }
+
+  int? _intValue(Map<String, dynamic> sel, String key, [String? alt1]) {
+    for (final candidate in [key, alt1]) {
+      if (candidate == null) continue;
+      final value = sel[candidate];
+      if (value is num) return value.toInt();
+    }
+    return null;
+  }
+
+  String _stepLabel(String type, String reasoning) {
+    if (reasoning.isEmpty) return type;
+    final compact = reasoning.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return compact.length <= 72
+        ? '$type - $compact'
+        : '$type - ${compact.substring(0, 69)}...';
   }
 
   void _log(String msg, [LogLevel level = LogLevel.info]) {

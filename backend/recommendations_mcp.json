@@ -1,0 +1,119 @@
+{
+  "id": "helloagain_recommendations",
+  "protocol": "at_home_mcp",
+  "kind": "backend_integrated_toolset",
+  "description": "This MCP exposes the recommendation and GAT part of the backend. It turns a person's description and evolving profile context into feature vectors, compares people for compatibility, updates learned feature signals over time, and uses the graph-based recommendation engine to return the best friendship matches.",
+  "invoke_url": "/api/recommendations/",
+  "tools": [
+    {
+      "name": "elders_collection",
+      "method": "GET",
+      "path": "/api/recommendations/elders/",
+      "description": "Lists all recommendation profiles stored in the GAT system.",
+      "body_schema": {}
+    },
+    {
+      "name": "create_elder_profile",
+      "method": "POST",
+      "path": "/api/recommendations/elders/",
+      "description": "Creates a recommendation profile from a description and optional manual overrides. This is where text first becomes vectors.",
+      "body_schema": {
+        "username": "string",
+        "display_name": "string",
+        "description": "string",
+        "manual_overrides": "object",
+        "clarification_answers": "object"
+      }
+    },
+    {
+      "name": "profile_detail",
+      "method": "GET",
+      "path": "/api/recommendations/profile/<int:elder_id>/",
+      "description": "Fetches one recommendation profile with its current vectors, confidence, and extracted trait state.",
+      "body_schema": {
+        "elder_id": "int"
+      }
+    },
+    {
+      "name": "update_profile",
+      "method": "PUT",
+      "path": "/api/recommendations/profile/<int:elder_id>/edit/",
+      "description": "Updates a recommendation profile's human-facing fields. If linked to a real user, this flows through the canonical user profile and then resyncs the GAT state.",
+      "body_schema": {
+        "display_name": "string",
+        "description": "string",
+        "dynamic_profile_summary": "string",
+        "profile_notes": "string",
+        "manual_overrides": "object",
+        "feature_vector": "object"
+      }
+    },
+    {
+      "name": "patch_profile",
+      "method": "PATCH",
+      "path": "/api/recommendations/profile/<int:elder_id>/edit/",
+      "description": "Partially updates recommendation profile data and resyncs feature extraction when needed.",
+      "body_schema": {
+        "display_name": "string",
+        "description": "string",
+        "dynamic_profile_summary": "string",
+        "profile_notes": "string",
+        "manual_overrides": "object",
+        "feature_vector": "object"
+      }
+    },
+    {
+      "name": "update_features",
+      "method": "POST",
+      "path": "/api/recommendations/profile/<int:elder_id>/features/",
+      "description": "Applies long-term behavioral signals to the user's learned feature vector without replacing the whole description.",
+      "body_schema": {
+        "signals": "object",
+        "alpha": "float"
+      }
+    },
+    {
+      "name": "compare_users",
+      "method": "POST",
+      "path": "/api/recommendations/compare/",
+      "description": "Compares two people or two descriptions for compatibility and returns why they match or where they may clash.",
+      "body_schema": {
+        "left_id": "int",
+        "left_description": "string",
+        "right_id": "int",
+        "right_description": "string"
+      }
+    },
+    {
+      "name": "find_friends",
+      "method": "GET",
+      "path": "/api/recommendations/find-friends/<int:elder_id>/",
+      "description": "Runs the GAT-based friend recommendation flow for one profile and returns the best matching people.",
+      "body_schema": {
+        "elder_id": "int",
+        "k": "int"
+      }
+    },
+    {
+      "name": "train_model",
+      "method": "POST",
+      "path": "/api/recommendations/train/",
+      "description": "Retrains the graph recommendation model from the current profiles and social edges.",
+      "body_schema": {}
+    },
+    {
+      "name": "health_status",
+      "method": "GET",
+      "path": "/api/recommendations/health/",
+      "description": "Checks if the recommendation engine and saved model checkpoint are available.",
+      "body_schema": {}
+    },
+    {
+      "name": "feature_schema",
+      "method": "GET",
+      "path": "/api/recommendations/schema/",
+      "description": "Returns the list of features and groups that define the recommendation personality model.",
+      "body_schema": {}
+    }
+  ]
+}

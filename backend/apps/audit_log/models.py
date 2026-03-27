@@ -20,9 +20,11 @@ class AuditEventType(models.TextChoices):
     SESSION_CANCELLED = "session_cancelled", "Session Cancelled"
     SESSION_ABORTED = "session_aborted", "Session Aborted"
     SESSION_COMPLETED = "session_completed", "Session Completed"
-    POLICY_VIOLATION = "policy_violation", "Policy Violation"
-    POLICY_ENFORCED  = "policy_enforced",  "Policy Enforced"
-    PLAN_BLOCKED     = "plan_blocked",     "Plan Blocked by Policy"
+    POLICY_VIOLATION     = "policy_violation",     "Policy Violation"
+    POLICY_ENFORCED      = "policy_enforced",      "Policy Enforced"
+    PLAN_BLOCKED         = "plan_blocked",         "Plan Blocked by Policy"
+    LLM_STEP_REASONED    = "llm_step_reasoned",    "LLM Step Reasoned"
+    LLM_VALIDATION_ERROR = "llm_validation_error", "LLM Response Validation Error"
 
 
 class AuditActor(models.TextChoices):

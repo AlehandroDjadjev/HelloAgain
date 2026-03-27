@@ -27,6 +27,7 @@ SUPPORTED_APPS: dict[str, str] = {
     "com.google.android.apps.maps":    "Google Maps (navigation / directions)",
     "com.android.chrome":              "Chrome (web browser / URL / search)",
     "com.google.android.gm":           "Gmail (email composition)",
+    "com.supercell.brawlstars":        "Brawl Stars (game launcher)",
 }
 
 SUPPORTED_GOAL_TYPES: list[str] = [
@@ -127,14 +128,24 @@ class IntentService:
     Falls back to keyword detection if the LLM is unavailable.
     """
 
-    def __init__(self, client: Optional[LLMClient] = None) -> None:
+    def __init__(
+        self,
+        client: Optional[LLMClient] = None,
+        reasoning_provider: Optional[str] = None,
+    ) -> None:
         self._client = client  # None = lazy-init from settings on first call
+        self._reasoning_provider = reasoning_provider
         self._fallback_service = _KeywordFallback()
 
     @property
     def client(self) -> LLMClient:
         if self._client is None:
-            self._client = LLMClient.from_settings()
+            if self._reasoning_provider:
+                self._client = LLMClient.from_reasoning_provider(
+                    self._reasoning_provider
+                )
+            else:
+                self._client = LLMClient.from_settings()
         return self._client
 
     def parse_intent(
@@ -159,7 +170,17 @@ class IntentService:
                 json_mode=True,
             )
             raw_response = json.dumps(result_dict)
-            return self._parse_llm_result(result_dict, transcript, raw_response)
+            parsed = self._parse_llm_result(result_dict, transcript, raw_response)
+            if parsed.app_package and parsed.goal:
+                return parsed
+
+            fallback = self._fallback_service.parse(transcript)
+            fallback.raw_llm_response = raw_response
+            fallback.ambiguity_flags = list(parsed.ambiguity_flags) + [
+                "LLM returned incomplete intent data — used keyword detection fallback"
+            ]
+            fallback.confidence = min(fallback.confidence, parsed.confidence, 0.6)
+            return fallback
 
         except LLMError as exc:
             logger.warning(
@@ -269,6 +290,8 @@ class _KeywordFallback:
             return "com.android.chrome", "Chrome", goal_type, "medium"
         if any(w in lower for w in ("maps", "navigate", "direction", "route", "get to")):
             return "com.google.android.apps.maps", "Google Maps", "navigate_to", "medium"
+        if "brawl stars" in lower or "brawlstars" in lower or "brawl star" in lower:
+            return "com.supercell.brawlstars", "Brawl Stars", "open_app", "low"
         if any(w in lower for w in ("search", "google", "look up", "find")):
             return "com.android.chrome", "Chrome", "search", "low"
         return "", "unknown", "open_app", "low"

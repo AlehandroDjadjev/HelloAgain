@@ -11,6 +11,9 @@ from .services.compatibility_engine import dominant_traits
 
 
 class ElderProfileSerializer(serializers.ModelSerializer):
+    username = serializers.SerializerMethodField()
+    display_name = serializers.SerializerMethodField()
+    description = serializers.SerializerMethodField()
     feature_vector = serializers.SerializerMethodField()
     base_feature_vector = serializers.SerializerMethodField()
     adapted_feature_vector = serializers.SerializerMethodField()
@@ -48,6 +51,24 @@ class ElderProfileSerializer(serializers.ModelSerializer):
             name: round(float(payload.get(name, defaults.get(name, 0.5))), 4)
             for name in get_feature_names()
         }
+
+    def _linked_account(self, obj):
+        try:
+            return obj.account_profile
+        except Exception:
+            return None
+
+    def get_username(self, obj):
+        account = self._linked_account(obj)
+        return account.user.username if account else obj.username
+
+    def get_display_name(self, obj):
+        account = self._linked_account(obj)
+        return account.display_name if account else obj.display_name
+
+    def get_description(self, obj):
+        account = self._linked_account(obj)
+        return account.effective_description if account else obj.description
 
     def get_feature_vector(self, obj):
         return self._serialize_vector(obj.feature_vector or {})

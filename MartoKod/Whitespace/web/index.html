@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <!--
+    If you are serving your web app in a path other than the root, change the
+    href value below to reflect the base path you are serving from.
+
+    The path provided below has to start and end with a slash "/" in order for
+    it to work correctly.
+
+    For more details:
+    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
+
+    This is a placeholder for base href that will be replaced by the value of
+    the `--base-href` argument provided to `flutter build`.
+  -->
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="A new Flutter project.">
+
+  <!-- iOS meta tags & icons -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="whitespace">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <!-- Favicon -->
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>whitespace</title>
+  <link rel="manifest" href="manifest.json">
+</head>
+<body>
+  <script>
+    window.helloAgainVoice = (() => {
+      let activeAudio = null;
+      let activeCapture = null;
+
+      const captureConfig = {
+        startThreshold: 0.07,
+        stopThreshold: 0.03,
+        speechFramesToStart: 4,
+        silenceMsToStop: 900,
+        minSpeechMs: 650,
+        startupTimeoutMs: 10000,
+      };
+
+      const captureState = {
+        mediaStream: null,
+        mediaRecorder: null,
+        audioContext: null,
+        analyser: null,
+        sourceNode: null,
+        frameData: null,
+        chunks: [],
+        recording: false,
+        recordingStartedAt: 0,
+        silenceStartedAt: null,
+        speechFrameCount: 0,
+        rafId: null,
+        pendingMimeType: '',
+      };
+
+      function getAudioContextConstructor() {
+        return window.AudioContext || window.webkitAudioContext || null;
+      }
+
+      function isSpeechCaptureSupported() {
+        return !!(
+          navigator.mediaDevices &&
+          navigator.mediaDevices.getUserMedia &&
+          window.MediaRecorder &&
+          getAudioContextConstructor()
+        );
+      }
+
+      function chooseMimeType() {
+        const candidates = [
+          'audio/webm;codecs=opus',
+          'audio/webm',
+          'audio/ogg;codecs=opus',
+        ];
+        for (const type of candidates) {
+          if (MediaRecorder.isTypeSupported(type)) {
+            return type;
+          }
+        }
+        return '';
+      }
+
+      function clearActiveCaptureTimer() {
+        if (activeCapture && activeCapture.startupTimer !== null) {
+          clearTimeout(activeCapture.startupTimer);
+          activeCapture.startupTimer = null;
+        }
+      }
+
+      function clearMonitorLoop() {
+        if (captureState.rafId !== null) {
+          cancelAnimationFrame(captureState.rafId);
+          captureState.rafId = null;
+        }
+      }
+
+      function resetRecorderState() {
+        captureState.chunks = [];
+        captureState.recording = false;
+        captureState.recordingStartedAt = 0;
+        captureState.silenceStartedAt = null;
+        captureState.speechFrameCount = 0;
+        captureState.pendingMimeType = '';
+        captureState.mediaRecorder = null;
+      }
+
+      function teardownAudioCapture() {
+        clearMonitorLoop();
+        resetRecorderState();
+
+        if (captureState.sourceNode) {
+          try {
+            captureState.sourceNode.disconnect();
+          } catch (_) {}
+          captureState.sourceNode = null;
+        }
+
+        if (captureState.analyser) {
+          try {
+            captureState.analyser.disconnect();
+          } catch (_) {}
+          captureState.analyser = null;
+        }
+
+        if (captureState.mediaStream) {
+          captureState.mediaStream.getTracks().forEach((track) => track.stop());
+          captureState.mediaStream = null;
+        }
+
+        if (captureState.audioContext) {
+          try {
+            captureState.audioContext.close();
+          } catch (_) {}
+          captureState.audioContext = null;
+        }
+
+        captureState.frameData = null;
+      }
+
+      async function ensureAudioCapture() {
+        if (captureState.mediaStream && captureState.audioContext && captureState.analyser) {
+          return;
+        }
+
+        teardownAudioCapture();
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+
+        const AudioContextCtor = getAudioContextConstructor();
+        const audioContext = new AudioContextCtor();
+        await audioContext.resume();
+
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.82;
+
+        const sourceNode = audioContext.createMediaStreamSource(stream);
+        sourceNode.connect(analyser);
+
+        captureState.mediaStream = stream;
+        captureState.audioContext = audioContext;
+        captureState.analyser = analyser;
+        captureState.sourceNode = sourceNode;
+        captureState.frameData = new Float32Array(analyser.fftSize);
+      }
+
+      function rmsFromAnalyser() {
+        if (!captureState.analyser || !captureState.frameData) {
+          return 0;
+        }
+        captureState.analyser.getFloatTimeDomainData(captureState.frameData);
+        let sum = 0;
+        for (let index = 0; index < captureState.frameData.length; index += 1) {
+          const value = captureState.frameData[index];
+          sum += value * value;
+        }
+        return Math.sqrt(sum / captureState.frameData.length);
+      }
+
+      function blobToBase64(blob) {
+        return blob.arrayBuffer().then((buffer) => {
+          const bytes = new Uint8Array(buffer);
+          let binary = '';
+          for (let index = 0; index < bytes.length; index += 1) {
+            binary += String.fromCharCode(bytes[index]);
+          }
+          return btoa(binary);
+        });
+      }
+
+      function finalizeCaptureFailure(message, preserveMic = true) {
+        if (!activeCapture || activeCapture.done) {
+          return;
+        }
+        const pending = activeCapture;
+        pending.done = true;
+        clearActiveCaptureTimer();
+        activeCapture = null;
+        clearMonitorLoop();
+        const shouldTearDown = !preserveMic;
+        resetRecorderState();
+        if (shouldTearDown) {
+          teardownAudioCapture();
+        }
+        pending.reject(new Error(message));
+      }
+
+      function startRecorder() {
+        if (!activeCapture || !captureState.mediaStream) {
+          return;
+        }
+
+        const mimeType = chooseMimeType();
+        const options = mimeType ? { mimeType } : undefined;
+        captureState.chunks = [];
+        captureState.pendingMimeType = mimeType;
+
+        const recorder = new MediaRecorder(captureState.mediaStream, options);
+        captureState.mediaRecorder = recorder;
+        recorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            captureState.chunks.push(event.data);
+          }
+        };
+        recorder.onerror = (event) => {
+          const reason =
+            event && event.error && event.error.message
+              ? event.error.message
+              : 'Audio recording failed.';
+          finalizeCaptureFailure(reason);
+        };
+        recorder.onstop = async () => {
+          if (!activeCapture || activeCapture.done) {
+            resetRecorderState();
+            return;
+          }
+
+          const blob = new Blob(captureState.chunks, {
+            type: recorder.mimeType || mimeType || 'audio/webm',
+          });
+          const pending = activeCapture;
+
+          if (blob.size < 2048) {
+            finalizeCaptureFailure('No speech was captured.');
+            return;
+          }
+
+          try {
+            const audioBase64 = await blobToBase64(blob);
+            if (!activeCapture || activeCapture !== pending || pending.done) {
+              resetRecorderState();
+              return;
+            }
+
+            pending.done = true;
+            clearActiveCaptureTimer();
+            activeCapture = null;
+            clearMonitorLoop();
+            resetRecorderState();
+            pending.resolve(
+              JSON.stringify({
+                audioBase64,
+                mimeType: blob.type || recorder.mimeType || mimeType || 'audio/webm',
+                language: pending.language || 'bg-BG',
+              }),
+            );
+          } catch (error) {
+            finalizeCaptureFailure(
+              error && error.message ? error.message : 'Audio encoding failed.',
+            );
+          }
+        };
+        recorder.start(250);
+        captureState.recording = true;
+        captureState.recordingStartedAt = performance.now();
+        captureState.silenceStartedAt = null;
+      }
+
+      function monitorCaptureLoop() {
+        if (!activeCapture || !captureState.analyser) {
+          clearMonitorLoop();
+          return;
+        }
+
+        const rms = rmsFromAnalyser();
+        const now = performance.now();
+
+        if (!captureState.recording) {
+          if (rms >= captureConfig.startThreshold) {
+            captureState.speechFrameCount += 1;
+            if (captureState.speechFrameCount >= captureConfig.speechFramesToStart) {
+              captureState.speechFrameCount = 0;
+              startRecorder();
+            }
+          } else {
+            captureState.speechFrameCount = 0;
+          }
+        } else if (captureState.mediaRecorder) {
+          const elapsed = now - captureState.recordingStartedAt;
+          if (rms < captureConfig.stopThreshold) {
+            if (captureState.silenceStartedAt === null) {
+              captureState.silenceStartedAt = now;
+            }
+
+            const silenceElapsed = now - captureState.silenceStartedAt;
+            if (
+              elapsed >= captureConfig.minSpeechMs &&
+              silenceElapsed >= captureConfig.silenceMsToStop
+            ) {
+              try {
+                captureState.mediaRecorder.stop();
+              } catch (_) {
+                finalizeCaptureFailure('Audio recording stopped unexpectedly.');
+                return;
+              }
+            }
+          } else {
+            captureState.silenceStartedAt = null;
+          }
+        }
+
+        captureState.rafId = requestAnimationFrame(monitorCaptureLoop);
+      }
+
+      function stopRecognition() {
+        if (!activeCapture) {
+          teardownAudioCapture();
+          return;
+        }
+
+        const pending = activeCapture;
+        pending.done = true;
+        clearActiveCaptureTimer();
+        activeCapture = null;
+        clearMonitorLoop();
+
+        if (captureState.mediaRecorder && captureState.mediaRecorder.state !== 'inactive') {
+          try {
+            captureState.mediaRecorder.stop();
+          } catch (_) {}
+        }
+
+        resetRecorderState();
+        teardownAudioCapture();
+        pending.reject(new Error('Audio capture aborted.'));
+      }
+
+      function captureAudioTurn(language) {
+        return new Promise(async (resolve, reject) => {
+          if (!isSpeechCaptureSupported()) {
+            reject(new Error('Audio capture is not supported in this browser.'));
+            return;
+          }
+
+          if (activeCapture) {
+            stopRecognition();
+          }
+          clearMonitorLoop();
+          resetRecorderState();
+
+          try {
+            await ensureAudioCapture();
+          } catch (error) {
+            reject(
+              new Error(
+                error && error.message ? error.message : 'Microphone access failed.',
+              ),
+            );
+            return;
+          }
+
+          activeCapture = {
+            resolve,
+            reject,
+            done: false,
+            language: language || 'bg-BG',
+            startupTimer: setTimeout(() => {
+              if (captureState.recording) {
+                return;
+              }
+              finalizeCaptureFailure('No speech was captured.');
+            }, captureConfig.startupTimeoutMs),
+          };
+
+          monitorCaptureLoop();
+        });
+      }
+
+      function playBase64Audio(base64Audio, mimeType) {
+        return new Promise((resolve, reject) => {
+          if (!base64Audio) {
+            resolve();
+            return;
+          }
+
+          if (activeAudio) {
+            try {
+              activeAudio.pause();
+              activeAudio.currentTime = 0;
+            } catch (_) {}
+          }
+
+          const audio = new Audio(`data:${mimeType || 'audio/wav'};base64,${base64Audio}`);
+          activeAudio = audio;
+
+          const cleanup = () => {
+            if (activeAudio === audio) {
+              activeAudio = null;
+            }
+          };
+
+          audio.onended = () => {
+            cleanup();
+            resolve();
+          };
+
+          audio.onerror = () => {
+            cleanup();
+            reject(new Error('Audio playback failed.'));
+          };
+
+          const playPromise = audio.play();
+          if (playPromise && typeof playPromise.then === 'function') {
+            playPromise.catch((error) => {
+              cleanup();
+              reject(error);
+            });
+          }
+        });
+      }
+
+      function stopAudio() {
+        if (!activeAudio) {
+          return;
+        }
+        try {
+          activeAudio.pause();
+          activeAudio.currentTime = 0;
+        } catch (_) {}
+        activeAudio = null;
+      }
+
+      return {
+        isSpeechCaptureSupported,
+        captureAudioTurn,
+        stopRecognition,
+        playBase64Audio,
+        stopAudio,
+      };
+    })();
+  </script>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

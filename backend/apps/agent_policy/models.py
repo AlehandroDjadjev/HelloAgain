@@ -157,6 +157,12 @@ class PolicyDecisionRecord(models.Model):
         max_length=128, blank=True, default="",
         help_text="Step id if this decision applies to a specific action; empty for plan-level rules.",
     )
+    action_type = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="ActionType value for step-level policy checks.",
+    )
     decision = models.CharField(
         max_length=16,
         choices=PolicyDecisionOutcome.choices,

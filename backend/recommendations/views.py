@@ -118,13 +118,41 @@ def update_profile(request, elder_id: int):
     except json.JSONDecodeError:
         return _json_error("Invalid JSON body.")
 
-    # Update basic info
-    if "display_name" in body: profile.display_name = str(body["display_name"])[:120]
-    if "description" in body: profile.description = str(body["description"])
+    linked_account = None
+    try:
+        linked_account = profile.account_profile
+    except Exception:
+        linked_account = None
 
-    # If description changed significantly, optionally re-run extraction
-    # Here we just save the new values
-    profile.save()
+    # Account-linked recommendation profiles now treat AccountProfile as the
+    # canonical human-facing profile source. The recommendation row remains
+    # derived state for vectors, confidence, and graph data.
+    if linked_account is not None:
+        changed_identity = False
+        if "display_name" in body:
+            linked_account.display_name = str(body["display_name"])[:120]
+            changed_identity = True
+        if "description" in body:
+            linked_account.description = str(body["description"])
+            changed_identity = True
+        if "dynamic_profile_summary" in body:
+            linked_account.dynamic_profile_summary = str(body["dynamic_profile_summary"])
+            changed_identity = True
+        if "profile_notes" in body:
+            linked_account.profile_notes = str(body["profile_notes"])
+            changed_identity = True
+        if changed_identity:
+            linked_account.save()
+            from apps.accounts.services import sync_profile_to_recommendations
+
+            sync_profile_to_recommendations(linked_account, preserve_adaptation=True)
+            profile.refresh_from_db()
+    else:
+        if "display_name" in body:
+            profile.display_name = str(body["display_name"])[:120]
+        if "description" in body:
+            profile.description = str(body["description"])
+        profile.save()
 
     # Apply feature overrides if provided
     manual_overrides = body.get("manual_overrides") or body.get("feature_vector")

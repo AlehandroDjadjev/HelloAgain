@@ -25,6 +25,16 @@ ALLOWED_HOSTS = ["*"] if DEBUG else [
     host for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if host
 ]
 
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
 INSTALLED_APPS = [
     'django.contrib.admin',
     'django.contrib.auth',
@@ -36,7 +46,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     # Platform
-    'voice_gateway',
+    'controller',
     'meetup',
     "apps.accounts",
     # Agent apps
@@ -87,6 +97,9 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        "OPTIONS": {
+            "timeout": int(os.environ.get("SQLITE_TIMEOUT", "20")),
+        },
     }
 }
 
@@ -157,6 +170,57 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# ── LLM configuration ─────────────────────────────────────────────────────────
+#
+# Default provider: transformers (Qwen/Qwen3-14B loaded locally).
+# Switch provider by setting LLM_PROVIDER env var — no code changes needed:
+#
+#   transformers  local HuggingFace model (default)
+#                 Requires: pip install transformers torch accelerate
+#                 Optional 4-bit quant: pip install bitsandbytes
+#                 First run downloads ~28 GB from HuggingFace Hub.
+#
+#   ollama        local Ollama server  (no API key, fast iteration)
+#                 Start with: ollama run qwen2.5:14b
+#
+#   groq          Groq cloud inference (fastest, free tier available)
+#                 Set LLM_API_KEY to your key from console.groq.com
+#
+#   openai        OpenAI or any OpenAI-compatible endpoint (LM Studio, vLLM…)
+#                 Set LLM_API_KEY + optionally LLM_BASE_URL
+#
+# Quick-start examples:
+#   python manage.py runserver                                         # transformers, downloads on first use
+#   LLM_PROVIDER=ollama python manage.py runserver                     # needs: ollama run qwen2.5:14b
+#   LLM_PROVIDER=groq LLM_API_KEY=gsk_xxx python manage.py runserver
+
+LLM_PROVIDER  = os.environ.get("LLM_PROVIDER",  "transformers")
+LLM_MODEL     = os.environ.get("LLM_MODEL",     "Qwen/Qwen3-14B")
+LLM_API_KEY   = os.environ.get("LLM_API_KEY",   "")
+LLM_BASE_URL  = os.environ.get("LLM_BASE_URL",  "")   # empty → use provider default
+LLM_TIMEOUT   = int(os.environ.get("LLM_TIMEOUT", "60"))  # 60s for local model generation
+LOCAL_LLM_PROVIDER = os.environ.get("LOCAL_LLM_PROVIDER", "transformers")
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen3-14B")
+LOCAL_LLM_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "")
+LOCAL_LLM_BASE_URL = os.environ.get("LOCAL_LLM_BASE_URL", "")
+LOCAL_LLM_TIMEOUT = int(os.environ.get("LOCAL_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+OPENAI_LLM_MODEL = os.environ.get("OPENAI_LLM_MODEL", "gpt-5-mini")
+OPENAI_LLM_API_KEY = os.environ.get(
+    "OPENAI_LLM_API_KEY",
+    os.environ.get("OPENAI_API_KEY", os.environ.get("LLM_API_KEY", "")),
+)
+OPENAI_LLM_BASE_URL = os.environ.get(
+    "OPENAI_LLM_BASE_URL",
+    os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+)
+OPENAI_LLM_TIMEOUT = int(os.environ.get("OPENAI_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+LLM_TOKEN_BUDGET_SYSTEM_PROMPT = int(os.environ.get("LLM_TOKEN_BUDGET_SYSTEM_PROMPT", "2000"))
+LLM_TOKEN_BUDGET_SCREEN_STATE  = int(os.environ.get("LLM_TOKEN_BUDGET_SCREEN_STATE", "6000"))
+LLM_TOKEN_BUDGET_HISTORY       = int(os.environ.get("LLM_TOKEN_BUDGET_HISTORY", "2000"))
+LLM_TOKEN_BUDGET_RESPONSE      = int(os.environ.get("LLM_TOKEN_BUDGET_RESPONSE", "500"))
+LLM_MAX_CONTEXT                = int(os.environ.get("LLM_MAX_CONTEXT", "12000"))
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 CORS_ALLOW_ALL_ORIGINS = True
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "transformers")

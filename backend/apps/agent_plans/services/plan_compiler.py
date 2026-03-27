@@ -1,6 +1,9 @@
 """
 PlanCompiler — deterministic, template-based plan compilation.
 
+DEPRECATED: Template-based compilation.
+New sessions use LLM-in-the-loop execution via StepReasoningService.
+
 The LLM is NOT used here. Templates are pure functions that take
 IntentResult entities and return a list of ActionStep objects.
 
@@ -261,24 +264,24 @@ def _maps_navigate(entities: dict) -> list[ActionStep]:
               hint="map_view"),
 
         _step("mp_3", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Search here")},
-              hint="search_open"),
+              _named("search_input"),
+              hint="search_active"),
 
         _step("mp_4", ActionType.TYPE_TEXT,
               {"text": destination},
               hint="search_results"),
 
         _step("mp_5", ActionType.TAP_ELEMENT,
-              {"selector": _sel(text=destination)},
+              _named("destination_result", destination=destination),
               hint="destination_selected", max_attempts=3),
 
         _step("mp_6", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Directions")},
-              hint="directions_ready"),
+              _named("directions_button"),
+              hint="route_preview"),
 
         _step("mp_7", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Start")},
-              hint="navigation_started",
+              _named("start_navigation_button"),
+              hint="navigation_active",
               sensitivity=ActionSensitivity.MEDIUM),
     ]
 
@@ -299,7 +302,7 @@ def _chrome_open_website(entities: dict) -> list[ActionStep]:
               hint="browser_open"),
 
         _step("ch_3", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Search or type URL")},
+              _named("omnibox"),
               hint="omnibox_focused"),
 
         _step("ch_4", ActionType.TYPE_TEXT,
@@ -307,7 +310,7 @@ def _chrome_open_website(entities: dict) -> list[ActionStep]:
               hint="url_typed"),
 
         _step("ch_5", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Go", class_name="android.widget.ImageView")},
+              _named("go_button"),
               hint="page_loading"),
     ]
 
@@ -328,7 +331,7 @@ def _chrome_search(entities: dict) -> list[ActionStep]:
               hint="browser_open"),
 
         _step("ch_3", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Search or type URL")},
+              _named("omnibox"),
               hint="omnibox_focused"),
 
         _step("ch_4", ActionType.TYPE_TEXT,
@@ -336,7 +339,7 @@ def _chrome_search(entities: dict) -> list[ActionStep]:
               hint="query_typed"),
 
         _step("ch_5", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Go", class_name="android.widget.ImageView")},
+              _named("go_button"),
               hint="results_loading"),
     ]
 
@@ -360,11 +363,11 @@ def _gmail_draft_email(entities: dict) -> list[ActionStep]:
               hint="inbox"),
 
         _step("gm_3", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Compose")},
+              _named("compose_button"),
               hint="compose_open"),
 
         _step("gm_4", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="To")},
+              _named("to_field"),
               hint="to_focused"),
 
         _step("gm_5", ActionType.TYPE_TEXT,
@@ -372,7 +375,7 @@ def _gmail_draft_email(entities: dict) -> list[ActionStep]:
               hint="to_filled"),
 
         _step("gm_6", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Subject")},
+              _named("subject_field"),
               hint="subject_focused"),
 
         _step("gm_7", ActionType.TYPE_TEXT,
@@ -380,7 +383,7 @@ def _gmail_draft_email(entities: dict) -> list[ActionStep]:
               hint="subject_filled"),
 
         _step("gm_8", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Compose email")},
+              _named("body_field"),
               hint="body_focused"),
 
         _step("gm_9", ActionType.TYPE_TEXT,
@@ -398,7 +401,7 @@ def _gmail_draft_email(entities: dict) -> list[ActionStep]:
               sensitivity=ActionSensitivity.MEDIUM),
 
         _step("gm_11", ActionType.TAP_ELEMENT,
-              {"selector": _sel(content_desc="Send")},
+              _named("send_button"),
               hint="email_sent",
               sensitivity=ActionSensitivity.HIGH,
               requires_confirmation=True),

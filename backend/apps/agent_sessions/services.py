@@ -40,6 +40,7 @@ class SessionService:
         device_id: str = "",
         transcript: str = "",
         input_mode: str = "voice",
+        reasoning_provider: str = "local",
         supported_packages: list | None = None,
     ) -> AgentSession:
         session = AgentSession.objects.create(
@@ -47,6 +48,7 @@ class SessionService:
             device_id=device_id,
             transcript=transcript,
             input_mode=input_mode,
+            reasoning_provider=reasoning_provider,
             supported_packages=supported_packages or [],
             status=SessionStatus.CREATED,
         )
@@ -58,6 +60,7 @@ class SessionService:
                 "user_id": user_id,
                 "device_id": device_id,
                 "input_mode": input_mode,
+                "reasoning_provider": reasoning_provider,
             },
         )
         logger.info("AgentSession created: %s (user=%s)", session.id, user_id)
@@ -86,7 +89,6 @@ class SessionService:
         return session
 
     @staticmethod
-    @transaction.atomic
     def create_confirmation(
         session: AgentSession,
         plan_id: UUID,
@@ -99,7 +101,9 @@ class SessionService:
         content_preview: str = "",
         expires_at: Optional[datetime] = None,
     ) -> ConfirmationRecord:
-        conf = ConfirmationRecord.objects.create(
+        """Shim — delegates to ConfirmationService.create()."""
+        from .confirmation_service import ConfirmationService
+        return ConfirmationService.create(
             session=session,
             plan_id=plan_id,
             step_id=step_id,
@@ -111,19 +115,6 @@ class SessionService:
             content_preview=content_preview,
             expires_at=expires_at,
         )
-        SessionService.transition(session, SessionStatus.AWAITING_CONFIRMATION)
-        AuditService.record(
-            session=session,
-            event_type=AuditEventType.CONFIRMATION_REQUESTED,
-            actor=AuditActor.SYSTEM,
-            payload={
-                "confirmation_id": str(conf.id),
-                "step_id": step_id,
-                "app_package": app_package,
-                "action_summary": action_summary,
-            },
-        )
-        return conf
 
     @staticmethod
     @transaction.atomic
@@ -199,46 +190,15 @@ class SessionService:
         }
 
     @staticmethod
-    @transaction.atomic
     def resolve_confirmation(
         confirmation_id: UUID,
         approved: bool,
         session: AgentSession,
     ) -> ConfirmationRecord:
-        conf = ConfirmationRecord.objects.select_for_update().get(pk=confirmation_id)
-        if conf.status != ConfirmationRecord.Status.PENDING:
-            raise ValueError(
-                f"Confirmation {confirmation_id} is already {conf.status}."
-            )
-        conf.status = (
-            ConfirmationRecord.Status.APPROVED
-            if approved
-            else ConfirmationRecord.Status.REJECTED
-        )
-        conf.resolved_at = datetime.now(timezone.utc)
-        conf.save(update_fields=["status", "resolved_at"])
-
-        event_type = (
-            AuditEventType.CONFIRMATION_APPROVED
-            if approved
-            else AuditEventType.CONFIRMATION_REJECTED
-        )
-        AuditService.record(
+        """Shim — delegates to ConfirmationService.resolve()."""
+        from .confirmation_service import ConfirmationService
+        return ConfirmationService.resolve(
+            confirmation_id=confirmation_id,
+            approved=approved,
             session=session,
-            event_type=event_type,
-            actor=AuditActor.USER,
-            payload={"confirmation_id": str(confirmation_id)},
         )
-
-        if approved:
-            SessionService.transition(session, SessionStatus.EXECUTING)
-        else:
-            SessionService.transition(session, SessionStatus.ABORTED)
-            AuditService.record(
-                session=session,
-                event_type=AuditEventType.SESSION_ABORTED,
-                actor=AuditActor.USER,
-                payload={"reason": "confirmation_rejected"},
-            )
-
-        return conf
