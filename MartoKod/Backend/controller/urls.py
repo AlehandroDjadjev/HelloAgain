@@ -1,0 +1,32 @@
+from django.urls import path
+from .views import (
+    add_action_view,
+    agent_board_memory_view,
+    agent_mcp_descriptor_view,
+    agent_mcp_invoke_view,
+    agent_mcp_registry_view,
+    agent_object_open_view,
+    agent_run_view,
+    conversation_view,
+    fetch_action_view,
+    home_view,
+    qwen_health_view,
+    reset_state_view,
+    state_view,
+)
+
+urlpatterns = [
+    path("", home_view, name="home"),
+    path("api/add-action/", add_action_view, name="add_action"),
+    path("api/fetch-action/", fetch_action_view, name="fetch_action"),
+    path("api/conversation/", conversation_view, name="conversation"),
+    path("api/state/", state_view, name="state"),
+    path("api/reset-state/", reset_state_view, name="reset_state"),
+    path("api/qwen-health/", qwen_health_view, name="qwen_health"),
+    path("api/agent/mcp-registry/", agent_mcp_registry_view, name="agent_mcp_registry"),
+    path("api/agent/mcps/<str:mcp_id>/", agent_mcp_descriptor_view, name="agent_mcp_descriptor"),
+    path("api/agent/mcps/<str:mcp_id>/invoke/", agent_mcp_invoke_view, name="agent_mcp_invoke"),
+    path("api/agent/board-memory/", agent_board_memory_view, name="agent_board_memory"),
+    path("api/agent/run/", agent_run_view, name="agent_run"),
+    path("api/agent/open-object/", agent_object_open_view, name="agent_object_open"),
+]
