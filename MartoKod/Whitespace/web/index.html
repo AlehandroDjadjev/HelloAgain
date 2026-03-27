@@ -33,6 +33,144 @@
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
+  <script>
+    window.helloAgainVoice = (() => {
+      let activeRecognition = null;
+      let activeAudio = null;
+
+      function getRecognitionConstructor() {
+        return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+      }
+
+      function isSpeechRecognitionSupported() {
+        return !!getRecognitionConstructor();
+      }
+
+      function startRecognition(language) {
+        return new Promise((resolve, reject) => {
+          const Recognition = getRecognitionConstructor();
+          if (!Recognition) {
+            reject(new Error('Speech recognition is not supported in this browser.'));
+            return;
+          }
+
+          if (activeRecognition) {
+            try {
+              activeRecognition.abort();
+            } catch (_) {}
+          }
+
+          const recognition = new Recognition();
+          activeRecognition = recognition;
+          recognition.lang = language || 'bg-BG';
+          recognition.continuous = false;
+          recognition.interimResults = true;
+          recognition.maxAlternatives = 1;
+
+          let finalTranscript = '';
+
+          recognition.onresult = (event) => {
+            let combinedTranscript = '';
+            for (let index = event.resultIndex; index < event.results.length; index += 1) {
+              const result = event.results[index];
+              if (!result || !result[0]) {
+                continue;
+              }
+              const transcript = (result[0].transcript || '').trim();
+              if (!transcript) {
+                continue;
+              }
+              combinedTranscript += `${transcript} `;
+              if (result.isFinal) {
+                finalTranscript += `${transcript} `;
+              }
+            }
+            if (!finalTranscript.trim()) {
+              finalTranscript = combinedTranscript;
+            }
+          };
+
+          recognition.onerror = (event) => {
+            activeRecognition = null;
+            reject(new Error(event.error || 'Speech recognition failed.'));
+          };
+
+          recognition.onend = () => {
+            const transcript = (finalTranscript || '').trim();
+            activeRecognition = null;
+            if (!transcript) {
+              reject(new Error('No speech was captured.'));
+              return;
+            }
+            resolve(transcript);
+          };
+
+          recognition.start();
+        });
+      }
+
+      function playBase64Audio(base64Audio, mimeType) {
+        return new Promise((resolve, reject) => {
+          if (!base64Audio) {
+            resolve();
+            return;
+          }
+
+          if (activeAudio) {
+            try {
+              activeAudio.pause();
+              activeAudio.currentTime = 0;
+            } catch (_) {}
+          }
+
+          const audio = new Audio(`data:${mimeType || 'audio/wav'};base64,${base64Audio}`);
+          activeAudio = audio;
+
+          const cleanup = () => {
+            if (activeAudio === audio) {
+              activeAudio = null;
+            }
+          };
+
+          audio.onended = () => {
+            cleanup();
+            resolve();
+          };
+
+          audio.onerror = () => {
+            cleanup();
+            reject(new Error('Audio playback failed.'));
+          };
+
+          const playPromise = audio.play();
+          if (playPromise && typeof playPromise.then === 'function') {
+            playPromise.catch((error) => {
+              cleanup();
+              reject(error);
+            });
+          }
+        });
+      }
+
+      function stopAudio() {
+        if (!activeAudio) {
+          return;
+        }
+        try {
+          activeAudio.pause();
+          activeAudio.currentTime = 0;
+        } catch (_) {}
+        activeAudio = null;
+      }
+
+      return {
+        isSpeechRecognitionSupported,
+        startRecognition,
+        playBase64Audio,
+        stopAudio,
+      };
+    })();
+  </script>
   <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>

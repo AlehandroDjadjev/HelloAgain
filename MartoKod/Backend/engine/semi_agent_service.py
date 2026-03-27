@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import base64
+import json
 import math
 import re
+import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
+from threading import Lock
 from typing import Any, Dict, List
 
 from .custom_mcp_registry import CustomMcpRegistry
@@ -12,16 +17,17 @@ from .llm_parser import QwenPromptParser
 from .qwen_worker_client import QwenWorkerClient
 from .semi_agent_prompts import (
     build_step_one_mcp_prompt,
-    build_step_three_speech_prompt,
     build_step_two_board_prompt,
 )
 from .whiteboard_memory import WhiteboardMemoryStore
+from voice_gateway.services.providers import OpenAILLMProvider, PiperTTSProvider
 
 
 class SemiAgentService:
     SUPPORTED_TOOL_NAMES = {"add_action", "fetch_action", "conversation"}
     BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS = 256
     BOARD_PIPELINE_JSON_CONTINUATION_BUDGET = 0
+    RUN_JOB_TTL_SECONDS = 900
 
     def __init__(
         self,
@@ -30,11 +36,18 @@ class SemiAgentService:
         qwen_client: QwenWorkerClient | None = None,
         registry: CustomMcpRegistry | None = None,
         board_memory: WhiteboardMemoryStore | None = None,
+        llm_provider: OpenAILLMProvider | None = None,
+        tts_provider: PiperTTSProvider | None = None,
     ) -> None:
         self.graph_service = graph_service or GraphService()
         self.qwen_client = qwen_client or QwenWorkerClient()
         self.registry = registry or CustomMcpRegistry()
         self.board_memory = board_memory or WhiteboardMemoryStore()
+        self.llm_provider = llm_provider or OpenAILLMProvider()
+        self.tts_provider = tts_provider or PiperTTSProvider()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        self._run_jobs: Dict[str, Dict[str, Any]] = {}
+        self._run_jobs_lock = Lock()
 
     def get_registry_payload(self, *, base_url: str = "") -> Dict[str, Any]:
         return self.registry.load_registry(base_url=base_url)
@@ -48,7 +61,121 @@ class SemiAgentService:
             "board_state": self.board_memory.load_persistent_board_state(),
         }
 
-    def run(self, *, prompt: str, board_state: Dict[str, Any] | None, largest_empty_space: Dict[str, Any] | None) -> Dict[str, Any]:
+    def run(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        largest_empty_space: Dict[str, Any] | None,
+        user_id: str = "anonymous",
+        session_id: str = "default_session",
+    ) -> Dict[str, Any]:
+        context = self._prepare_run_context(
+            prompt=prompt,
+            board_state=board_state,
+            largest_empty_space=largest_empty_space,
+        )
+        speech_future = self._executor.submit(
+            self._run_speech_stage,
+            clean_prompt=context["prompt"],
+            step_one=context["step_one"],
+            mcp_results=context["mcp_results"],
+            registry_payload=context["mcp_registry"],
+            user_id=user_id,
+            session_id=session_id,
+        )
+        board_payload = self._run_board_stage(
+            clean_prompt=context["prompt"],
+            normalized_board_state=context["normalized_board_state"],
+            empty_space_payload=context["largest_empty_space"],
+            step_one=context["step_one"],
+            mcp_results=context["mcp_results"],
+            chain_history=context["chain_history"],
+            registry_payload=context["mcp_registry"],
+        )
+        speech_payload = speech_future.result()
+        return {
+            **board_payload,
+            "speech_response": self._clean_text(speech_payload.get("assistant_text")),
+            "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
+            "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
+            "speech_provider_status": speech_payload.get("provider_status", {}),
+            "speech_warnings": speech_payload.get("warnings", []),
+        }
+
+    def start_run(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        largest_empty_space: Dict[str, Any] | None,
+        user_id: str = "anonymous",
+        session_id: str = "default_session",
+    ) -> Dict[str, Any]:
+        self._prune_run_jobs()
+        context = self._prepare_run_context(
+            prompt=prompt,
+            board_state=board_state,
+            largest_empty_space=largest_empty_space,
+        )
+        run_id = f"run_{uuid.uuid4().hex}"
+        speech_future = self._executor.submit(
+            self._run_speech_stage,
+            clean_prompt=context["prompt"],
+            step_one=context["step_one"],
+            mcp_results=context["mcp_results"],
+            registry_payload=context["mcp_registry"],
+            user_id=user_id,
+            session_id=session_id,
+        )
+        whitespace_future = self._executor.submit(
+            self._run_board_stage,
+            clean_prompt=context["prompt"],
+            normalized_board_state=context["normalized_board_state"],
+            empty_space_payload=context["largest_empty_space"],
+            step_one=context["step_one"],
+            mcp_results=context["mcp_results"],
+            chain_history=context["chain_history"],
+            registry_payload=context["mcp_registry"],
+        )
+        with self._run_jobs_lock:
+            self._run_jobs[run_id] = {
+                "created_at": time.time(),
+                "prompt": context["prompt"],
+                "speech_future": speech_future,
+                "whitespace_future": whitespace_future,
+            }
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "prompt": context["prompt"],
+            "step_one": context["step_one"],
+            "mcp_results": context["mcp_results"],
+            "speech_status": "running",
+            "whitespace_status": "running",
+        }
+
+    def get_run_speech(self, run_id: str) -> Dict[str, Any]:
+        return self._serialize_future_payload(
+            run_id=run_id,
+            future_key="speech_future",
+            kind="speech",
+        )
+
+    def get_run_whitespace(self, run_id: str) -> Dict[str, Any]:
+        return self._serialize_future_payload(
+            run_id=run_id,
+            future_key="whitespace_future",
+            kind="whitespace",
+        )
+
+    def _prepare_run_context(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        largest_empty_space: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
         clean_prompt = self._clean_text(prompt)
         if not clean_prompt:
             raise ValueError("prompt required")
@@ -78,7 +205,28 @@ class SemiAgentService:
         if mcp_results:
             chain_history.append({"stage": "mcp_results", "payload": mcp_results})
 
-        step_two = self._run_step_two_loop(
+        return {
+            "prompt": clean_prompt,
+            "normalized_board_state": normalized_board_state,
+            "largest_empty_space": empty_space_payload,
+            "chain_history": chain_history,
+            "mcp_registry": registry_payload,
+            "step_one": step_one,
+            "mcp_results": mcp_results,
+        }
+
+    def _run_board_stage(
+        self,
+        *,
+        clean_prompt: str,
+        normalized_board_state: Dict[str, Any],
+        empty_space_payload: Dict[str, Any],
+        step_one: Dict[str, Any],
+        mcp_results: List[Dict[str, Any]],
+        chain_history: List[Dict[str, Any]],
+        registry_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        step_two, final_mcp_results = self._run_step_two_loop(
             prompt=clean_prompt,
             board_state=normalized_board_state,
             largest_empty_space=empty_space_payload,
@@ -86,37 +234,28 @@ class SemiAgentService:
             mcp_results=mcp_results,
             chain_history=chain_history,
         )
-        chain_history.append({"stage": "step_2_board", "payload": step_two})
 
         final_board_commands = step_two.get("board_commands", [])
-        final_board_state = self.board_memory.apply_commands(normalized_board_state, final_board_commands)
+        final_board_state = self.board_memory.apply_commands(
+            normalized_board_state,
+            final_board_commands,
+        )
         registered_bindings = self._prepare_result_bindings(
             step_two=step_two,
-            executed_results=mcp_results,
+            executed_results=final_mcp_results,
             final_board_state=final_board_state,
         )
         self._attach_bindings_to_commands(final_board_commands, registered_bindings)
         self.board_memory.register_result_bindings(registered_bindings)
         persisted_board_state = self.board_memory.save_persistent_board_state(final_board_state)
 
-        speech_response = self._generate_text(
-            system_prompt=build_step_three_speech_prompt(
-                original_prompt=clean_prompt,
-                step_one_plan=step_one,
-                mcp_results=mcp_results,
-                step_two_plan=step_two,
-                final_board_state=final_board_state,
-            ),
-            user_prompt=clean_prompt,
-            fallback=self._fallback_speech_response(clean_prompt, mcp_results, step_two),
-        )
-
         return {
             "ok": True,
+            "status": "completed",
             "prompt": clean_prompt,
             "mcp_registry": registry_payload,
             "step_one": step_one,
-            "mcp_results": mcp_results,
+            "mcp_results": final_mcp_results,
             "step_two": step_two,
             "board_commands": final_board_commands,
             "board_state": final_board_state,
@@ -130,8 +269,189 @@ class SemiAgentService:
                 }
                 for binding in registered_bindings
             ],
-            "speech_response": speech_response,
         }
+
+    def _run_speech_stage(
+        self,
+        *,
+        clean_prompt: str,
+        step_one: Dict[str, Any],
+        mcp_results: List[Dict[str, Any]],
+        registry_payload: Dict[str, Any],
+        user_id: str,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+        llm_result = None
+        try:
+            llm_result = self.llm_provider.generate_reply_with_messages(
+                system_prompt=self._build_parallel_speech_system_prompt(),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_parallel_speech_user_prompt(
+                            clean_prompt=clean_prompt,
+                            step_one=step_one,
+                            mcp_results=mcp_results,
+                            registry_payload=registry_payload,
+                        ),
+                    }
+                ],
+                session_id=self._clean_text(session_id) or "default_session",
+                user_id=self._clean_text(user_id) or "anonymous",
+                include_history=True,
+                history_prompt=clean_prompt,
+                store_history=True,
+            )
+            assistant_text = llm_result.text
+            warnings.extend(llm_result.warnings)
+            llm_source = llm_result.source
+        except Exception as exc:
+            assistant_text = self._fallback_parallel_speech_response(clean_prompt)
+            warnings.append(f"llm_fallback={exc}")
+            llm_source = "fallback"
+
+        synthesis = self.tts_provider.synthesize(assistant_text)
+        warnings.extend(synthesis.warnings)
+        return {
+            "ok": True,
+            "status": "completed",
+            "speech_response": assistant_text,
+            "assistant_text": assistant_text,
+            "assistant_audio_base64": base64.b64encode(synthesis.audio_bytes).decode("ascii"),
+            "assistant_audio_mime_type": synthesis.mime_type,
+            "provider_status": {
+                "llm": llm_source,
+                "tts": synthesis.source,
+            },
+            "warnings": warnings,
+        }
+
+    def _build_parallel_speech_system_prompt(self) -> str:
+        return (
+            "You are HelloAgain speaking for a semi-agent that has already finished "
+            "stage 1 MCP work. You are generally having a conversation with the user, "
+            "so be tolerant, explanatory, patient, and helpful. Use the MCP context "
+            "only when it helps the answer. This reply will go directly into text to "
+            "speech, so keep it natural and easy to say aloud. "
+            "THIS IS EXTREMELY IMPORTANT: you MUST answer in Bulgarian written in "
+            "Bulgarian Cyrillic. Do not answer in English unless the user explicitly "
+            "asks you to switch languages."
+        )
+
+    def _build_parallel_speech_user_prompt(
+        self,
+        *,
+        clean_prompt: str,
+        step_one: Dict[str, Any],
+        mcp_results: List[Dict[str, Any]],
+        registry_payload: Dict[str, Any],
+    ) -> str:
+        context_payload = {
+            "original_user_request": clean_prompt,
+            "step_one_plan": step_one,
+            "used_mcp_context": self._build_used_mcp_context(
+                mcp_results=mcp_results,
+                registry_payload=registry_payload,
+            ),
+        }
+        return (
+            "Hold a helpful conversation with the user about their request. "
+            "The agent has already completed the stage 1 MCP work below, so you can "
+            "use it as factual context while answering. Respond directly to the user. "
+            "Be warm and explanatory when the request is unclear or difficult. "
+            "THIS IS EXTREMELY IMPORTANT: the final answer must be in Bulgarian.\n\n"
+            f"{json.dumps(context_payload, ensure_ascii=False, indent=2)}"
+        )
+
+    def _build_used_mcp_context(
+        self,
+        *,
+        mcp_results: List[Dict[str, Any]],
+        registry_payload: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        registry_items = {
+            self._clean_text(item.get("id")): item
+            for item in registry_payload.get("mcps", [])
+            if isinstance(item, dict)
+        }
+        used_mcps: List[Dict[str, Any]] = []
+        for result in mcp_results:
+            if not isinstance(result, dict):
+                continue
+            mcp_id = self._clean_text(result.get("mcp_id"))
+            registry_item = registry_items.get(mcp_id, {})
+            used_mcps.append(
+                {
+                    "call_id": self._clean_text(result.get("call_id")),
+                    "mcp_id": mcp_id,
+                    "mcp_name": self._clean_text(registry_item.get("name")) or mcp_id,
+                    "mcp_description": self._clean_text(registry_item.get("description")),
+                    "mcp_notes": [
+                        self._clean_text(note)
+                        for note in registry_item.get("notes", [])
+                        if self._clean_text(note)
+                    ],
+                    "tool_name": self._normalize_tool_name(result.get("tool_name")),
+                    "why_used": self._clean_text(result.get("why")),
+                    "result_summary": self._clean_text(result.get("summary")),
+                }
+            )
+        return used_mcps
+
+    def _serialize_future_payload(
+        self,
+        *,
+        run_id: str,
+        future_key: str,
+        kind: str,
+    ) -> Dict[str, Any]:
+        self._prune_run_jobs()
+        with self._run_jobs_lock:
+            job = self._run_jobs.get(self._clean_text(run_id))
+        if job is None:
+            raise ValueError(f"Unknown run '{run_id}'.")
+
+        future = job.get(future_key)
+        if not isinstance(future, Future):
+            raise ValueError(f"Run '{run_id}' is missing the {kind} future.")
+
+        if not future.done():
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "kind": kind,
+                "status": "running",
+                "prompt": job.get("prompt", ""),
+            }
+
+        try:
+            payload = future.result()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "run_id": run_id,
+                "kind": kind,
+                "status": "failed",
+                "detail": str(exc),
+            }
+
+        return {
+            "run_id": run_id,
+            "kind": kind,
+            **payload,
+        }
+
+    def _prune_run_jobs(self) -> None:
+        cutoff = time.time() - self.RUN_JOB_TTL_SECONDS
+        with self._run_jobs_lock:
+            stale_ids = [
+                run_id
+                for run_id, payload in self._run_jobs.items()
+                if float(payload.get("created_at", 0.0)) < cutoff
+            ]
+            for run_id in stale_ids:
+                self._run_jobs.pop(run_id, None)
 
     def invoke_mcp(self, *, mcp_id: str, tool_name: str, arguments: Dict[str, Any] | None, fallback_prompt: str = "") -> Dict[str, Any]:
         clean_mcp_id = self._clean_text(mcp_id)
@@ -211,7 +531,7 @@ class SemiAgentService:
         step_one: Dict[str, Any],
         mcp_results: List[Dict[str, Any]],
         chain_history: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
+    ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         current_results = list(mcp_results)
         current_history = list(chain_history)
         step_two = self._default_step_two_plan(prompt, step_one, current_results)
@@ -249,7 +569,7 @@ class SemiAgentService:
                 {"stage": "step_2_extra_mcp_results", "payload": extra_results},
             ]
 
-        return step_two
+        return step_two, current_results
 
     def _execute_mcp_calls(self, calls: List[Dict[str, Any]], fallback_prompt: str) -> List[Dict[str, Any]]:
         executed: List[Dict[str, Any]] = []
@@ -1049,6 +1369,15 @@ class SemiAgentService:
             if summary:
                 return f"{summary} I also moved the board around {focus_text or 'the new object'} so the result is front and center."
         return f"I worked through your request and put a focused board object up for {focus_text or prompt}."
+
+    def _fallback_parallel_speech_response(self, prompt: str) -> str:
+        focus = self._clean_text(prompt)
+        if focus:
+            return (
+                f"Обработих заявката ти за {focus} и подготвих резултата. "
+                "Ще ти го покажа на дъската след малко."
+            )
+        return "Обработих заявката ти и подготвих резултата. Ще ти го покажа на дъската след малко."
 
     @staticmethod
     def _slugify(value: str) -> str:

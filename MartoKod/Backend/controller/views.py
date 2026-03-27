@@ -200,11 +200,68 @@ def agent_run_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
+            user_id=str(payload.get("user_id") or "anonymous"),
+            session_id=str(payload.get("session_id") or "default_session"),
         )
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)
     except Exception as exc:
         print(f"[controller] semi-agent failed: {exc}", file=sys.stderr, flush=True)
+        return JsonResponse({"detail": str(exc)}, status=500)
+    return JsonResponse(result)
+
+
+@csrf_exempt
+def agent_run_start_view(request: HttpRequest):
+    if request.method != "POST":
+        return JsonResponse({"detail": "POST required"}, status=405)
+    try:
+        payload = _parse_json_request(request)
+    except json.JSONDecodeError as exc:
+        return JsonResponse({"detail": f"invalid JSON body: {exc}"}, status=400)
+
+    prompt = payload.get("prompt", "")
+    if not str(prompt).strip():
+        return JsonResponse({"detail": "prompt required"}, status=400)
+
+    try:
+        result = semi_agent_service.start_run(
+            prompt=str(prompt),
+            board_state=payload.get("board_state") if isinstance(payload.get("board_state"), dict) else {},
+            largest_empty_space=payload.get("largest_empty_space")
+            if isinstance(payload.get("largest_empty_space"), dict)
+            else {},
+            user_id=str(payload.get("user_id") or "anonymous"),
+            session_id=str(payload.get("session_id") or "default_session"),
+        )
+    except ValueError as exc:
+        return JsonResponse({"detail": str(exc)}, status=400)
+    except Exception as exc:
+        print(f"[controller] semi-agent start failed: {exc}", file=sys.stderr, flush=True)
+        return JsonResponse({"detail": str(exc)}, status=500)
+    return JsonResponse(result)
+
+
+def agent_run_speech_view(request: HttpRequest, run_id: str):
+    if request.method != "GET":
+        return JsonResponse({"detail": "GET required"}, status=405)
+    try:
+        result = semi_agent_service.get_run_speech(run_id)
+    except ValueError as exc:
+        return JsonResponse({"detail": str(exc)}, status=404)
+    except Exception as exc:
+        return JsonResponse({"detail": str(exc)}, status=500)
+    return JsonResponse(result)
+
+
+def agent_run_whitespace_view(request: HttpRequest, run_id: str):
+    if request.method != "GET":
+        return JsonResponse({"detail": "GET required"}, status=405)
+    try:
+        result = semi_agent_service.get_run_whitespace(run_id)
+    except ValueError as exc:
+        return JsonResponse({"detail": str(exc)}, status=404)
+    except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)
     return JsonResponse(result)
 

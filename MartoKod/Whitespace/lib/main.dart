@@ -1,11 +1,13 @@
-
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui' show lerpDouble;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+
+import 'browser_voice_bridge.dart';
 
 void main() {
   runApp(const AgentBoardApp());
@@ -38,21 +40,31 @@ class AgentBoardScreen extends StatefulWidget {
 class _AgentBoardScreenState extends State<AgentBoardScreen> {
   late final SceneController _sceneController;
   late final AgentBackendClient _backendClient;
+  late final BrowserVoiceBridge _voiceBridge;
   final TextEditingController _promptController = TextEditingController();
-  String _lastSpeech = 'The board is ready for the 3-step Qwen chain.';
+  late final String _sessionId;
+  final String _userId = 'whitespace_frontend';
+  String _lastSpeech =
+      'The board is ready for the whitespace conversation pipeline.';
   String _statusText = 'Loading saved board memory...';
   bool _isBusy = false;
+  bool _isListening = false;
+  bool _speechReady = false;
+  bool _whitespaceReady = false;
 
   @override
   void initState() {
     super.initState();
     _sceneController = SceneController();
     _backendClient = AgentBackendClient();
+    _voiceBridge = createBrowserVoiceBridge();
+    _sessionId = 'whitespace_${DateTime.now().millisecondsSinceEpoch}';
     unawaited(_hydrateBoardFromBackend());
   }
 
   @override
   void dispose() {
+    _voiceBridge.stopAudio();
     _sceneController.dispose();
     _promptController.dispose();
     super.dispose();
@@ -109,7 +121,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         _lastSpeech = (payload['speech_response'] ?? _lastSpeech).toString();
         _statusText = (payload['found'] ?? false) == true
             ? 'Opened the stored MCP result for ${object.text}.'
-            : (payload['message'] ?? 'This object has no linked result.').toString();
+            : (payload['message'] ?? 'This object has no linked result.')
+                  .toString();
       });
     } catch (error) {
       if (!mounted) return;
@@ -117,45 +130,183 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         _statusText = 'Could not open the board object right now.';
       });
     } finally {
-      if (!mounted) return;
-      setState(() {
-        _isBusy = false;
-      });
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+        });
+      }
     }
   }
 
   Future<void> _sendPrompt() async {
     final message = _promptController.text.trim();
-    if (message.isEmpty || _isBusy) return;
+    if (message.isEmpty || _isBusy || _isListening) return;
+    await _submitPrompt(message: message, triggeredBySpeech: false);
+  }
+
+  Future<void> _startSpeechInput() async {
+    if (_isBusy || _isListening) return;
+
+    if (!_voiceBridge.isSpeechRecognitionSupported) {
+      setState(() {
+        _statusText =
+            'Chrome speech input is unavailable here. Open the web app in a supported Chrome browser.';
+      });
+      return;
+    }
 
     setState(() {
-      _isBusy = true;
-      _statusText = 'Running the 3-step Qwen chain...';
+      _isListening = true;
+      _statusText = 'Listening in Chrome conversation mode...';
     });
 
     try {
-      final payload = await _backendClient.runAgent(
-        prompt: message,
-        boardState: _sceneController.exportStateSnapshot(),
-        largestEmptySpace: _sceneController.findLargestEmptySpaceSnapshot(),
+      final transcript = await _voiceBridge.startRecognition(language: 'bg-BG');
+      if (!mounted) return;
+      _promptController.text = transcript;
+      _promptController.selection = TextSelection.collapsed(
+        offset: transcript.length,
       );
-      await _applyCommands(payload['board_commands']);
+      setState(() {
+        _isListening = false;
+      });
+      await _submitPrompt(message: transcript, triggeredBySpeech: true);
+    } catch (error) {
       if (!mounted) return;
       setState(() {
-        _lastSpeech = (payload['speech_response'] ?? '').toString();
-        _statusText = _readStatusText(payload);
+        _statusText = 'Speech capture failed before the request could start.';
       });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isListening = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _submitPrompt({
+    required String message,
+    required bool triggeredBySpeech,
+  }) async {
+    final cleanMessage = message.trim();
+    if (cleanMessage.isEmpty || _isBusy) return;
+
+    setState(() {
+      _isBusy = true;
+      _speechReady = false;
+      _whitespaceReady = false;
+      _statusText = triggeredBySpeech
+          ? 'Speech captured. Starting the whitespace pipeline...'
+          : 'Starting the whitespace pipeline...';
+    });
+
+    try {
+      final startPayload = await _backendClient.startAgentRun(
+        prompt: cleanMessage,
+        boardState: _sceneController.exportStateSnapshot(),
+        largestEmptySpace: _sceneController.findLargestEmptySpaceSnapshot(),
+        userId: _userId,
+        sessionId: _sessionId,
+      );
+
+      final runId = (startPayload['run_id'] ?? '').toString();
+      if (runId.isEmpty) {
+        throw StateError('Backend did not return a run id.');
+      }
+
+      if (mounted) {
+        setState(() {
+          _statusText = _readPendingStatusText(startPayload);
+        });
+      }
+
+      await Future.wait([_waitForSpeech(runId), _waitForWhitespace(runId)]);
+
+      if (!mounted) return;
       _promptController.clear();
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _statusText = 'The semi-agent request failed before the board could update.';
+        _statusText =
+            'The whitespace request failed before the full response could finish.';
       });
     } finally {
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _waitForSpeech(String runId) async {
+    while (true) {
+      final payload = await _backendClient.fetchAgentSpeech(runId);
+      final status = (payload['status'] ?? 'running').toString();
+      if (status == 'running') {
+        await Future<void>.delayed(const Duration(milliseconds: 450));
+        continue;
+      }
+      if (status != 'completed') {
+        throw StateError(
+          (payload['detail'] ?? 'Speech generation failed.').toString(),
+        );
+      }
+
+      final speechText = (payload['assistant_text'] ?? '').toString();
+      final audioBase64 = (payload['assistant_audio_base64'] ?? '').toString();
+      final audioMimeType =
+          (payload['assistant_audio_mime_type'] ?? 'audio/wav').toString();
+
       if (!mounted) return;
       setState(() {
-        _isBusy = false;
+        _speechReady = true;
+        if (speechText.isNotEmpty) {
+          _lastSpeech = speechText;
+        }
+        if (!_whitespaceReady) {
+          _statusText = 'Speech is ready. Finishing the whitespace actions...';
+        }
       });
+
+      if (audioBase64.isNotEmpty) {
+        unawaited(
+          _voiceBridge
+              .playBase64Audio(
+                audioBase64: audioBase64,
+                mimeType: audioMimeType,
+              )
+              .catchError((_) {}),
+        );
+      }
+      return;
+    }
+  }
+
+  Future<void> _waitForWhitespace(String runId) async {
+    while (true) {
+      final payload = await _backendClient.fetchAgentWhitespace(runId);
+      final status = (payload['status'] ?? 'running').toString();
+      if (status == 'running') {
+        await Future<void>.delayed(const Duration(milliseconds: 450));
+        continue;
+      }
+      if (status != 'completed') {
+        throw StateError(
+          (payload['detail'] ?? 'Whitespace processing failed.').toString(),
+        );
+      }
+
+      await _applyCommands(payload['board_commands']);
+      if (!mounted) return;
+      setState(() {
+        _whitespaceReady = true;
+        _statusText = _speechReady
+            ? _readStatusText(payload)
+            : 'Whitespace actions are ready. Waiting for the speech response...';
+      });
+      return;
     }
   }
 
@@ -178,10 +329,19 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     );
     final mcpResults = (payload['mcp_results'] as List?) ?? const [];
     final requestKind = (stepOne['request_kind'] ?? 'mixed').toString();
-    final memoryType = ((stepTwo['memory_plan'] as Map?)?['default_memory_type'] ??
-            'ram')
-        .toString();
+    final memoryType =
+        ((stepTwo['memory_plan'] as Map?)?['default_memory_type'] ?? 'ram')
+            .toString();
     return 'Step 1: $requestKind. MCP calls: ${mcpResults.length}. Step 2 memory: $memoryType.';
+  }
+
+  String _readPendingStatusText(Map<String, dynamic> payload) {
+    final stepOne = Map<String, dynamic>.from(
+      payload['step_one'] as Map? ?? const {},
+    );
+    final mcpResults = (payload['mcp_results'] as List?) ?? const [];
+    final requestKind = (stepOne['request_kind'] ?? 'mixed').toString();
+    return 'Stage 1 finished as $requestKind. MCP calls: ${mcpResults.length}. Waiting for speech and whitespace...';
   }
 
   @override
@@ -207,19 +367,15 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                         child: Stack(
                           children: [
                             Positioned.fill(
-                              child: CustomPaint(
-                                painter: GridPainter(),
-                              ),
+                              child: CustomPaint(painter: GridPainter()),
                             ),
                             ..._sceneController.objects.values.map(
                               (object) => BoardObjectWidget(
                                 key: ValueKey(object.name),
                                 data: object,
                                 onTap: () => _openObjectResult(object),
-                                onDeleteComplete: () =>
-                                    _sceneController.finalizeDelete(
-                                  object.name,
-                                ),
+                                onDeleteComplete: () => _sceneController
+                                    .finalizeDelete(object.name),
                                 onDragPositionChanged: (x, y) {
                                   _sceneController.setObjectPositionFromDrag(
                                     object.name,
@@ -258,10 +414,13 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 ),
                               ),
                               child: TextField(
+                                enabled: !_isBusy && !_isListening,
                                 controller: _promptController,
                                 onSubmitted: (_) => _sendPrompt(),
                                 decoration: InputDecoration(
-                                  hintText: 'Write prompt...',
+                                  hintText: _isListening
+                                      ? 'Listening in Chrome...'
+                                      : 'Write prompt or use the mic...',
                                   hintStyle: TextStyle(
                                     color: Colors.black.withOpacity(0.45),
                                   ),
@@ -277,7 +436,33 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                           ),
                           const SizedBox(width: 10),
                           GestureDetector(
-                            onTap: _sendPrompt,
+                            onTap: (_isBusy || _isListening)
+                                ? null
+                                : _startSpeechInput,
+                            child: Container(
+                              width: 44,
+                              height: 44,
+                              decoration: BoxDecoration(
+                                color: _isListening
+                                    ? const Color(0xFFD64444)
+                                    : const Color(0xFFCB4A4A),
+                                border: Border.all(
+                                  color: Colors.black.withOpacity(0.18),
+                                  width: 0.7,
+                                ),
+                              ),
+                              child: Icon(
+                                _isListening ? Icons.mic : Icons.mic_none,
+                                color: Colors.white,
+                                size: 18,
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          GestureDetector(
+                            onTap: (_isBusy || _isListening)
+                                ? null
+                                : _sendPrompt,
                             child: Container(
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 14,
@@ -291,7 +476,11 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 ),
                               ),
                               child: Text(
-                                _isBusy ? 'Running' : 'Send',
+                                _isBusy
+                                    ? 'Running'
+                                    : _isListening
+                                    ? 'Listening'
+                                    : 'Send',
                                 style: TextStyle(
                                   color: Colors.black.withOpacity(0.70),
                                   fontSize: 13,
@@ -334,10 +523,7 @@ class AgentResponseCard extends StatelessWidget {
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
           color: Colors.white.withOpacity(0.88),
-          border: Border.all(
-            color: Colors.black.withOpacity(0.12),
-            width: 0.8,
-          ),
+          border: Border.all(color: Colors.black.withOpacity(0.12), width: 0.8),
           boxShadow: [
             BoxShadow(
               color: Colors.black.withOpacity(0.08),
@@ -384,10 +570,7 @@ class AgentResponseCard extends StatelessWidget {
 }
 
 class AgentResultDialog extends StatelessWidget {
-  const AgentResultDialog({
-    super.key,
-    required this.viewer,
-  });
+  const AgentResultDialog({super.key, required this.viewer});
 
   final Map<String, dynamic> viewer;
 
@@ -422,10 +605,7 @@ class AgentResultDialog extends StatelessWidget {
               child: SingleChildScrollView(
                 child: SelectableText(
                   jsonText,
-                  style: const TextStyle(
-                    fontSize: 12,
-                    height: 1.25,
-                  ),
+                  style: const TextStyle(fontSize: 12, height: 1.25),
                 ),
               ),
             ),
@@ -443,91 +623,87 @@ class AgentResultDialog extends StatelessWidget {
 }
 
 class AgentBackendClient {
-  AgentBackendClient({
-    String? baseUrl,
-  }) : _baseUri = Uri.parse(
-         baseUrl ??
-             const String.fromEnvironment(
-               'BACKEND_BASE_URL',
-               defaultValue: 'http://127.0.0.1:8000',
-             ),
-       );
+  AgentBackendClient({String? baseUrl})
+    : _baseUri = Uri.parse(baseUrl ?? _resolveDefaultBaseUrl());
 
   final Uri _baseUri;
+
+  static String _resolveDefaultBaseUrl() {
+    const configuredBaseUrl = String.fromEnvironment('BACKEND_BASE_URL');
+    if (configuredBaseUrl.isNotEmpty) {
+      return configuredBaseUrl;
+    }
+    if (kIsWeb) {
+      return Uri.base.origin;
+    }
+    return 'http://127.0.0.1:8000';
+  }
 
   Future<Map<String, dynamic>> fetchBoardMemory() {
     return _getJson('/api/agent/board-memory/');
   }
 
-  Future<Map<String, dynamic>> runAgent({
+  Future<Map<String, dynamic>> startAgentRun({
     required String prompt,
     required Map<String, dynamic> boardState,
     required Map<String, dynamic> largestEmptySpace,
+    required String userId,
+    required String sessionId,
   }) {
-    return _postJson(
-      '/api/agent/run/',
-      {
-        'prompt': prompt,
-        'board_state': boardState,
-        'largest_empty_space': largestEmptySpace,
-      },
-    );
+    return _postJson('/api/agent/run/start/', {
+      'prompt': prompt,
+      'board_state': boardState,
+      'largest_empty_space': largestEmptySpace,
+      'user_id': userId,
+      'session_id': sessionId,
+    });
+  }
+
+  Future<Map<String, dynamic>> fetchAgentSpeech(String runId) {
+    return _getJson('/api/agent/run/$runId/speech/');
+  }
+
+  Future<Map<String, dynamic>> fetchAgentWhitespace(String runId) {
+    return _getJson('/api/agent/run/$runId/whitespace/');
   }
 
   Future<Map<String, dynamic>> openObject({
     required Map<String, dynamic> object,
   }) {
-    return _postJson(
-      '/api/agent/open-object/',
-      {
-        'object': object,
-      },
-    );
+    return _postJson('/api/agent/open-object/', {'object': object});
   }
 
   Future<Map<String, dynamic>> _getJson(String path) async {
-    final client = HttpClient();
-    try {
-      final request = await client.getUrl(_baseUri.resolve(path));
-      final response = await request.close();
-      final body = await response.transform(utf8.decoder).join();
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException(
-          'GET $path failed with ${response.statusCode}: $body',
-          uri: _baseUri.resolve(path),
-        );
-      }
-      return _decodeJson(body);
-    } finally {
-      client.close(force: true);
+    final response = await http.get(
+      _baseUri.resolve(path),
+      headers: const {'Accept': 'application/json'},
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(
+        'GET $path failed with ${response.statusCode}: ${response.body}',
+      );
     }
+    return _decodeJson(response.body);
   }
 
   Future<Map<String, dynamic>> _postJson(
     String path,
     Map<String, dynamic> payload,
   ) async {
-    final client = HttpClient();
-    try {
-      final request = await client.postUrl(_baseUri.resolve(path));
-      final encodedBody = utf8.encode(jsonEncode(payload));
-      request.headers.contentType = ContentType.json;
-      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
-      request.contentLength = encodedBody.length;
-      request.persistentConnection = false;
-      request.add(encodedBody);
-      final response = await request.close();
-      final body = await response.transform(utf8.decoder).join();
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw HttpException(
-          'POST $path failed with ${response.statusCode}: $body',
-          uri: _baseUri.resolve(path),
-        );
-      }
-      return _decodeJson(body);
-    } finally {
-      client.close(force: true);
+    final response = await http.post(
+      _baseUri.resolve(path),
+      headers: const {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Accept': 'application/json',
+      },
+      body: jsonEncode(payload),
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(
+        'POST $path failed with ${response.statusCode}: ${response.body}',
+      );
     }
+    return _decodeJson(response.body);
   }
 
   Map<String, dynamic> _decodeJson(String body) {
@@ -578,20 +754,14 @@ class SceneController extends ChangeNotifier {
         .clamp(0.0, math.max(0.0, _boardSize.height - current.height))
         .toDouble();
 
-    _objects[name] = current.copyWith(
-      x: clampedX,
-      y: clampedY,
-    );
+    _objects[name] = current.copyWith(x: clampedX, y: clampedY);
     notifyListeners();
   }
 
   Future<Map<String, dynamic>> executeJson(String rawJson) async {
     final decoded = jsonDecode(rawJson);
     if (decoded is List) {
-      Map<String, dynamic> lastResult = {
-        'ok': true,
-        'count': decoded.length,
-      };
+      Map<String, dynamic> lastResult = {'ok': true, 'count': decoded.length};
       for (final item in decoded) {
         lastResult = await executeCommandMap(
           Map<String, dynamic>.from(item as Map),
@@ -653,12 +823,14 @@ class SceneController extends ChangeNotifier {
 
       final width = _readDouble(entry['width'], fallback: 120);
       final height = _readDouble(entry['height'], fallback: 120);
-      final x = _readDouble(entry['x'], fallback: 0)
-          .clamp(0.0, math.max(0.0, _boardSize.width - width))
-          .toDouble();
-      final y = _readDouble(entry['y'], fallback: 0)
-          .clamp(0.0, math.max(0.0, _boardSize.height - height))
-          .toDouble();
+      final x = _readDouble(
+        entry['x'],
+        fallback: 0,
+      ).clamp(0.0, math.max(0.0, _boardSize.width - width)).toDouble();
+      final y = _readDouble(
+        entry['y'],
+        fallback: 0,
+      ).clamp(0.0, math.max(0.0, _boardSize.height - height)).toDouble();
 
       final object = SceneObjectData(
         name: name,
@@ -668,9 +840,10 @@ class SceneController extends ChangeNotifier {
         width: width,
         height: height,
         color: _colorFromJson(entry['color']) ?? _randomMainColor(),
-        baseScale: _readDouble(entry['baseScale'], fallback: 1.0)
-            .clamp(0.15, 8.0)
-            .toDouble(),
+        baseScale: _readDouble(
+          entry['baseScale'],
+          fallback: 1.0,
+        ).clamp(0.15, 8.0).toDouble(),
         isDeleting: false,
         innerInset: _tryReadDouble(entry['innerInset']) ?? _randomInnerInset(),
         memoryType: _readMemoryType(entry['memoryType']),
@@ -730,9 +903,10 @@ class SceneController extends ChangeNotifier {
       width: width,
       height: height,
       color: _colorFromJson(json['color']) ?? _randomMainColor(),
-      baseScale: _readDouble(json['baseScale'], fallback: 1.0)
-          .clamp(0.15, 8.0)
-          .toDouble(),
+      baseScale: _readDouble(
+        json['baseScale'],
+        fallback: 1.0,
+      ).clamp(0.15, 8.0).toDouble(),
       isDeleting: false,
       innerInset: _tryReadDouble(json['innerInset']) ?? _randomInnerInset(),
       memoryType: _readMemoryType(json['memoryType']),
@@ -747,11 +921,7 @@ class SceneController extends ChangeNotifier {
     _objects[name] = object;
     notifyListeners();
 
-    return {
-      'ok': true,
-      'action': 'create',
-      'object': object.toJson(),
-    };
+    return {'ok': true, 'action': 'create', 'object': object.toJson()};
   }
 
   Map<String, dynamic> _moveFromJson(Map<String, dynamic> json) {
@@ -761,21 +931,19 @@ class SceneController extends ChangeNotifier {
       throw StateError('Object "$name" not found.');
     }
 
-    final x = _readDouble(json['x'], fallback: current.x)
-        .clamp(0.0, math.max(0.0, _boardSize.width - current.width))
-        .toDouble();
-    final y = _readDouble(json['y'], fallback: current.y)
-        .clamp(0.0, math.max(0.0, _boardSize.height - current.height))
-        .toDouble();
+    final x = _readDouble(
+      json['x'],
+      fallback: current.x,
+    ).clamp(0.0, math.max(0.0, _boardSize.width - current.width)).toDouble();
+    final y = _readDouble(
+      json['y'],
+      fallback: current.y,
+    ).clamp(0.0, math.max(0.0, _boardSize.height - current.height)).toDouble();
 
     _objects[name] = current.copyWith(x: x, y: y);
     notifyListeners();
 
-    return {
-      'ok': true,
-      'action': 'move',
-      'object': _objects[name]!.toJson(),
-    };
+    return {'ok': true, 'action': 'move', 'object': _objects[name]!.toJson()};
   }
 
   Map<String, dynamic> _resizeScaleFromJson(
@@ -788,10 +956,7 @@ class SceneController extends ChangeNotifier {
       throw StateError('Object "$name" not found.');
     }
 
-    final factor = _readDouble(
-      json['factor'],
-      fallback: enlarge ? 1.2 : 0.85,
-    );
+    final factor = _readDouble(json['factor'], fallback: enlarge ? 1.2 : 0.85);
 
     final targetScale = (current.baseScale * factor)
         .clamp(0.15, 8.0)
@@ -817,11 +982,7 @@ class SceneController extends ChangeNotifier {
     _objects[name] = current.copyWith(isDeleting: true);
     notifyListeners();
 
-    return {
-      'ok': true,
-      'action': 'delete',
-      'scheduledDelete': name,
-    };
+    return {'ok': true, 'action': 'delete', 'scheduledDelete': name};
   }
 
   Future<Map<String, dynamic>> _clickFromJson(Map<String, dynamic> json) async {
@@ -831,11 +992,7 @@ class SceneController extends ChangeNotifier {
       throw StateError('Object "$name" not found.');
     }
 
-    return {
-      'ok': true,
-      'action': 'click',
-      'name': name,
-    };
+    return {'ok': true, 'action': 'click', 'name': name};
   }
 
   Map<String, dynamic> _findLargestEmptySpaceFromJson() {
@@ -843,10 +1000,7 @@ class SceneController extends ChangeNotifier {
     return {
       'ok': true,
       'action': 'findLargestEmptySpace',
-      'board': {
-        'width': _boardSize.width,
-        'height': _boardSize.height,
-      },
+      'board': {'width': _boardSize.width, 'height': _boardSize.height},
       'bbox': rect == null
           ? null
           : {
@@ -862,10 +1016,7 @@ class SceneController extends ChangeNotifier {
     return {
       'ok': true,
       'action': 'state',
-      'board': {
-        'width': _boardSize.width,
-        'height': _boardSize.height,
-      },
+      'board': {'width': _boardSize.width, 'height': _boardSize.height},
       'objects': _objects.values.map((object) => object.toJson()).toList(),
     };
   }
@@ -929,7 +1080,12 @@ class SceneController extends ChangeNotifier {
 
   bool _overlapsAny(Rect candidate) {
     for (final object in _objects.values.where((o) => !o.isDeleting)) {
-      final rect = Rect.fromLTWH(object.x, object.y, object.width, object.height);
+      final rect = Rect.fromLTWH(
+        object.x,
+        object.y,
+        object.width,
+        object.height,
+      );
       if (_rectanglesOverlap(candidate, rect)) {
         return true;
       }
@@ -1119,12 +1275,7 @@ class SceneObjectData {
       'resultId': resultId,
       'deleteAfterClick': deleteAfterClick,
       'tags': tags,
-      'bbox': {
-        'x': x,
-        'y': y,
-        'width': width,
-        'height': height,
-      },
+      'bbox': {'x': x, 'y': y, 'width': width, 'height': height},
     };
   }
 }
@@ -1172,40 +1323,44 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     _scaleAnimStart = widget.data.baseScale;
     _scaleAnimTarget = widget.data.baseScale;
 
-    _moveController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 900),
-    )..addListener(() {
-        setState(() {});
-      });
+    _moveController =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 900),
+        )..addListener(() {
+          setState(() {});
+        });
 
-    _scaleController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 220),
-    )..addListener(() {
-        setState(() {});
-      });
+    _scaleController =
+        AnimationController(
+          vsync: this,
+          duration: const Duration(milliseconds: 220),
+        )..addListener(() {
+          setState(() {});
+        });
 
-    _deleteController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 380),
-    )
-      ..addListener(() {
-        setState(() {});
-      })
-      ..addStatusListener((status) {
-        if (status == AnimationStatus.completed && !_deletionDone) {
-          _deletionDone = true;
-          widget.onDeleteComplete();
-        }
-      });
+    _deleteController =
+        AnimationController(
+            vsync: this,
+            duration: const Duration(milliseconds: 380),
+          )
+          ..addListener(() {
+            setState(() {});
+          })
+          ..addStatusListener((status) {
+            if (status == AnimationStatus.completed && !_deletionDone) {
+              _deletionDone = true;
+              widget.onDeleteComplete();
+            }
+          });
   }
 
   @override
   void didUpdateWidget(covariant BoardObjectWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
 
-    if (oldWidget.data.x != widget.data.x || oldWidget.data.y != widget.data.y) {
+    if (oldWidget.data.x != widget.data.x ||
+        oldWidget.data.y != widget.data.y) {
       _startMove(
         from: _currentVisualPosition(),
         to: Offset(widget.data.x, widget.data.y),
@@ -1240,10 +1395,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     return Offset.lerp(_fromPosition, _toPosition, t)!;
   }
 
-  void _startMove({
-    required Offset from,
-    required Offset to,
-  }) {
+  void _startMove({required Offset from, required Offset to}) {
     _fromPosition = from;
     _toPosition = to;
 
@@ -1257,10 +1409,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     _moveController.forward(from: 0);
   }
 
-  void _startScalePop({
-    required double fromScale,
-    required double toScale,
-  }) {
+  void _startScalePop({required double fromScale, required double toScale}) {
     _scaleAnimStart = fromScale;
     _scaleAnimTarget = toScale;
     _displayScale = toScale;
@@ -1303,11 +1452,13 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     final opacity = _computeDeleteOpacity(_deleteController.value);
     final visualScale = scaleValue * motionScale;
 
-    final innerSize = math.max(
-      12.0,
-      math.min(widget.data.width, widget.data.height) -
-          (widget.data.innerInset * 2),
-    ).toDouble();
+    final innerSize = math
+        .max(
+          12.0,
+          math.min(widget.data.width, widget.data.height) -
+              (widget.data.innerInset * 2),
+        )
+        .toDouble();
 
     final textBoxWidth = (innerSize * 0.72)
         .clamp(36.0, widget.data.width)
@@ -1335,10 +1486,13 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                 });
               },
               onPanUpdate: (details) {
-                final board = context.findAncestorRenderObjectOfType<RenderBox>();
+                final board = context
+                    .findAncestorRenderObjectOfType<RenderBox>();
                 final dragOffset = _dragPointerOffset;
                 if (board == null || dragOffset == null) return;
-                final localOnBoard = board.globalToLocal(details.globalPosition);
+                final localOnBoard = board.globalToLocal(
+                  details.globalPosition,
+                );
                 widget.onDragPositionChanged(
                   localOnBoard.dx - dragOffset.dx,
                   localOnBoard.dy - dragOffset.dy,
@@ -1514,11 +1668,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     return 1 - Curves.easeIn.transform(tail.clamp(0.0, 1.0).toDouble());
   }
 
-  double _computeScalePopValue(
-    double t,
-    double fromScale,
-    double targetScale,
-  ) {
+  double _computeScalePopValue(double t, double fromScale, double targetScale) {
     final direction = targetScale >= fromScale ? 1.0 : -1.0;
     final overshootMagnitude = (targetScale - fromScale).abs() * 0.18 + 0.015;
     final overshoot = targetScale + (direction * overshootMagnitude);
@@ -1582,7 +1732,8 @@ class SmoothVelocityCurve extends Curve {
     final segmentT = t - _decelStart;
     final segmentDuration = 1 - _decelStart;
     final slope = (_endVelocity - _cruiseVelocity) / segmentDuration;
-    final area = _area1 +
+    final area =
+        _area1 +
         _area2 +
         (_cruiseVelocity * segmentT) +
         (0.5 * slope * segmentT * segmentT);

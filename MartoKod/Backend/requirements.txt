@@ -8,3 +8,5 @@ numpy>=1.26.0
 safetensors>=0.4.3
 Pillow>=10.0.0
 six>=1.16.0
+piper-tts
+google-cloud-speech

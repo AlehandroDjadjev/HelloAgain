@@ -14,7 +14,7 @@ def build_step_one_mcp_prompt(
     chain_history: List[Dict[str, Any]],
 ) -> str:
     return f"""
-You are a Qwen worker inside a hardcoded 3 step semi agent. This is part of a set reasoning chain and you must stay aware of which exact step you are in.
+You are a Qwen worker inside a hardcoded semi agent. This is part of a set reasoning chain and you must stay aware of which exact step you are in.
 The user wording is the contract for this system. Keep the tone of the instructions and do not simplify the intent away:
 We have a couple of steps we go through sort of like a thought chain but its not a dynamic one - a set order"
 First we run a sort of "mcp" layer. Now this doesnt use real mcps but exposes ready endpoints that have set actions they offer in a json - these actions produce a result which we can just use with the model and each at-home mcp comes with a desription of how its actions behave
@@ -22,10 +22,10 @@ The idea is to see where and how we can apply different stuff to drive a multipl
 We still have to select if its even relevant for some as tools can be wildly different.
 But just be aware of the type of descition you are making - the first step of the reasoning process.
 
-This is step 1 of 3.
+This is step 1.
 - Step 1 decides whether MCPs are needed and which MCP calls to make.
-- Step 2 waits for the MCP results, can recall stage 1, also does some work on processing them.
-- Step 3 produces the speech responce with awareness of the work done.
+- After step 1 finishes, the speech branch starts from these results in parallel.
+- Step 2 waits for the MCP results, can recall stage 1, and does the whiteboard work.
 - Keep the full JSON within 256 output tokens.
 
 Return exactly one JSON object and nothing else.
@@ -81,7 +81,7 @@ def build_step_two_board_prompt(
     chain_history: List[Dict[str, Any]],
 ) -> str:
     return f"""
-You are now in step 2 of the same hardcoded 3 step semi agent.
+You are now in step 2 of the same hardcoded semi agent.
 This is the user wording you must preserve the spirit of:
 "The second qwen request waits for each of the called mcps to return (so these arent mcps, jsut endpoints for results - the qwen doesnt do anything for each feature). It has an option to cycle back and call an mcp step one here with the results -> so if we have multi layer work we can just have it go on as long as it needs to. But the real "reasoning" is mostly layer 1."
 "It takes the results of step one and has to use board interaction on it - check the frontend for all the interactions we expose to it."
@@ -109,7 +109,8 @@ Available whiteboard actions:
 - "delete" removes an object.
 - "click" represents opening a result widget.
 
-This is step 2 of 3.
+This is step 2.
+- The speech branch has already started from the finished stage 1 results.
 - Keep the full JSON within 256 output tokens.
 Return exactly one JSON object and nothing else.
 

@@ -7,6 +7,9 @@ from .views import (
     agent_mcp_registry_view,
     agent_object_open_view,
     agent_run_view,
+    agent_run_speech_view,
+    agent_run_start_view,
+    agent_run_whitespace_view,
     conversation_view,
     fetch_action_view,
     home_view,
@@ -28,5 +31,8 @@ urlpatterns = [
     path("api/agent/mcps/<str:mcp_id>/invoke/", agent_mcp_invoke_view, name="agent_mcp_invoke"),
     path("api/agent/board-memory/", agent_board_memory_view, name="agent_board_memory"),
     path("api/agent/run/", agent_run_view, name="agent_run"),
+    path("api/agent/run/start/", agent_run_start_view, name="agent_run_start"),
+    path("api/agent/run/<str:run_id>/speech/", agent_run_speech_view, name="agent_run_speech"),
+    path("api/agent/run/<str:run_id>/whitespace/", agent_run_whitespace_view, name="agent_run_whitespace"),
     path("api/agent/open-object/", agent_object_open_view, name="agent_object_open"),
 ]

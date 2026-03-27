@@ -23,7 +23,7 @@ DEFAULT_GOOGLE_SPEECH_API_VERSION = "v1"
 DEFAULT_GOOGLE_SPEECH_MODEL = "latest_long"
 DEFAULT_GOOGLE_SPEECH_LOCATION = "global"
 DEFAULT_GOOGLE_SPEECH_RECOGNIZER = "_"
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "You are HelloAgain, a warm real-time voice assistant. "
@@ -653,7 +653,17 @@ class OpenAILLMProvider(LLMProvider):
             raise RuntimeError("OpenAI returned an unexpected response shape.") from exc
         return str(content).strip()
 
-    def generate_reply(self, prompt: str, session_id: str, user_id: str):
+    def generate_reply_with_messages(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        session_id: str,
+        user_id: str,
+        system_prompt: Optional[str] = None,
+        include_history: bool = True,
+        history_prompt: Optional[str] = None,
+        store_history: bool = True,
+    ):
         from voice_gateway.domain.contracts import LLMResult
 
         if not self.api_key:
@@ -661,24 +671,69 @@ class OpenAILLMProvider(LLMProvider):
                 "OpenAI is not ready. Set OPENAI_LLM_API_KEY in backend/.env.",
             )
 
-        history = conversation_memory.get_history(user_id, session_id)
-        messages = [{"role": "system", "content": self.system_prompt}, *history]
-        messages.append({"role": "user", "content": prompt.strip()})
-        message = self._normalize_reply(self._request_openai(messages))
+        payload_messages: list[dict[str, str]] = []
+        normalized_system_prompt = " ".join((system_prompt or "").split()).strip()
+        if normalized_system_prompt:
+            payload_messages.append(
+                {"role": "system", "content": normalized_system_prompt},
+            )
+
+        if include_history:
+            payload_messages.extend(conversation_memory.get_history(user_id, session_id))
+
+        for raw_message in messages:
+            if not isinstance(raw_message, dict):
+                continue
+            role = str(raw_message.get("role", "")).strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = self._normalize_reply(str(raw_message.get("content", "")))
+            if not content:
+                continue
+            payload_messages.append({"role": role, "content": content})
+
+        if not payload_messages:
+            raise ValueError("At least one message is required for OpenAI generation.")
+
+        message = self._normalize_reply(self._request_openai(payload_messages))
         if not message:
             raise ValueError("OpenAI returned an empty response.")
 
-        conversation_memory.append_turn(
-            user_id=user_id,
-            session_id=session_id,
-            user_text=prompt,
-            assistant_text=message,
-        )
+        if store_history:
+            prompt_for_history = self._normalize_reply(
+                history_prompt
+                or next(
+                    (
+                        str(item.get("content", ""))
+                        for item in reversed(messages)
+                        if str(item.get("role", "")).strip().lower() == "user"
+                    ),
+                    "",
+                ),
+            )
+            if prompt_for_history:
+                conversation_memory.append_turn(
+                    user_id=user_id,
+                    session_id=session_id,
+                    user_text=prompt_for_history,
+                    assistant_text=message,
+                )
 
         return LLMResult(
             text=message,
             source="openai_chat_completions",
             warnings=[f"llm_model={self.model}"],
+        )
+
+    def generate_reply(self, prompt: str, session_id: str, user_id: str):
+        return self.generate_reply_with_messages(
+            system_prompt=self.system_prompt,
+            messages=[{"role": "user", "content": prompt.strip()}],
+            session_id=session_id,
+            user_id=user_id,
+            include_history=True,
+            history_prompt=prompt,
+            store_history=True,
         )
 
     def status(self) -> str:
