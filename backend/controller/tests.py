@@ -22,11 +22,17 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertEqual(payload["protocol"], "at_home_mcp")
         self.assertEqual(payload["mcps"][0]["id"], "gnn_actions")
         self.assertTrue(payload["mcps"][0]["descriptor_url"].endswith("/api/agent/mcps/gnn_actions/"))
+        self.assertTrue(any(item["id"] == "connections" for item in payload["mcps"]))
 
         descriptor = registry.load_descriptor("gnn_actions", base_url="http://localhost:8000")
         self.assertEqual(descriptor["id"], "gnn_actions")
         self.assertEqual(len(descriptor["tools"]), 3)
         self.assertTrue(descriptor["invoke_url"].endswith("/api/agent/mcps/gnn_actions/invoke/"))
+
+        connections_descriptor = registry.load_descriptor("connections", base_url="http://localhost:8000")
+        self.assertEqual(connections_descriptor["id"], "connections")
+        self.assertEqual(len(connections_descriptor["tools"]), 2)
+        self.assertTrue(connections_descriptor["invoke_url"].endswith("/api/agent/mcps/connections/invoke/"))
 
 
 class LocalDevCorsMiddlewareTests(SimpleTestCase):
@@ -92,6 +98,33 @@ class WhiteboardMemoryStoreTests(SimpleTestCase):
             self.assertEqual(len(board_state["objects"]), 2)
             self.assertEqual(len(persisted["objects"]), 1)
             self.assertEqual(persisted["objects"][0]["name"], "saved_card")
+
+    def test_preserves_object_extra_data(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+
+            normalized = store.normalize_board_state(
+                {
+                    "board": {"width": 900, "height": 700},
+                    "objects": [
+                        {
+                            "name": "real_user",
+                            "text": "Best Match",
+                            "width": 220,
+                            "height": 160,
+                            "memoryType": "memory",
+                            "extraData": {
+                                "kind": "user",
+                                "user_id": 12,
+                                "description": "Thoughtful and curious.",
+                            },
+                        }
+                    ],
+                }
+            )
+
+            self.assertEqual(normalized["objects"][0]["extraData"]["kind"], "user")
+            self.assertEqual(normalized["objects"][0]["extraData"]["user_id"], 12)
 
 
 class SemiAgentServiceTests(SimpleTestCase):
@@ -275,3 +308,67 @@ class SemiAgentServiceTests(SimpleTestCase):
         self.assertEqual(payload["focus_object"]["text"], "Call Mom Soon")
         self.assertEqual(payload["focus_object"]["name"], "call_mom_soon")
         self.assertEqual(payload["focus_object"]["result_title"], "Call Mom Soon")
+
+    def test_opening_user_object_returns_specialized_user_viewer(self) -> None:
+        class FakeConnectionsService:
+            def build_user_widget_payload(self, *, agent_user_id: str, target_user_id: int):
+                return {
+                    "widget_type": "user_profile",
+                    "title": "Best Match",
+                    "summary": "Reflective and kind.",
+                    "user": {
+                        "user_id": target_user_id,
+                        "display_name": "Best Match",
+                        "description": "Reflective and kind.",
+                    },
+                }
+
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            service = SemiAgentService(
+                board_memory=store,
+                connections_service=FakeConnectionsService(),
+            )
+            store.register_result_bindings(
+                [
+                    {
+                        "result_id": "result_user",
+                        "object_name": "best_match",
+                        "memory_type": "memory",
+                        "delete_after_click": False,
+                        "result_title": "Best Match",
+                        "result_summary": "Reflective and kind.",
+                        "payload": {
+                            "linked_results": [
+                                {
+                                    "result": {
+                                        "user": {
+                                            "user_id": 42,
+                                            "display_name": "Best Match",
+                                        }
+                                    }
+                                }
+                            ],
+                            "object": {
+                                "name": "best_match",
+                                "text": "Best Match",
+                                "extraData": {"kind": "user", "user_id": 42},
+                            },
+                        },
+                    }
+                ]
+            )
+
+            payload = service.open_board_object(
+                object_payload={
+                    "name": "best_match",
+                    "resultId": "result_user",
+                    "memoryType": "memory",
+                    "extraData": {"kind": "user", "user_id": 42},
+                },
+                user_id="viewer",
+            )
+
+            self.assertTrue(payload["found"])
+            self.assertEqual(payload["viewer"]["widget_type"], "user_profile")
+            self.assertEqual(payload["viewer"]["user"]["user_id"], 42)

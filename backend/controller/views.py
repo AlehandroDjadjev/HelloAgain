@@ -162,6 +162,8 @@ def agent_mcp_invoke_view(request: HttpRequest, mcp_id: str):
             tool_name=tool_name,
             arguments=arguments,
             fallback_prompt=fallback_prompt,
+            user_id=str(payload.get("user_id") or "anonymous"),
+            board_state=payload.get("board_state") if isinstance(payload.get("board_state"), dict) else {},
         )
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)
@@ -281,6 +283,7 @@ def agent_object_open_view(request: HttpRequest):
     try:
         result = semi_agent_service.open_board_object(
             object_payload=payload.get("object") if isinstance(payload.get("object"), dict) else payload,
+            user_id=str(payload.get("user_id") or "anonymous"),
         )
     except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)

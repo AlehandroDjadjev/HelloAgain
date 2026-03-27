@@ -112,7 +112,10 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     });
 
     try {
-      final payload = await _backendClient.openObject(object: object.toJson());
+      final payload = await _backendClient.openObject(
+        object: object.toJson(),
+        userId: _userId,
+      );
       await _applyCommands(payload['board_commands']);
       final viewer = Map<String, dynamic>.from(
         payload['viewer'] as Map? ?? const {},
@@ -741,6 +744,7 @@ class AgentResultDialog extends StatelessWidget {
     final title = (viewer['title'] ?? 'Board result').toString();
     final summary = (viewer['summary'] ?? '').toString();
     final payload = viewer['payload'];
+    final widgetType = (viewer['widget_type'] ?? '').toString();
     final jsonText = JsonEncoder.withIndent('  ').convert(payload);
 
     return AlertDialog(
@@ -762,15 +766,26 @@ class AgentResultDialog extends StatelessWidget {
                   ),
                 ),
               ),
-            SizedBox(
-              height: 320,
-              child: SingleChildScrollView(
-                child: SelectableText(
-                  jsonText,
-                  style: const TextStyle(fontSize: 12, height: 1.25),
+            if (widgetType == 'user_profile' && viewer['user'] is Map)
+              SizedBox(
+                width: 520,
+                height: 340,
+                child: SingleChildScrollView(
+                  child: AgentUserProfileView(
+                    user: Map<String, dynamic>.from(viewer['user'] as Map),
+                  ),
+                ),
+              )
+            else
+              SizedBox(
+                height: 320,
+                child: SingleChildScrollView(
+                  child: SelectableText(
+                    jsonText,
+                    style: const TextStyle(fontSize: 12, height: 1.25),
+                  ),
                 ),
               ),
-            ),
           ],
         ),
       ),
@@ -780,6 +795,118 @@ class AgentResultDialog extends StatelessWidget {
           child: const Text('Close'),
         ),
       ],
+    );
+  }
+}
+
+class AgentUserProfileView extends StatelessWidget {
+  const AgentUserProfileView({super.key, required this.user});
+
+  final Map<String, dynamic> user;
+
+  @override
+  Widget build(BuildContext context) {
+    final description = (user['description'] ?? '').toString();
+    final friendStatus = (user['friend_status'] ?? 'none').toString();
+    final email = user['email']?.toString();
+    final phoneNumber = user['phone_number']?.toString();
+    final topTraits = (user['top_traits'] as List?) ?? const [];
+    final matchSummary = user['match_summary'] is Map
+        ? Map<String, dynamic>.from(user['match_summary'] as Map)
+        : null;
+    final whyTheyMatch = (matchSummary?['why_they_match'] as List?) ?? const [];
+    final sharedInterests = (matchSummary?['shared_interests'] as List?) ?? const [];
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _UserSectionLabel(
+          text: 'Name',
+          value: (user['display_name'] ?? user['username'] ?? 'Unknown user')
+              .toString(),
+        ),
+        _UserSectionLabel(
+          text: 'Friend status',
+          value: friendStatus,
+        ),
+        if (description.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Description',
+            value: description,
+          ),
+        if (topTraits.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Top traits',
+            value: topTraits
+                .map((trait) {
+                  if (trait is! Map) return '';
+                  return (trait['label'] ?? trait['feature'] ?? '').toString();
+                })
+                .where((value) => value.toString().trim().isNotEmpty)
+                .join(', '),
+          ),
+        if (sharedInterests.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Shared interests',
+            value: sharedInterests.map((item) => item.toString()).join(', '),
+          ),
+        if (whyTheyMatch.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Why this match works',
+            value: whyTheyMatch.map((item) => item.toString()).join(' '),
+          ),
+        if (email != null && email.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Email',
+            value: email,
+          ),
+        if (phoneNumber != null && phoneNumber.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Phone',
+            value: phoneNumber,
+          ),
+      ],
+    );
+  }
+}
+
+class _UserSectionLabel extends StatelessWidget {
+  const _UserSectionLabel({
+    required this.text,
+    required this.value,
+  });
+
+  final String text;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            text,
+            style: TextStyle(
+              color: Colors.black.withOpacity(0.58),
+              fontSize: 11.5,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 0.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 13,
+              height: 1.3,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -861,8 +988,12 @@ class AgentBackendClient {
 
   Future<Map<String, dynamic>> openObject({
     required Map<String, dynamic> object,
+    required String userId,
   }) {
-    return _postJson('/api/agent/open-object/', {'object': object});
+    return _postJson('/api/agent/open-object/', {
+      'object': object,
+      'user_id': userId,
+    });
   }
 
   Future<Map<String, dynamic>> _getJson(String path) async {
@@ -1045,6 +1176,7 @@ class SceneController extends ChangeNotifier {
           fallback: _readMemoryType(entry['memoryType']) == 'instant',
         ),
         tags: _readTags(entry['tags']),
+        extraData: _readExtraData(entry['extraData'] ?? entry['extra_data']),
       );
 
       _objects[name] = object;
@@ -1108,6 +1240,7 @@ class SceneController extends ChangeNotifier {
         fallback: _readMemoryType(json['memoryType']) == 'instant',
       ),
       tags: _readTags(json['tags']),
+      extraData: _readExtraData(json['extraData'] ?? json['extra_data']),
     );
 
     _objects[name] = object;
@@ -1382,6 +1515,11 @@ class SceneController extends ChangeNotifier {
     }
     return tags;
   }
+
+  Map<String, dynamic> _readExtraData(dynamic value) {
+    if (value is! Map) return const <String, dynamic>{};
+    return Map<String, dynamic>.from(value);
+  }
 }
 
 class SceneObjectData {
@@ -1400,6 +1538,7 @@ class SceneObjectData {
     required this.resultId,
     required this.deleteAfterClick,
     required this.tags,
+    required this.extraData,
   });
 
   final String name;
@@ -1416,6 +1555,7 @@ class SceneObjectData {
   final String? resultId;
   final bool deleteAfterClick;
   final List<String> tags;
+  final Map<String, dynamic> extraData;
 
   SceneObjectData copyWith({
     String? name,
@@ -1432,6 +1572,7 @@ class SceneObjectData {
     String? resultId,
     bool? deleteAfterClick,
     List<String>? tags,
+    Map<String, dynamic>? extraData,
   }) {
     return SceneObjectData(
       name: name ?? this.name,
@@ -1448,6 +1589,7 @@ class SceneObjectData {
       resultId: resultId ?? this.resultId,
       deleteAfterClick: deleteAfterClick ?? this.deleteAfterClick,
       tags: tags ?? this.tags,
+      extraData: extraData ?? this.extraData,
     );
   }
 
@@ -1467,6 +1609,7 @@ class SceneObjectData {
       'resultId': resultId,
       'deleteAfterClick': deleteAfterClick,
       'tags': tags,
+      'extraData': extraData,
       'bbox': {'x': x, 'y': y, 'width': width, 'height': height},
     };
   }

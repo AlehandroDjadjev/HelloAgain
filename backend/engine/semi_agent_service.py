@@ -24,13 +24,22 @@ from voice_gateway.services.providers import OpenAILLMProvider, PiperTTSProvider
 
 
 class SemiAgentService:
-    SUPPORTED_TOOL_NAMES = {"add_action", "fetch_action", "conversation"}
+    SUPPORTED_MCP_TOOLS = {
+        "gnn_actions": {"add_action", "fetch_action", "conversation"},
+        "connections": {"update_profile", "find_connection"},
+    }
+    SUPPORTED_TOOL_NAMES = {
+        tool_name
+        for tool_names in SUPPORTED_MCP_TOOLS.values()
+        for tool_name in tool_names
+    }
     BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS = 256
     BOARD_PIPELINE_JSON_CONTINUATION_BUDGET = 0
     RUN_JOB_TTL_SECONDS = 900
     FOCUS_TITLE_MAX_WORDS = 6
     FOCUS_TITLE_MAX_CHARS = 42
     FOCUS_OBJECT_NAME_MAX_CHARS = 64
+    USER_OBJECT_TAG = "type:user"
 
     def __init__(
         self,
@@ -41,6 +50,7 @@ class SemiAgentService:
         board_memory: WhiteboardMemoryStore | None = None,
         llm_provider: OpenAILLMProvider | None = None,
         tts_provider: PiperTTSProvider | None = None,
+        connections_service: Any | None = None,
     ) -> None:
         self.graph_service = graph_service or GraphService()
         self.qwen_client = qwen_client or QwenWorkerClient()
@@ -48,6 +58,11 @@ class SemiAgentService:
         self.board_memory = board_memory or WhiteboardMemoryStore()
         self.llm_provider = llm_provider or OpenAILLMProvider()
         self.tts_provider = tts_provider or PiperTTSProvider()
+        if connections_service is None:
+            from apps.accounts.agent_service import ConnectionsAgentService
+
+            connections_service = ConnectionsAgentService(qwen_client=self.qwen_client)
+        self.connections_service = connections_service
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
@@ -77,6 +92,7 @@ class SemiAgentService:
             prompt=prompt,
             board_state=board_state,
             largest_empty_space=largest_empty_space,
+            user_id=user_id,
         )
         speech_future = self._executor.submit(
             self._run_speech_stage,
@@ -95,6 +111,7 @@ class SemiAgentService:
             mcp_results=context["mcp_results"],
             chain_history=context["chain_history"],
             registry_payload=context["mcp_registry"],
+            user_id=user_id,
         )
         speech_payload = speech_future.result()
         return {
@@ -120,6 +137,7 @@ class SemiAgentService:
             prompt=prompt,
             board_state=board_state,
             largest_empty_space=largest_empty_space,
+            user_id=user_id,
         )
         run_id = f"run_{uuid.uuid4().hex}"
         speech_future = self._executor.submit(
@@ -140,6 +158,7 @@ class SemiAgentService:
             mcp_results=context["mcp_results"],
             chain_history=context["chain_history"],
             registry_payload=context["mcp_registry"],
+            user_id=user_id,
         )
         with self._run_jobs_lock:
             self._run_jobs[run_id] = {
@@ -178,6 +197,7 @@ class SemiAgentService:
         prompt: str,
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
+        user_id: str,
     ) -> Dict[str, Any]:
         clean_prompt = self._clean_text(prompt)
         if not clean_prompt:
@@ -197,6 +217,7 @@ class SemiAgentService:
             system_prompt=build_step_one_mcp_prompt(
                 registry=registry_payload,
                 chain_history=chain_history,
+                board_state=normalized_board_state,
             ),
             user_prompt=clean_prompt,
             default_payload=self._default_step_one_plan(clean_prompt),
@@ -204,7 +225,12 @@ class SemiAgentService:
         step_one = self._normalize_step_one_plan(step_one_raw, clean_prompt)
         chain_history.append({"stage": "step_1_mcp", "payload": step_one})
 
-        mcp_results = self._execute_mcp_calls(step_one.get("mcp_calls", []), clean_prompt)
+        mcp_results = self._execute_mcp_calls(
+            step_one.get("mcp_calls", []),
+            clean_prompt,
+            user_id=user_id,
+            board_state=normalized_board_state,
+        )
         if mcp_results:
             chain_history.append({"stage": "mcp_results", "payload": mcp_results})
 
@@ -228,6 +254,7 @@ class SemiAgentService:
         mcp_results: List[Dict[str, Any]],
         chain_history: List[Dict[str, Any]],
         registry_payload: Dict[str, Any],
+        user_id: str,
     ) -> Dict[str, Any]:
         step_two, final_mcp_results = self._run_step_two_loop(
             prompt=clean_prompt,
@@ -236,6 +263,7 @@ class SemiAgentService:
             step_one=step_one,
             mcp_results=mcp_results,
             chain_history=chain_history,
+            user_id=user_id,
         )
 
         final_board_commands = step_two.get("board_commands", [])
@@ -468,31 +496,56 @@ class SemiAgentService:
             for run_id in stale_ids:
                 self._run_jobs.pop(run_id, None)
 
-    def invoke_mcp(self, *, mcp_id: str, tool_name: str, arguments: Dict[str, Any] | None, fallback_prompt: str = "") -> Dict[str, Any]:
+    def invoke_mcp(
+        self,
+        *,
+        mcp_id: str,
+        tool_name: str,
+        arguments: Dict[str, Any] | None,
+        fallback_prompt: str = "",
+        user_id: str = "anonymous",
+        board_state: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         clean_mcp_id = self._clean_text(mcp_id)
         clean_tool_name = self._normalize_tool_name(tool_name)
-        if clean_mcp_id != "gnn_actions":
+        supported_tools = self.SUPPORTED_MCP_TOOLS.get(clean_mcp_id)
+        if supported_tools is None:
             raise ValueError(f"Unsupported MCP '{clean_mcp_id}'.")
-        if clean_tool_name not in self.SUPPORTED_TOOL_NAMES:
+        if clean_tool_name not in supported_tools:
             raise ValueError(f"Unsupported tool '{clean_tool_name}'.")
 
-        arguments = arguments if isinstance(arguments, dict) else {}
+        arguments = self._clean_jsonish(arguments) if isinstance(arguments, dict) else {}
         tool_prompt = self._clean_text(arguments.get("prompt") or fallback_prompt)
         if not tool_prompt:
             raise ValueError("prompt required for MCP invocation")
 
-        result = self._dispatch_gnn_tool(clean_tool_name, tool_prompt)
-        summary = self._summarize_mcp_result(clean_tool_name, result)
+        result = self._dispatch_mcp_tool(
+            mcp_id=clean_mcp_id,
+            tool_name=clean_tool_name,
+            prompt=tool_prompt,
+            arguments=arguments,
+            user_id=user_id,
+            board_state=board_state,
+        )
+        summary = self._summarize_mcp_result(clean_mcp_id, clean_tool_name, result)
         return {
             "ok": True,
             "mcp_id": clean_mcp_id,
             "tool_name": clean_tool_name,
-            "arguments": {"prompt": tool_prompt},
+            "arguments": {
+                **arguments,
+                "prompt": tool_prompt,
+            },
             "summary": summary,
             "result": result,
         }
 
-    def open_board_object(self, *, object_payload: Dict[str, Any] | None) -> Dict[str, Any]:
+    def open_board_object(
+        self,
+        *,
+        object_payload: Dict[str, Any] | None,
+        user_id: str = "anonymous",
+    ) -> Dict[str, Any]:
         object_payload = object_payload if isinstance(object_payload, dict) else {}
         object_name = self._clean_text(object_payload.get("name"))
         result_id = self._clean_text(object_payload.get("resultId") or object_payload.get("result_id"))
@@ -521,6 +574,14 @@ class SemiAgentService:
         title = self._clean_text(binding.get("result_title") or binding.get("resultTitle") or object_name or "Board result")
         summary = self._clean_text(binding.get("result_summary") or binding.get("resultSummary"))
         payload = binding.get("payload") if isinstance(binding.get("payload"), dict) else {"payload": binding.get("payload")}
+        viewer = self._build_object_viewer(
+            object_payload=object_payload,
+            binding=binding,
+            default_title=title,
+            default_summary=summary,
+            default_payload=payload,
+            user_id=user_id,
+        )
 
         return {
             "ok": True,
@@ -528,13 +589,7 @@ class SemiAgentService:
             "object_name": object_name,
             "board_commands": board_commands,
             "speech_response": summary or f"I opened {title}.",
-            "viewer": {
-                "title": title,
-                "summary": summary,
-                "memory_type": binding.get("memory_type"),
-                "linked_call_ids": binding.get("linked_call_ids", []),
-                "payload": payload,
-            },
+            "viewer": viewer,
         }
 
     def _run_step_two_loop(
@@ -546,6 +601,7 @@ class SemiAgentService:
         step_one: Dict[str, Any],
         mcp_results: List[Dict[str, Any]],
         chain_history: List[Dict[str, Any]],
+        user_id: str,
     ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         current_results = list(mcp_results)
         current_history = list(chain_history)
@@ -576,7 +632,12 @@ class SemiAgentService:
             extra_calls = step_two.get("additional_mcp_calls", [])
             if not extra_calls:
                 break
-            extra_results = self._execute_mcp_calls(extra_calls, prompt)
+            extra_results = self._execute_mcp_calls(
+                extra_calls,
+                prompt,
+                user_id=user_id,
+                board_state=board_state,
+            )
             if not extra_results:
                 break
             current_results.extend(extra_results)
@@ -586,7 +647,14 @@ class SemiAgentService:
 
         return step_two, current_results
 
-    def _execute_mcp_calls(self, calls: List[Dict[str, Any]], fallback_prompt: str) -> List[Dict[str, Any]]:
+    def _execute_mcp_calls(
+        self,
+        calls: List[Dict[str, Any]],
+        fallback_prompt: str,
+        *,
+        user_id: str,
+        board_state: Dict[str, Any] | None,
+    ) -> List[Dict[str, Any]]:
         executed: List[Dict[str, Any]] = []
         seen_call_ids: set[str] = set()
         for index, call in enumerate(calls, start=1):
@@ -608,6 +676,8 @@ class SemiAgentService:
                     tool_name=tool_name,
                     arguments=arguments,
                     fallback_prompt=fallback_prompt,
+                    user_id=user_id,
+                    board_state=board_state,
                 )
             except Exception as exc:
                 payload = {
@@ -624,6 +694,28 @@ class SemiAgentService:
             executed.append(payload)
         return executed
 
+    def _dispatch_mcp_tool(
+        self,
+        *,
+        mcp_id: str,
+        tool_name: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+        user_id: str,
+        board_state: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if mcp_id == "gnn_actions":
+            return self._dispatch_gnn_tool(tool_name, prompt)
+        if mcp_id == "connections":
+            return self._dispatch_connections_tool(
+                tool_name=tool_name,
+                prompt=prompt,
+                arguments=arguments,
+                user_id=user_id,
+                board_state=board_state,
+            )
+        raise ValueError(f"Unsupported MCP '{mcp_id}'.")
+
     def _dispatch_gnn_tool(self, tool_name: str, prompt: str) -> Dict[str, Any]:
         if tool_name == "add_action":
             return self.graph_service.add_action_flow(prompt)
@@ -633,7 +725,46 @@ class SemiAgentService:
             return self.graph_service.conversation_flow(prompt)
         raise ValueError(f"Unsupported tool '{tool_name}'.")
 
-    def _summarize_mcp_result(self, tool_name: str, result: Dict[str, Any]) -> str:
+    def _dispatch_connections_tool(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+        user_id: str,
+        board_state: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if tool_name == "update_profile":
+            return self.connections_service.update_profile_from_prompt(
+                agent_user_id=user_id,
+                prompt=prompt,
+                profile_patch=arguments.get("profile_patch") if isinstance(arguments.get("profile_patch"), dict) else None,
+                profile_json=arguments.get("profile_json") if isinstance(arguments.get("profile_json"), dict) else None,
+                board_state=board_state,
+            )
+        if tool_name == "find_connection":
+            return self.connections_service.find_connection_for_prompt(
+                agent_user_id=user_id,
+                prompt=prompt,
+                limit=int(arguments.get("limit") or 1),
+                board_state=board_state,
+            )
+        raise ValueError(f"Unsupported tool '{tool_name}'.")
+
+    def _summarize_mcp_result(self, mcp_id: str, tool_name: str, result: Dict[str, Any]) -> str:
+        if mcp_id == "connections":
+            if tool_name == "find_connection":
+                user = result.get("user") if isinstance(result.get("user"), dict) else {}
+                display_name = self._clean_text(user.get("display_name") or user.get("name"))
+                if display_name:
+                    return f"Found a close connection match: {display_name}."
+                return self._clean_text(result.get("message")) or "Connection search finished."
+            if tool_name == "update_profile":
+                profile = result.get("profile") if isinstance(result.get("profile"), dict) else {}
+                description = self._clean_text(profile.get("effective_description") or profile.get("description"))
+                if description:
+                    return f"Updated your connection profile: {description[:180]}"
+                return self._clean_text(result.get("message")) or "Profile update finished."
         if tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             chosen_name = self._clean_text(chosen.get("name"))
@@ -696,6 +827,8 @@ class SemiAgentService:
                 if item in results_by_call_id
             ]
             object_state = objects_by_name[object_name]
+            object_metadata = self._extract_board_object_metadata(linked_payloads)
+            self._apply_board_object_metadata(object_state, object_metadata)
             result_id = self._clean_text(raw_binding.get("result_id") or raw_binding.get("resultId"))
             if not result_id:
                 result_id = f"result_{uuid.uuid4().hex[:12]}"
@@ -724,6 +857,7 @@ class SemiAgentService:
                     raw_binding.get("result_summary")
                     or raw_binding.get("resultSummary")
                 ),
+                "object_metadata": object_metadata,
                 "payload": {
                     "linked_results": linked_payloads,
                     "object": deepcopy(object_state),
@@ -756,8 +890,130 @@ class SemiAgentService:
             command["deleteAfterClick"] = binding.get("delete_after_click")
             command["tags"] = self._merge_tags(
                 command.get("tags"),
-                [f"memory:{binding.get('memory_type', 'ram')}"],
+                [
+                    f"memory:{binding.get('memory_type', 'ram')}",
+                    *self._coerce_tags_from_binding(binding),
+                ],
             )
+            extra_data = self._coerce_extra_data_from_binding(binding)
+            if extra_data:
+                command["extraData"] = extra_data
+
+    def _build_object_viewer(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+        default_title: str,
+        default_summary: str,
+        default_payload: Dict[str, Any],
+        user_id: str,
+    ) -> Dict[str, Any]:
+        target_user_id = self._extract_target_user_id(object_payload, binding)
+        if target_user_id is not None:
+            try:
+                user_viewer = self.connections_service.build_user_widget_payload(
+                    agent_user_id=user_id,
+                    target_user_id=target_user_id,
+                )
+            except Exception:
+                user_viewer = None
+            if isinstance(user_viewer, dict):
+                return {
+                    "title": self._clean_text(user_viewer.get("title")) or default_title,
+                    "summary": self._clean_text(user_viewer.get("summary")) or default_summary,
+                    "memory_type": binding.get("memory_type"),
+                    "linked_call_ids": binding.get("linked_call_ids", []),
+                    "payload": default_payload,
+                    **user_viewer,
+                }
+
+        return {
+            "title": default_title,
+            "summary": default_summary,
+            "memory_type": binding.get("memory_type"),
+            "linked_call_ids": binding.get("linked_call_ids", []),
+            "payload": default_payload,
+        }
+
+    def _extract_target_user_id(
+        self,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> int | None:
+        candidates = [
+            object_payload.get("extraData"),
+            object_payload.get("extra_data"),
+        ]
+        payload = binding.get("payload") if isinstance(binding.get("payload"), dict) else {}
+        candidates.append(payload.get("object") if isinstance(payload.get("object"), dict) else {})
+        for linked in payload.get("linked_results", []):
+            if not isinstance(linked, dict):
+                continue
+            result = linked.get("result") if isinstance(linked.get("result"), dict) else {}
+            candidates.append(result.get("board_object"))
+            candidates.append(result.get("user"))
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            extra_data = (
+                candidate.get("extra_data")
+                if isinstance(candidate.get("extra_data"), dict)
+                else candidate.get("extraData")
+                if isinstance(candidate.get("extraData"), dict)
+                else candidate
+            )
+            for key in ("user_id", "target_user_id"):
+                value = extra_data.get(key)
+                try:
+                    if value is not None:
+                        return int(value)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _extract_board_object_metadata(self, linked_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        tags: List[str] = []
+        extra_data: Dict[str, Any] = {}
+        for payload in linked_payloads:
+            if not isinstance(payload, dict):
+                continue
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+            board_object = result.get("board_object") if isinstance(result.get("board_object"), dict) else {}
+            tags = self._merge_tags(tags, board_object.get("tags") if isinstance(board_object, dict) else [])
+            candidate_extra = board_object.get("extra_data", board_object.get("extraData"))
+            if isinstance(candidate_extra, dict):
+                extra_data.update(self._clean_jsonish(candidate_extra))
+        return {
+            "tags": tags,
+            "extraData": extra_data,
+        }
+
+    def _apply_board_object_metadata(
+        self,
+        object_state: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> None:
+        tags = metadata.get("tags") if isinstance(metadata, dict) else []
+        extra_data = metadata.get("extraData") if isinstance(metadata, dict) else {}
+        object_state["tags"] = self._merge_tags(object_state.get("tags"), tags if isinstance(tags, list) else [])
+        if isinstance(extra_data, dict) and extra_data:
+            existing = object_state.get("extraData") if isinstance(object_state.get("extraData"), dict) else {}
+            object_state["extraData"] = {
+                **existing,
+                **extra_data,
+            }
+
+    def _coerce_tags_from_binding(self, binding: Dict[str, Any]) -> List[str]:
+        metadata = binding.get("object_metadata") if isinstance(binding.get("object_metadata"), dict) else {}
+        tags = metadata.get("tags")
+        return tags if isinstance(tags, list) else []
+
+    def _coerce_extra_data_from_binding(self, binding: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = binding.get("object_metadata") if isinstance(binding.get("object_metadata"), dict) else {}
+        extra_data = metadata.get("extraData")
+        return extra_data if isinstance(extra_data, dict) else {}
 
     def _normalize_step_one_plan(self, raw: Dict[str, Any], prompt: str) -> Dict[str, Any]:
         raw = raw if isinstance(raw, dict) else {}
@@ -1091,16 +1347,18 @@ class SemiAgentService:
                 continue
             mcp_id = self._clean_text(item.get("mcp_id") or item.get("mcp"))
             tool_name = self._normalize_tool_name(item.get("tool_name") or item.get("tool"))
-            if mcp_id != "gnn_actions" or tool_name not in self.SUPPORTED_TOOL_NAMES:
+            if tool_name not in self.SUPPORTED_MCP_TOOLS.get(mcp_id, set()):
                 continue
-            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            arguments = self._clean_jsonish(item.get("arguments")) if isinstance(item.get("arguments"), dict) else {}
             prompt = self._clean_text(arguments.get("prompt"))
+            if prompt:
+                arguments["prompt"] = prompt
             results.append(
                 {
                     "call_id": self._clean_text(item.get("call_id")) or f"{mcp_id}.{tool_name}.{index}",
                     "mcp_id": mcp_id,
                     "tool_name": tool_name,
-                    "arguments": {"prompt": prompt} if prompt else {},
+                    "arguments": arguments,
                     "why": self._clean_text(item.get("why")),
                 }
             )
@@ -1138,6 +1396,9 @@ class SemiAgentService:
                         "tags": self._merge_tags(item.get("tags"), []),
                     }
                 )
+                extra_data = item.get("extraData", item.get("extra_data"))
+                if isinstance(extra_data, dict) and extra_data:
+                    command["extraData"] = self._clean_jsonish(extra_data)
                 if item.get("x") is not None:
                     command["x"] = self._to_float(item.get("x"), 0.0)
                 if item.get("y") is not None:
@@ -1279,6 +1540,51 @@ class SemiAgentService:
     def _default_mcp_calls(self, prompt: str, request_kind: str) -> List[Dict[str, Any]]:
         if request_kind == "mechanical":
             return []
+        lowered = prompt.lower()
+        if any(
+            keyword in lowered
+            for keyword in {
+                "connect",
+                "connection",
+                "closest user",
+                "find someone",
+                "someone like",
+                "person like",
+                "friend for",
+                "recommend a person",
+            }
+        ):
+            return [
+                {
+                    "call_id": "connections.find_connection.1",
+                    "mcp_id": "connections",
+                    "tool_name": "find_connection",
+                    "arguments": {"prompt": prompt},
+                    "why": "Fallback connection search based on the request wording.",
+                }
+            ]
+        if any(
+            keyword in lowered
+            for keyword in {
+                "remember that i",
+                "i am",
+                "i'm",
+                "i enjoy",
+                "i like",
+                "about me",
+                "update my profile",
+                "update my description",
+            }
+        ):
+            return [
+                {
+                    "call_id": "connections.update_profile.1",
+                    "mcp_id": "connections",
+                    "tool_name": "update_profile",
+                    "arguments": {"prompt": prompt},
+                    "why": "Fallback durable profile update based on first-person user details.",
+                }
+            ]
         tool_name = "conversation" if request_kind == "profile" else "fetch_action"
         return [
             {
@@ -1307,6 +1613,17 @@ class SemiAgentService:
             "need",
             "want",
             "profile",
+            "connect",
+            "connection",
+            "someone",
+            "person",
+            "people",
+            "match",
+            "i am",
+            "i'm",
+            "i like",
+            "i enjoy",
+            "about me",
         }
         mechanical_keywords = {
             "open",
@@ -1352,10 +1669,18 @@ class SemiAgentService:
         if not isinstance(payload, dict):
             return ""
 
+        mcp_id = self._clean_text(payload.get("mcp_id"))
         tool_name = self._normalize_tool_name(payload.get("tool_name"))
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
 
-        if tool_name == "fetch_action":
+        if mcp_id == "connections" and tool_name == "find_connection":
+            user = result.get("user") if isinstance(result.get("user"), dict) else {}
+            candidate = self._clean_text(user.get("display_name") or user.get("name"))
+            if candidate:
+                return self._clip_focus_title(candidate)
+        elif mcp_id == "connections" and tool_name == "update_profile":
+            return "Profile Update"
+        elif tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             candidate = self._clean_text(chosen.get("name"))
             if candidate:
@@ -1483,7 +1808,8 @@ class SemiAgentService:
         tags: List[str] = []
         if isinstance(raw_tags, list):
             tags.extend(" ".join(str(item).strip().split()) for item in raw_tags if str(item).strip())
-        tags.extend(extra_tags)
+        if isinstance(extra_tags, list):
+            tags.extend(" ".join(str(item).strip().split()) for item in extra_tags if str(item).strip())
         deduped: List[str] = []
         seen: set[str] = set()
         for tag in tags:
@@ -1502,6 +1828,20 @@ class SemiAgentService:
     @staticmethod
     def _clean_text(value: Any) -> str:
         return " ".join(str(value or "").strip().split())
+
+    @classmethod
+    def _clean_jsonish(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                cls._clean_text(key): cls._clean_jsonish(item)
+                for key, item in value.items()
+                if cls._clean_text(key)
+            }
+        if isinstance(value, list):
+            return [cls._clean_jsonish(item) for item in value]
+        if isinstance(value, str):
+            return cls._clean_text(value)
+        return value
 
     @staticmethod
     def _to_bool(value: Any, default: bool = False) -> bool:
