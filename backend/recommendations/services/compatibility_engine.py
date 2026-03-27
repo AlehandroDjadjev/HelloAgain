@@ -278,18 +278,24 @@ def compare_people(
     # Blend: feature-level analysis + graph/embedding signals
     # Shifted most weight (0.75) to core alignment for professional objectivity.
     blended_score = (
-        (0.75 * feature_alignment)
-        + (0.08 * interest_overlap)
-        + (0.04 * communication_fit)
-        + (0.04 * social_style)
-        + (0.06 * embedding_score)
-        + (0.03 * graph_score)
+        (0.68 * feature_alignment)
+        + (0.12 * interest_overlap)
+        + (0.06 * communication_fit)
+        + (0.05 * social_style)
+        + (0.05 * embedding_score)
+        + (0.04 * graph_score)
     )
 
-    # Soft certainty adjustment: floor at 0.75 so uncertain data
-    # reduces score by at most 25%, not 75% like the old version.
-    certainty_adj = 0.75 + (0.25 * certainty_score)
+    # Keep uncertainty from crushing otherwise-strong matches too aggressively.
+    certainty_adj = 0.88 + (0.12 * certainty_score)
     overall = blended_score * certainty_adj
+    if (
+        feature_alignment >= 0.80
+        and certainty_score >= 0.55
+        and distinctive_aligned_feature_count >= 2
+    ):
+        overall += 0.05
+    overall = max(0.0, min(1.0, overall))
 
     graph_affinity = feature_alignment
 
@@ -308,7 +314,7 @@ def compare_people(
     shared_interests = _shared_interest_labels(left, right, left_confidence, right_confidence)
 
     breakdown = {
-        "overall": round(max(0.0, min(1.0, overall)), 4),
+        "overall": round(overall, 4),
         "feature_alignment": round(feature_alignment, 4),
         "interest_overlap": round(interest_overlap, 4),
         "communication_fit": round(communication_fit, 4),

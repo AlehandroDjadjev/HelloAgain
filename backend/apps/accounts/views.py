@@ -22,9 +22,11 @@ from .models import AccountProfile, FriendRequest, ImportedContact, normalize_em
 from .serializers import (
     AccountProfileUpdateSerializer,
     ContactsImportSerializer,
+    DiscoveryQuerySerializer,
     FriendRequestCreateSerializer,
     FriendRequestResponseSerializer,
     LoginSerializer,
+    RecommendationActivitySerializer,
     RegisterSerializer,
 )
 from .services import (
@@ -40,7 +42,10 @@ from .services import (
     matched_profile_ids_for_owner,
     matched_profiles_for_contact,
     profile_for_token,
+    record_recommendation_activity,
     refresh_social_edge_for_friendship,
+    recommend_profiles_for_description,
+    recommend_profiles_for_viewer,
     sync_profile_to_recommendations,
 )
 
@@ -423,51 +428,39 @@ def discovery_feed(request):
         return viewer
 
     query = request.GET.get("q", "").strip()
-    queryset = AccountProfile.objects.select_related("user", "elder_profile").exclude(pk=viewer.pk)
-
-    recommended_ids: list[int] = []
-    if viewer.elder_profile_id:
-        try:
-            from recommendations.gat.recommender import get_embedding_snapshot
-
-            snapshot = get_embedding_snapshot()
-            if viewer.elder_profile_id in snapshot["elder_ids"]:
-                query_index = snapshot["elder_ids"].index(viewer.elder_profile_id)
-                query_embedding = snapshot["embeddings"][query_index]
-                ranked_pairs = []
-                for index, elder_id in enumerate(snapshot["elder_ids"]):
-                    if elder_id == viewer.elder_profile_id:
-                        continue
-                    similarity = float((query_embedding * snapshot["embeddings"][index]).sum().item())
-                    graph_score = max(0.0, min(1.0, (similarity + 1.0) / 2.0))
-                    ranked_pairs.append((int(elder_id), graph_score))
-                ranked_pairs.sort(key=lambda item: item[1], reverse=True)
-                recommended_ids = [elder_id for elder_id, _ in ranked_pairs]
-        except Exception:
-            recommended_ids = []
-
-    if query:
-        queryset = queryset.filter(
-            Q(display_name__icontains=query)
-            | Q(user__username__icontains=query)
-            | Q(user__email__icontains=query)
-            | Q(description__icontains=query)
-        )
-
-    profiles = list(queryset[:40])
-    if recommended_ids:
-        order_map = {elder_id: index for index, elder_id in enumerate(recommended_ids)}
-        profiles.sort(key=lambda item: order_map.get(item.elder_profile_id or -1, 10_000))
-
-    matched_contact_ids = matched_profile_ids_for_owner(viewer)
-    graph_scores = graph_scores_for_profile(viewer)
-    rows = _serialize_profile_list(
-        profiles,
-        viewer=viewer,
-        matched_contact_ids=matched_contact_ids,
-        graph_scores=graph_scores,
-    )
+    limit = max(1, min(int(request.GET.get("limit", 12) or 12), 25))
+    rows = recommend_profiles_for_viewer(viewer, query=query, limit=limit)
     return _json_ok({"count": len(rows), "results": rows})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def discovery_query(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = DiscoveryQuerySerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Describe someone search failed.")
+
+    description = serializer.validated_data["description"].strip()
+    limit = serializer.validated_data["limit"]
+    rows = recommend_profiles_for_description(viewer, description=description, limit=limit)
+    record_recommendation_activity(
+        viewer,
+        event_type="description_query_submitted",
+        discovery_mode="describe_someone",
+        query_text=description,
+        metadata={"result_count": len(rows)},
+        signal_strength=0.06,
+    )
+    return _json_ok({"count": len(rows), "results": rows, "description": description})
 
 
 @require_http_methods(["GET"])
@@ -517,7 +510,7 @@ def friend_requests_collection(request):
                 "from_profile__elder_profile",
                 "to_profile__user",
                 "to_profile__elder_profile",
-            ).filter(to_profile=viewer)
+            ).filter(to_profile=viewer, status=FriendRequest.Status.PENDING)
         ]
         outgoing = [
             _serialize_friend_request(item, viewer=viewer, matched_contact_ids=matched_contact_ids)
@@ -526,7 +519,7 @@ def friend_requests_collection(request):
                 "from_profile__elder_profile",
                 "to_profile__user",
                 "to_profile__elder_profile",
-            ).filter(from_profile=viewer)
+            ).filter(from_profile=viewer, status=FriendRequest.Status.PENDING)
         ]
         return _json_ok({"incoming": incoming, "outgoing": outgoing})
 
@@ -586,6 +579,14 @@ def friend_requests_collection(request):
             status=FriendRequest.Status.PENDING,
             message=message,
         )
+    record_recommendation_activity(
+        viewer,
+        event_type="friend_request_sent",
+        target=target,
+        discovery_mode="direct",
+        metadata={"request_id": request_obj.id},
+        signal_strength=0.30,
+    )
 
     return _json_ok(
         {
@@ -645,6 +646,32 @@ def respond_to_friend_request(request, request_id: int):
 
     if action == "accept":
         refresh_social_edge_for_friendship(request_obj.from_profile, request_obj.to_profile)
+        record_recommendation_activity(
+            viewer,
+            event_type="friend_request_accepted",
+            target=request_obj.from_profile,
+            discovery_mode="direct",
+            metadata={"request_id": request_obj.id},
+            signal_strength=0.85,
+        )
+    elif action == "decline":
+        record_recommendation_activity(
+            viewer,
+            event_type="friend_request_declined",
+            target=request_obj.from_profile,
+            discovery_mode="direct",
+            metadata={"request_id": request_obj.id},
+            signal_strength=0.08,
+        )
+    elif action == "cancel":
+        record_recommendation_activity(
+            viewer,
+            event_type="friend_request_canceled",
+            target=request_obj.to_profile,
+            discovery_mode="direct",
+            metadata={"request_id": request_obj.id},
+            signal_strength=0.05,
+        )
 
     matched_contact_ids = matched_profile_ids_for_owner(viewer)
     return _json_ok(
@@ -687,6 +714,55 @@ def contacts_collection(request):
             }
         )
     return _json_ok({"count": len(contacts), "contacts": contacts})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def activity_event_collection(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = RecommendationActivitySerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Activity logging failed.")
+
+    target = None
+    target_user_id = serializer.validated_data.get("target_user_id")
+    if target_user_id:
+        target = AccountProfile.objects.select_related("user", "elder_profile").filter(
+            user_id=target_user_id
+        ).first()
+        if not target:
+            return _json_error("Target user not found.", status=404, code="USER_NOT_FOUND")
+        if target.pk == viewer.pk:
+            target = None
+
+    activity = record_recommendation_activity(
+        viewer,
+        event_type=serializer.validated_data["event_type"],
+        target=target,
+        discovery_mode=serializer.validated_data.get("discovery_mode", "direct"),
+        query_text=serializer.validated_data.get("query_text", ""),
+        metadata=serializer.validated_data.get("metadata", {}),
+    )
+    return _json_ok(
+        {
+            "status": "success",
+            "activity": {
+                "id": activity.id,
+                "event_type": activity.event_type,
+                "discovery_mode": activity.discovery_mode,
+                "signal_strength": activity.signal_strength,
+            },
+        },
+        status=201,
+    )
 
 
 @csrf_exempt
@@ -756,6 +832,16 @@ def import_contacts_view(request):
         }
         for contact in created_contacts
     ]
+    for contact in created_contacts:
+        for match in matched_profiles_for_contact(viewer, contact):
+            record_recommendation_activity(
+                viewer,
+                event_type="contact_match_hit",
+                target=match,
+                discovery_mode="direct",
+                metadata={"contact_id": contact.id, "source": source},
+                signal_strength=0.24,
+            )
     return _json_ok(
         {
             "status": "success",

@@ -186,6 +186,10 @@ class AppProfile {
     required this.sharePhoneWithFriends,
     required this.shareEmailWithFriends,
     required this.onboardingAnswers,
+    this.matchPercent,
+    this.rawScore,
+    this.scoreComponents = const <String, double>{},
+    this.discoveryMode,
   });
 
   final int userId;
@@ -205,6 +209,10 @@ class AppProfile {
   final bool sharePhoneWithFriends;
   final bool shareEmailWithFriends;
   final Map<String, String> onboardingAnswers;
+  final int? matchPercent;
+  final double? rawScore;
+  final Map<String, double> scoreComponents;
+  final String? discoveryMode;
 
   factory AppProfile.fromJson(Map<String, dynamic> json) {
     final rawAnswers = json['onboarding_answers'];
@@ -212,6 +220,16 @@ class AppProfile {
     if (rawAnswers is Map) {
       for (final entry in rawAnswers.entries) {
         parsedAnswers[entry.key.toString()] = entry.value?.toString() ?? '';
+      }
+    }
+    final rawScoreComponents = <String, double>{};
+    final scoreComponentsPayload = json['score_components'];
+    if (scoreComponentsPayload is Map) {
+      for (final entry in scoreComponentsPayload.entries) {
+        final parsed = _toDouble(entry.value);
+        if (parsed != null) {
+          rawScoreComponents[entry.key.toString()] = parsed;
+        }
       }
     }
 
@@ -241,6 +259,10 @@ class AppProfile {
       sharePhoneWithFriends: json['share_phone_with_friends'] != false,
       shareEmailWithFriends: json['share_email_with_friends'] != false,
       onboardingAnswers: parsedAnswers,
+      matchPercent: (json['match_percent'] as num?)?.toInt(),
+      rawScore: _toDouble(json['raw_score']),
+      scoreComponents: rawScoreComponents,
+      discoveryMode: json['discovery_mode']?.toString(),
     );
   }
 
@@ -254,6 +276,10 @@ class AppProfile {
     bool? sharePhoneWithFriends,
     bool? shareEmailWithFriends,
     Map<String, String>? onboardingAnswers,
+    int? matchPercent,
+    double? rawScore,
+    Map<String, double>? scoreComponents,
+    String? discoveryMode,
   }) {
     return AppProfile(
       userId: userId,
@@ -276,6 +302,10 @@ class AppProfile {
       shareEmailWithFriends:
           shareEmailWithFriends ?? this.shareEmailWithFriends,
       onboardingAnswers: onboardingAnswers ?? this.onboardingAnswers,
+      matchPercent: matchPercent ?? this.matchPercent,
+      rawScore: rawScore ?? this.rawScore,
+      scoreComponents: scoreComponents ?? this.scoreComponents,
+      discoveryMode: discoveryMode ?? this.discoveryMode,
     );
   }
 }
@@ -471,6 +501,24 @@ class SocialApiClient {
         .toList();
   }
 
+  Future<List<AppProfile>> fetchDescriptionDiscovery({
+    required String description,
+    int limit = 8,
+  }) async {
+    final payload = await _request(
+      'POST',
+      '/api/accounts/discovery/query/',
+      body: <String, dynamic>{
+        'description': description,
+        'limit': limit,
+      },
+    );
+    return (payload['results'] as List? ?? const <dynamic>[])
+        .whereType<Map>()
+        .map((item) => AppProfile.fromJson(item.cast<String, dynamic>()))
+        .toList();
+  }
+
   Future<FriendRequestBucket> fetchFriendRequests() async {
     final payload = await _request('GET', '/api/accounts/friend-requests/');
     return FriendRequestBucket.fromJson(payload);
@@ -529,6 +577,31 @@ class SocialApiClient {
         'replace_existing': true,
         'contacts': contacts,
       },
+    );
+  }
+
+  Future<void> logActivity({
+    required String eventType,
+    int? targetUserId,
+    String discoveryMode = 'direct',
+    String queryText = '',
+    Map<String, dynamic> metadata = const <String, dynamic>{},
+  }) async {
+    final body = <String, dynamic>{
+      'event_type': eventType,
+      'discovery_mode': discoveryMode,
+      'metadata': metadata,
+    };
+    if (targetUserId != null) {
+      body['target_user_id'] = targetUserId;
+    }
+    if (queryText.trim().isNotEmpty) {
+      body['query_text'] = queryText.trim();
+    }
+    await _request(
+      'POST',
+      '/api/accounts/activities/',
+      body: body,
     );
   }
 }

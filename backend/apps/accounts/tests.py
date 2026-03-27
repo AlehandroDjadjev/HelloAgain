@@ -6,7 +6,7 @@ from django.test import TestCase
 
 from recommendations.models import ElderProfile
 
-from .models import AccountProfile
+from .models import AccountProfile, RecommendationActivity
 from .services import issue_token
 
 
@@ -272,6 +272,10 @@ class AccountApiTests(TestCase):
         self.assertIn("match_summary", payload["results"][0])
         self.assertIn("contact_access", payload["results"][0])
         self.assertIn("graph_score", payload["results"][0])
+        self.assertIn("match_percent", payload["results"][0])
+        self.assertIn("raw_score", payload["results"][0])
+        self.assertIn("score_components", payload["results"][0])
+        self.assertGreaterEqual(payload["results"][0]["match_percent"], 70)
 
         filtered = self.client.get(
             "/api/accounts/discovery/?q=Best",
@@ -280,3 +284,86 @@ class AccountApiTests(TestCase):
         self.assertEqual(filtered.status_code, 200)
         self.assertEqual(filtered.json()["count"], 1)
         self.assertEqual(filtered.json()["results"][0]["user_id"], match.user_id)
+
+    def test_description_query_ranks_by_typed_persona(self):
+        viewer = self._create_profile(
+            username="viewer",
+            email="viewer@example.com",
+            display_name="Viewer",
+            description="Calm, thoughtful, prefers quiet coffee and reading.",
+        )
+        sporty = self._create_profile(
+            username="sporty",
+            email="sporty@example.com",
+            display_name="Sporty Friend",
+            description="Loves volleyball, active weekends, energetic team games.",
+        )
+        quiet = self._create_profile(
+            username="quiet",
+            email="quiet@example.com",
+            display_name="Quiet Friend",
+            description="Enjoys books, reflective talks, and peaceful afternoons.",
+        )
+
+        response = self.client.post(
+            "/api/accounts/discovery/query/",
+            data=json.dumps(
+                {
+                    "description": "Someone active who enjoys volleyball and energetic group activities.",
+                    "limit": 5,
+                }
+            ),
+            content_type="application/json",
+            **self._auth_headers(viewer.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["results"][0]["user_id"], sporty.user_id)
+        self.assertEqual(payload["results"][0]["discovery_mode"], "describe_someone")
+        self.assertGreaterEqual(
+            RecommendationActivity.objects.filter(
+                actor_profile=viewer,
+                event_type=RecommendationActivity.EventType.DESCRIPTION_QUERY_SUBMITTED,
+            ).count(),
+            1,
+        )
+        self.assertNotEqual(payload["results"][0]["user_id"], quiet.user_id)
+
+    def test_activity_endpoint_logs_social_signal(self):
+        viewer = self._create_profile(
+            username="viewer",
+            email="viewer@example.com",
+            display_name="Viewer",
+            description="Warm and curious.",
+        )
+        target = self._create_profile(
+            username="target",
+            email="target@example.com",
+            display_name="Target",
+            description="Friendly and playful.",
+        )
+
+        response = self.client.post(
+            "/api/accounts/activities/",
+            data=json.dumps(
+                {
+                    "event_type": "profile_viewed",
+                    "target_user_id": target.user_id,
+                    "discovery_mode": "for_you",
+                    "metadata": {"source": "result_card"},
+                }
+            ),
+            content_type="application/json",
+            **self._auth_headers(viewer.user),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(
+            RecommendationActivity.objects.filter(
+                actor_profile=viewer,
+                target_profile=target,
+                event_type=RecommendationActivity.EventType.PROFILE_VIEWED,
+            ).count(),
+            1,
+        )

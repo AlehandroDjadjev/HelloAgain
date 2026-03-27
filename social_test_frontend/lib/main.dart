@@ -720,6 +720,8 @@ class _AppShellState extends State<AppShell> {
   }
 }
 
+enum DiscoveryModeChoice { forYou, describeSomeone }
+
 class HomeTab extends StatefulWidget {
   const HomeTab({
     super.key,
@@ -742,6 +744,8 @@ class HomeTab extends StatefulWidget {
 
 class _HomeTabState extends State<HomeTab> {
   final _searchController = TextEditingController();
+  final _descriptionController = TextEditingController();
+  DiscoveryModeChoice _mode = DiscoveryModeChoice.forYou;
   bool _loading = true;
   String? _error;
   List<AppProfile> _profiles = const <AppProfile>[];
@@ -763,6 +767,7 @@ class _HomeTabState extends State<HomeTab> {
   @override
   void dispose() {
     _searchController.dispose();
+    _descriptionController.dispose();
     super.dispose();
   }
 
@@ -771,10 +776,24 @@ class _HomeTabState extends State<HomeTab> {
       _loading = true;
       _error = null;
     });
+    if (_mode == DiscoveryModeChoice.describeSomeone &&
+        _descriptionController.text.trim().isEmpty) {
+      setState(() {
+        _profiles = const <AppProfile>[];
+        _loading = false;
+        _error = 'Write a short description of the kind of person you want to meet.';
+      });
+      return;
+    }
     try {
-      final profiles = await widget.session.api.fetchDiscovery(
-        query: _searchController.text,
-      );
+      final profiles = _mode == DiscoveryModeChoice.forYou
+          ? await widget.session.api.fetchDiscovery(
+              query: _searchController.text,
+            )
+          : await widget.session.api.fetchDescriptionDiscovery(
+              description: _descriptionController.text.trim(),
+              limit: 8,
+            );
       if (!mounted) {
         return;
       }
@@ -802,6 +821,28 @@ class _HomeTabState extends State<HomeTab> {
         });
       }
     }
+  }
+
+  Future<void> _openProfileFromResults(AppProfile profile) async {
+    final eventType = _mode == DiscoveryModeChoice.forYou
+        ? 'recommendation_clicked'
+        : 'search_result_opened';
+    final discoveryMode =
+        _mode == DiscoveryModeChoice.forYou ? 'for_you' : 'describe_someone';
+    try {
+      await widget.session.api.logActivity(
+        eventType: eventType,
+        targetUserId: profile.userId,
+        discoveryMode: discoveryMode,
+        queryText: _mode == DiscoveryModeChoice.describeSomeone
+            ? _descriptionController.text.trim()
+            : _searchController.text.trim(),
+        metadata: const {'surface': 'home_results'},
+      );
+    } catch (_) {
+      // Keep profile navigation resilient.
+    }
+    widget.onOpenProfile(profile);
   }
 
   Future<void> _sendRequest(AppProfile profile) async {
@@ -868,29 +909,78 @@ class _HomeTabState extends State<HomeTab> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'Search by name or interest keywords. Results stay grounded in your synced account profile and graph scores.',
+                    _mode == DiscoveryModeChoice.forYou
+                        ? 'Graph-first friend discovery using your account profile, social edges, and recent activity.'
+                        : 'Describe the kind of person you want to meet and the backend will rank real users against that target persona.',
                     style: Theme.of(context).textTheme.bodyMedium,
                   ),
                   const SizedBox(height: 14),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _searchController,
-                          onSubmitted: (_) => _load(),
-                          decoration: const InputDecoration(
-                            labelText: 'Search people or interests',
-                            prefixIcon: Icon(Icons.search_rounded),
-                          ),
-                        ),
+                  SegmentedButton<DiscoveryModeChoice>(
+                    segments: const [
+                      ButtonSegment<DiscoveryModeChoice>(
+                        value: DiscoveryModeChoice.forYou,
+                        label: Text('For You'),
+                        icon: Icon(Icons.auto_awesome_rounded),
                       ),
-                      const SizedBox(width: 10),
-                      FilledButton(
-                        onPressed: _load,
-                        child: const Text('Search'),
+                      ButtonSegment<DiscoveryModeChoice>(
+                        value: DiscoveryModeChoice.describeSomeone,
+                        label: Text('Describe Someone'),
+                        icon: Icon(Icons.edit_note_rounded),
                       ),
                     ],
+                    selected: <DiscoveryModeChoice>{_mode},
+                    onSelectionChanged: (selection) {
+                      setState(() {
+                        _mode = selection.first;
+                      });
+                      _load();
+                    },
                   ),
+                  const SizedBox(height: 14),
+                  if (_mode == DiscoveryModeChoice.forYou)
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: _searchController,
+                            onSubmitted: (_) => _load(),
+                            decoration: const InputDecoration(
+                              labelText: 'Filter by name or interests',
+                              prefixIcon: Icon(Icons.search_rounded),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        FilledButton(
+                          onPressed: _load,
+                          child: const Text('Refresh'),
+                        ),
+                      ],
+                    )
+                  else
+                    Column(
+                      children: [
+                        TextField(
+                          controller: _descriptionController,
+                          minLines: 3,
+                          maxLines: 5,
+                          onSubmitted: (_) => _load(),
+                          decoration: const InputDecoration(
+                            labelText: 'Describe the kind of person you want to meet',
+                            alignLabelWithHint: true,
+                            prefixIcon: Icon(Icons.psychology_alt_rounded),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        Align(
+                          alignment: Alignment.centerRight,
+                          child: FilledButton(
+                            onPressed: _load,
+                            child: const Text('Find matches'),
+                          ),
+                        ),
+                      ],
+                    ),
                 ],
               ),
             ),
@@ -917,7 +1007,7 @@ class _HomeTabState extends State<HomeTab> {
                 padding: const EdgeInsets.only(bottom: 12),
                 child: PersonCard(
                   profile: profile,
-                  onTap: () => widget.onOpenProfile(profile),
+                  onTap: () => _openProfileFromResults(profile),
                   action: _buildAction(profile),
                 ),
               ),
@@ -1050,19 +1140,21 @@ class _RequestsTabState extends State<RequestsTab> {
                   child: RequestCard(
                     row: row,
                     onTap: () => widget.onOpenProfile(row.counterparty),
-                    trailing: Wrap(
-                      spacing: 8,
-                      children: [
-                        FilledButton(
-                          onPressed: () => _respond(row, 'accept'),
-                          child: const Text('Accept'),
-                        ),
-                        OutlinedButton(
-                          onPressed: () => _respond(row, 'decline'),
-                          child: const Text('Decline'),
-                        ),
-                      ],
-                    ),
+                    trailing: row.status == 'pending'
+                        ? Wrap(
+                            spacing: 8,
+                            children: [
+                              FilledButton(
+                                onPressed: () => _respond(row, 'accept'),
+                                child: const Text('Accept'),
+                              ),
+                              OutlinedButton(
+                                onPressed: () => _respond(row, 'decline'),
+                                child: const Text('Decline'),
+                              ),
+                            ],
+                          )
+                        : StatusChip(label: row.status),
                   ),
                 ),
               ),
@@ -1438,6 +1530,20 @@ class _UserProfilePageState extends State<UserProfilePage> {
     super.initState();
     _profile = widget.initialProfile;
     _refresh();
+    _logProfileView();
+  }
+
+  Future<void> _logProfileView() async {
+    try {
+      await widget.session.api.logActivity(
+        eventType: 'profile_viewed',
+        targetUserId: widget.initialProfile.userId,
+        discoveryMode: widget.initialProfile.discoveryMode ?? 'direct',
+        metadata: const {'surface': 'profile_page'},
+      );
+    } catch (_) {
+      // Ignore analytics failures.
+    }
   }
 
   Future<void> _refresh() async {
@@ -1471,6 +1577,34 @@ class _UserProfilePageState extends State<UserProfilePage> {
         SnackBar(content: Text(error.message)),
       );
     }
+  }
+
+  Future<void> _tapPhone() async {
+    try {
+      await widget.session.api.logActivity(
+        eventType: 'call_tapped',
+        targetUserId: _profile.userId,
+        discoveryMode: _profile.discoveryMode ?? 'direct',
+        metadata: const {'surface': 'profile_page'},
+      );
+    } catch (_) {
+      // Ignore analytics failures.
+    }
+    await launchExternalUri('tel:${_profile.phoneNumber}');
+  }
+
+  Future<void> _tapEmail() async {
+    try {
+      await widget.session.api.logActivity(
+        eventType: 'email_tapped',
+        targetUserId: _profile.userId,
+        discoveryMode: _profile.discoveryMode ?? 'direct',
+        metadata: const {'surface': 'profile_page'},
+      );
+    } catch (_) {
+      // Ignore analytics failures.
+    }
+    await launchExternalUri('mailto:${_profile.email}');
   }
 
   @override
@@ -1520,10 +1654,9 @@ class _UserProfilePageState extends State<UserProfilePage> {
                                 label:
                                     'Graph ${(100 * _profile.graphScore!).round()}%',
                               ),
-                            if (_profile.matchSummary != null)
+                            if (_profile.matchPercent != null)
                               ScoreChip(
-                                label:
-                                    'Match ${(100 * _profile.matchSummary!.compatibilityScore).round()}%',
+                                label: 'Match ${_profile.matchPercent}%',
                               ),
                             if (_profile.matchedFromContacts)
                               const StatusChip(label: 'In contacts'),
@@ -1575,15 +1708,13 @@ class _UserProfilePageState extends State<UserProfilePage> {
                               ),
                             if ((_profile.phoneNumber ?? '').isNotEmpty)
                               FilledButton.tonalIcon(
-                                onPressed: () =>
-                                    launchExternalUri('tel:${_profile.phoneNumber}'),
+                                onPressed: _tapPhone,
                                 icon: const Icon(Icons.call_rounded),
                                 label: Text(_profile.phoneNumber!),
                               ),
                             if ((_profile.email ?? '').isNotEmpty)
                               FilledButton.tonalIcon(
-                                onPressed: () =>
-                                    launchExternalUri('mailto:${_profile.email}'),
+                                onPressed: _tapEmail,
                                 icon: const Icon(Icons.email_rounded),
                                 label: Text(_profile.email!),
                               ),
@@ -1651,10 +1782,9 @@ class PersonCard extends StatelessWidget {
                       ],
                     ),
                   ),
-                  if (profile.matchSummary != null)
+                  if (profile.matchPercent != null)
                     ScoreChip(
-                      label:
-                          '${(100 * profile.matchSummary!.compatibilityScore).round()}% fit',
+                      label: '${profile.matchPercent}% fit',
                     ),
                 ],
               ),
@@ -1674,6 +1804,12 @@ class PersonCard extends StatelessWidget {
                   if (profile.graphScore != null)
                     ScoreChip(
                       label: 'Graph ${(100 * profile.graphScore!).round()}%',
+                    ),
+                  if (profile.scoreComponents['query_fit_score'] != null &&
+                      (profile.scoreComponents['query_fit_score'] ?? 0) > 0)
+                    ScoreChip(
+                      label:
+                          'Query ${((profile.scoreComponents['query_fit_score'] ?? 0) * 100).round()}%',
                     ),
                   if (profile.matchedFromContacts)
                     const StatusChip(label: 'In contacts'),
