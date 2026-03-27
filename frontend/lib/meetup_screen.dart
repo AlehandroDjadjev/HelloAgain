@@ -35,9 +35,14 @@ const _kMapStyle = '''
 ''';
 
 class MeetupScreen extends StatefulWidget {
-  const MeetupScreen({super.key, required this.userPosition});
+  const MeetupScreen({
+    super.key,
+    required this.userPosition,
+    this.accountToken,
+  });
 
   final Position userPosition;
+  final String? accountToken;
 
   @override
   State<MeetupScreen> createState() => _MeetupScreenState();
@@ -47,33 +52,26 @@ class _MeetupScreenState extends State<MeetupScreen> {
   final FlutterLocalNotificationsPlugin _notificationsPlugin =
       FlutterLocalNotificationsPlugin();
   final Set<Marker> _markers = {};
-  final TextEditingController _myDescriptionController = TextEditingController();
-  final TextEditingController _friendDescriptionController =
-      TextEditingController();
-  final TextEditingController _friendLatController = TextEditingController();
-  final TextEditingController _friendLngController = TextEditingController();
 
   GoogleMapController? _mapController;
   Map<String, dynamic>? _bestMatch;
   List<Map<String, dynamic>> _recommendations = const [];
-  List<Map<String, double>> _lastParticipants = const [];
+  List<Map<String, double>> _lastParticipants = [];
+  List<_FriendOption> _friends = const [];
+  int? _selectedFriendUserId;
+  bool _isLoadingFriends = true;
   bool _isLoading = false;
   String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-    _friendLatController.text = widget.userPosition.latitude.toStringAsFixed(6);
-    _friendLngController.text = widget.userPosition.longitude.toStringAsFixed(6);
     unawaited(_initNotifications());
+    unawaited(_loadFriends());
   }
 
   @override
   void dispose() {
-    _myDescriptionController.dispose();
-    _friendDescriptionController.dispose();
-    _friendLatController.dispose();
-    _friendLngController.dispose();
     super.dispose();
   }
 
@@ -101,57 +99,107 @@ class _MeetupScreenState extends State<MeetupScreen> {
     await androidImpl?.requestExactAlarmsPermission();
   }
 
-  Future<void> fetchRecommendation() async {
-    final myDescription = _myDescriptionController.text.trim();
-    final friendDescription = _friendDescriptionController.text.trim();
-    if (myDescription.isEmpty || friendDescription.isEmpty) {
+  Map<String, String> _authHeaders({bool withJson = false}) {
+    final headers = <String, String>{};
+    if (withJson) {
+      headers['Content-Type'] = 'application/json';
+    }
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isNotEmpty) {
+      headers['Authorization'] = 'Token $token';
+    }
+    return headers;
+  }
+
+  Future<void> _loadFriends() async {
+    setState(() {
+      _isLoadingFriends = true;
+      _errorMessage = null;
+    });
+
+    try {
+      final response = await http.get(
+        Uri.parse('${_backendBaseUrl()}/api/accounts/friends/'),
+        headers: _authHeaders(),
+      );
+
+      if (response.statusCode != 200) {
+        setState(() {
+          _isLoadingFriends = false;
+          _errorMessage =
+              'Не успях да заредя приятелите. Влез отново в профила си.';
+        });
+        return;
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final rows = (data['friends'] as List? ?? const [])
+          .whereType<Map>()
+          .map((row) => row.cast<String, dynamic>())
+          .map(_FriendOption.fromJson)
+          .toList();
+
       setState(() {
-        _errorMessage = 'Въведи и двете описания, за да намерим подходяща среща.';
+        _friends = rows;
+        _selectedFriendUserId = rows.isNotEmpty ? rows.first.userId : null;
+        _isLoadingFriends = false;
+      });
+    } catch (_) {
+      setState(() {
+        _isLoadingFriends = false;
+        _errorMessage = 'Няма връзка със сървъра за приятели.';
+      });
+    }
+  }
+
+  Future<void> fetchRecommendation() async {
+    final selectedFriendId = _selectedFriendUserId;
+    if (selectedFriendId == null) {
+      setState(() {
+        _errorMessage = 'Избери приятел, за да намерим среща.';
       });
       return;
     }
 
-    final friendLat = double.tryParse(_friendLatController.text.trim());
-    final friendLng = double.tryParse(_friendLngController.text.trim());
-    if (friendLat == null || friendLng == null) {
-      setState(() {
-        _errorMessage = 'Въведи валидни координати за приятеля.';
-      });
-      return;
-    }
+    final selectedFriend = _friends.firstWhere(
+      (item) => item.userId == selectedFriendId,
+      orElse: () => _FriendOption.empty(),
+    );
 
     setState(() {
       _isLoading = true;
       _errorMessage = null;
     });
 
-    final payload = _buildRecommendationPayload(
-      myDescription: myDescription,
-      friendDescription: friendDescription,
-      friendLat: friendLat,
-      friendLng: friendLng,
-    );
-    _lastParticipants = (payload['participants'] as List)
-        .whereType<Map>()
-        .map(
-          (row) => {
-            'lat': (row['lat'] as num).toDouble(),
-            'lng': (row['lng'] as num).toDouble(),
-          },
-        )
-        .toList();
+    final payload = {
+      'friend_user_id': selectedFriendId,
+      'proposed_time': DateTime.now()
+          .add(const Duration(hours: 2))
+          .toIso8601String(),
+      'requester_location': {
+        'lat': widget.userPosition.latitude,
+        'lng': widget.userPosition.longitude,
+      },
+      if (selectedFriend.homeLat != null && selectedFriend.homeLng != null)
+        'friend_location': {
+          'lat': selectedFriend.homeLat,
+          'lng': selectedFriend.homeLng,
+        },
+    };
 
     try {
       final response = await http.post(
-        Uri.parse('${_backendBaseUrl()}/api/meetup/recommend/'),
-        headers: {'Content-Type': 'application/json'},
+        Uri.parse('${_backendBaseUrl()}/api/meetup/friends/propose/'),
+        headers: _authHeaders(withJson: true),
         body: jsonEncode(payload),
       );
 
-      if (response.statusCode != 200) {
+      if (response.statusCode != 201 && response.statusCode != 200) {
         final body = jsonDecode(response.body);
         final apiError =
-            body is Map<String, dynamic> ? body['error'] as String? : null;
+            body is Map<String, dynamic>
+                ? (body['error'] as String? ?? body['message'] as String?)
+                : null;
         setState(() {
           _errorMessage =
               apiError ?? 'Не успях да намеря подходящо място за среща.';
@@ -161,11 +209,24 @@ class _MeetupScreenState extends State<MeetupScreen> {
       }
 
       final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final bestMatch = data['best_match'] as Map<String, dynamic>?;
-      final recommendations = (data['recommendations'] as List? ?? const [])
-          .whereType<Map>()
-          .map((item) => item.cast<String, dynamic>())
-          .toList();
+      final invite = data['invite'] as Map<String, dynamic>?;
+      final payloadData = invite?['payload'] as Map<String, dynamic>?;
+      final bestMatch =
+          (payloadData?['best_match'] as Map?)?.cast<String, dynamic>();
+      final recommendations =
+          bestMatch == null ? const <Map<String, dynamic>>[] : [bestMatch];
+
+      _lastParticipants = [
+        {
+          'lat': widget.userPosition.latitude,
+          'lng': widget.userPosition.longitude,
+        },
+        {
+          'lat': selectedFriend.homeLat ?? widget.userPosition.latitude,
+          'lng': selectedFriend.homeLng ?? widget.userPosition.longitude,
+        },
+      ];
+
       setState(() {
         _bestMatch = bestMatch;
         _recommendations = recommendations;
@@ -190,28 +251,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
         _isLoading = false;
       });
     }
-  }
-
-  Map<String, dynamic> _buildRecommendationPayload({
-    required String myDescription,
-    required String friendDescription,
-    required double friendLat,
-    required double friendLng,
-  }) {
-    final userLat = widget.userPosition.latitude;
-    final userLng = widget.userPosition.longitude;
-    return {
-      'participants': [
-        {'lat': userLat, 'lng': userLng},
-        {'lat': friendLat, 'lng': friendLng},
-      ],
-      'participant_descriptions': [
-        myDescription,
-        friendDescription,
-      ],
-      'top_n': 5,
-      'preferred_time': DateTime.now().add(const Duration(hours: 2)).toIso8601String(),
-    };
   }
 
   void _updateMarkers() {
@@ -375,60 +414,83 @@ class _MeetupScreenState extends State<MeetupScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       const Text(
-                        'Описание на двамата',
+                        'Среща с приятел от базата',
                         style: TextStyle(
                           color: _kText,
                           fontWeight: FontWeight.w700,
                         ),
                       ),
                       const SizedBox(height: 8),
-                      TextField(
-                        controller: _myDescriptionController,
-                        minLines: 2,
-                        maxLines: 3,
-                        decoration: const InputDecoration(
-                          labelText: 'Твоето описание',
-                          hintText: 'Пример: Харесвам книги, музеи и спокойни разговори.',
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      TextField(
-                        controller: _friendDescriptionController,
-                        minLines: 2,
-                        maxLines: 3,
-                        decoration: const InputDecoration(
-                          labelText: 'Описание на приятеля',
-                          hintText: 'Пример: Обича спорт, разходки и кафе.',
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: TextField(
-                              controller: _friendLatController,
-                              keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
-                              decoration: const InputDecoration(
-                                labelText: 'Ширина на приятеля',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
+                      if (_isLoadingFriends)
+                        const Padding(
+                          padding: EdgeInsets.symmetric(vertical: 8),
+                          child: LinearProgressIndicator(minHeight: 2),
+                        )
+                      else if (_friends.isEmpty)
+                        const Text(
+                          'Нямаш приети приятели. Добави приятел, за да предложим среща.',
+                          style: TextStyle(color: _kMuted),
+                        )
+                      else ...[
+                        DropdownButtonFormField<int>(
+                          initialValue: _selectedFriendUserId,
+                          decoration: const InputDecoration(
+                            labelText: 'Избери приятел',
+                            border: OutlineInputBorder(),
                           ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: TextField(
-                              controller: _friendLngController,
-                              keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
-                              decoration: const InputDecoration(
-                                labelText: 'Дължина на приятеля',
-                                border: OutlineInputBorder(),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
+                          items: _friends
+                              .map(
+                                (friend) => DropdownMenuItem<int>(
+                                  value: friend.userId,
+                                  child: Text(friend.displayName),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: (value) {
+                            setState(() {
+                              _selectedFriendUserId = value;
+                            });
+                          },
+                        ),
+                        const SizedBox(height: 8),
+                        Builder(
+                          builder: (context) {
+                            final selected = _friends.where(
+                              (friend) => friend.userId == _selectedFriendUserId,
+                            );
+                            if (selected.isEmpty) {
+                              return const SizedBox.shrink();
+                            }
+                            final friend = selected.first;
+                            final description = friend.description.trim();
+                            final locationText =
+                                (friend.homeLat != null && friend.homeLng != null)
+                                ? 'Локация: ${friend.homeLat!.toStringAsFixed(5)}, ${friend.homeLng!.toStringAsFixed(5)}'
+                                : 'Локация: липсва в профила на приятеля';
+                            return Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                if (description.isNotEmpty)
+                                  Text(
+                                    'Описание: $description',
+                                    style: const TextStyle(
+                                      color: _kMuted,
+                                      fontSize: 12.5,
+                                    ),
+                                  ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  locationText,
+                                  style: const TextStyle(
+                                    color: _kMuted,
+                                    fontSize: 12.5,
+                                  ),
+                                ),
+                              ],
+                            );
+                          },
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -549,7 +611,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
                             ),
                           )
                         : const Text(
-                            'Намери среща',
+                            'Намери среща с приятел',
                             style: TextStyle(
                               fontSize: 17,
                               fontWeight: FontWeight.w700,
@@ -559,7 +621,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'Резултатът е на български и показва основно кога е срещата.',
+                  'Срещата се изчислява по реални приятели, описания, предпочитания и локации от базата.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: _kMuted, fontSize: 13),
                 ),
@@ -568,6 +630,43 @@ class _MeetupScreenState extends State<MeetupScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _FriendOption {
+  const _FriendOption({
+    required this.userId,
+    required this.displayName,
+    required this.description,
+    required this.homeLat,
+    required this.homeLng,
+  });
+
+  final int userId;
+  final String displayName;
+  final String description;
+  final double? homeLat;
+  final double? homeLng;
+
+  factory _FriendOption.fromJson(Map<String, dynamic> json) {
+    return _FriendOption(
+      userId: int.tryParse((json['user_id'] ?? '0').toString()) ?? 0,
+      displayName: (json['display_name'] ?? json['name'] ?? 'Приятел')
+          .toString(),
+      description: (json['description'] ?? '').toString(),
+      homeLat: (json['home_lat'] as num?)?.toDouble(),
+      homeLng: (json['home_lng'] as num?)?.toDouble(),
+    );
+  }
+
+  factory _FriendOption.empty() {
+    return const _FriendOption(
+      userId: 0,
+      displayName: '',
+      description: '',
+      homeLat: null,
+      homeLng: null,
     );
   }
 }
