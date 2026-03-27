@@ -6,7 +6,6 @@ urlpatterns = [
     
     # Platform APIs
     path("api/voice/", include("voice_gateway.urls")),
-    path("api/voice-gateway/", include("voice_gateway.urls")),
     path("api/meetup/", include("meetup.urls")),
     path("", include("controller.urls")),
     

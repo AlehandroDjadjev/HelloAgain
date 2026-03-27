@@ -47,7 +47,6 @@ INSTALLED_APPS = [
     'corsheaders',
     # Platform
     'controller',
-    'voice_gateway',
     'meetup',
     "apps.accounts",
     # Agent apps
