@@ -9,10 +9,9 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from threading import Lock
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from .custom_mcp_registry import CustomMcpRegistry
-from .graph_service import GraphService
 from .llm_parser import QwenPromptParser
 from .qwen_worker_client import QwenWorkerClient
 from .semi_agent_prompts import (
@@ -21,6 +20,9 @@ from .semi_agent_prompts import (
 )
 from .whiteboard_memory import WhiteboardMemoryStore
 from voice_gateway.services.providers import OpenAILLMProvider, PiperTTSProvider
+
+if TYPE_CHECKING:
+    from .graph_service import GraphService
 
 
 class SemiAgentService:
@@ -35,14 +37,14 @@ class SemiAgentService:
     def __init__(
         self,
         *,
-        graph_service: GraphService | None = None,
+        graph_service: "GraphService" | None = None,
         qwen_client: QwenWorkerClient | None = None,
         registry: CustomMcpRegistry | None = None,
         board_memory: WhiteboardMemoryStore | None = None,
         llm_provider: OpenAILLMProvider | None = None,
         tts_provider: PiperTTSProvider | None = None,
     ) -> None:
-        self.graph_service = graph_service or GraphService()
+        self.graph_service = graph_service
         self.qwen_client = qwen_client or QwenWorkerClient()
         self.registry = registry or CustomMcpRegistry()
         self.board_memory = board_memory or WhiteboardMemoryStore()
@@ -51,6 +53,13 @@ class SemiAgentService:
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
+
+    def _get_graph_service(self) -> "GraphService":
+        if self.graph_service is None:
+            from .graph_service import GraphService
+
+            self.graph_service = GraphService()
+        return self.graph_service
 
     def get_registry_payload(self, *, base_url: str = "") -> Dict[str, Any]:
         return self.registry.load_registry(base_url=base_url)
