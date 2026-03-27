@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-from django.contrib.auth.models import User
-from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
+
+from .models import AccountProfile, normalize_phone_number
 
 
 class RegisterSerializer(serializers.Serializer):
-    username = serializers.CharField(max_length=150)
-    email = serializers.EmailField()
-    password = serializers.CharField(write_only=True, trim_whitespace=False)
-    display_name = serializers.CharField(max_length=120, required=False, allow_blank=True)
-    phone_number = serializers.CharField(max_length=32, required=False, allow_blank=True)
+    name = serializers.CharField(max_length=120)
+    phone_number = serializers.CharField(max_length=32)
     description = serializers.CharField(required=False, allow_blank=True)
     dynamic_profile_summary = serializers.CharField(required=False, allow_blank=True)
     profile_notes = serializers.CharField(required=False, allow_blank=True)
@@ -18,30 +15,48 @@ class RegisterSerializer(serializers.Serializer):
         child=serializers.CharField(allow_blank=True),
         required=False,
     )
+    onboarding_completed = serializers.BooleanField(required=False, default=True)
+    voice_navigation_enabled = serializers.BooleanField(required=False, default=True)
+    microphone_permission_granted = serializers.BooleanField(required=False, default=True)
+    phone_permission_granted = serializers.BooleanField(required=False, default=False)
     contacts_permission_granted = serializers.BooleanField(required=False, default=False)
-    share_phone_with_friends = serializers.BooleanField(required=False, default=True)
-    share_email_with_friends = serializers.BooleanField(required=False, default=True)
+    share_phone_with_friends = serializers.BooleanField(required=False, default=False)
+    share_email_with_friends = serializers.BooleanField(required=False, default=False)
 
-    def validate_username(self, value: str) -> str:
+    def validate_name(self, value: str) -> str:
         value = value.strip()
-        if User.objects.filter(username__iexact=value).exists():
-            raise serializers.ValidationError("This username is already taken.")
+        if not value:
+            raise serializers.ValidationError("Please say your name.")
         return value
 
-    def validate_email(self, value: str) -> str:
-        value = value.strip().lower()
-        if User.objects.filter(email__iexact=value).exists():
-            raise serializers.ValidationError("This email is already registered.")
+    def validate_phone_number(self, value: str) -> str:
+        normalized = normalize_phone_number(value)
+        if not normalized:
+            raise serializers.ValidationError("A valid phone number is required.")
+        if AccountProfile.objects.filter(normalized_phone_number=normalized).exists():
+            raise serializers.ValidationError("This phone number is already registered.")
         return value
 
-    def validate_password(self, value: str) -> str:
-        validate_password(value)
-        return value
+    def validate(self, attrs):
+        if not attrs.get("phone_permission_granted"):
+            raise serializers.ValidationError(
+                {"phone_permission_granted": "Phone access is required for sign up."}
+            )
+        if not attrs.get("microphone_permission_granted"):
+            raise serializers.ValidationError(
+                {"microphone_permission_granted": "Microphone access is required for voice navigation."}
+            )
+        return attrs
 
 
 class LoginSerializer(serializers.Serializer):
-    identifier = serializers.CharField()
-    password = serializers.CharField(write_only=True, trim_whitespace=False)
+    phone_number = serializers.CharField(max_length=32)
+
+    def validate_phone_number(self, value: str) -> str:
+        normalized = normalize_phone_number(value)
+        if not normalized:
+            raise serializers.ValidationError("A valid phone number is required.")
+        return value
 
 
 class AccountProfileUpdateSerializer(serializers.Serializer):
@@ -54,9 +69,55 @@ class AccountProfileUpdateSerializer(serializers.Serializer):
         child=serializers.CharField(allow_blank=True),
         required=False,
     )
+    onboarding_completed = serializers.BooleanField(required=False)
+    voice_navigation_enabled = serializers.BooleanField(required=False)
+    microphone_permission_granted = serializers.BooleanField(required=False)
+    phone_permission_granted = serializers.BooleanField(required=False)
     contacts_permission_granted = serializers.BooleanField(required=False)
     share_phone_with_friends = serializers.BooleanField(required=False)
     share_email_with_friends = serializers.BooleanField(required=False)
+    home_lat = serializers.FloatField(required=False, min_value=-90.0, max_value=90.0)
+    home_lng = serializers.FloatField(required=False, min_value=-180.0, max_value=180.0)
+
+    def validate_phone_number(self, value: str) -> str:
+        normalized = normalize_phone_number(value)
+        if value and not normalized:
+            raise serializers.ValidationError("A valid phone number is required.")
+        profile = getattr(self.context.get("profile"), "pk", None)
+        if normalized:
+            query = AccountProfile.objects.filter(normalized_phone_number=normalized)
+            if profile is not None:
+                query = query.exclude(pk=profile)
+            if query.exists():
+                raise serializers.ValidationError("This phone number is already registered.")
+        return value
+
+
+class OnboardingStartSerializer(serializers.Serializer):
+    session_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
+
+
+class OnboardingTurnSerializer(serializers.Serializer):
+    session_id = serializers.CharField(max_length=64)
+    message = serializers.CharField()
+
+    def validate_message(self, value: str) -> str:
+        value = " ".join(value.split()).strip()
+        if not value:
+            raise serializers.ValidationError("Please say something so I can continue.")
+        return value
+
+
+class OnboardingConfirmLoginSerializer(serializers.Serializer):
+    session_id = serializers.CharField(max_length=64)
+    phone_confirmed = serializers.BooleanField()
+    login_confirmed = serializers.BooleanField()
+
+
+class OnboardingCompleteSerializer(serializers.Serializer):
+    session_id = serializers.CharField(max_length=64)
+    microphone_permission_granted = serializers.BooleanField(required=False, default=True)
+    phone_permission_granted = serializers.BooleanField(required=False, default=True)
 
 
 class FriendRequestCreateSerializer(serializers.Serializer):

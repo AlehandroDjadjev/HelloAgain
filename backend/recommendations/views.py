@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import importlib.util
 from pathlib import Path
@@ -24,6 +25,9 @@ from .services.compatibility_engine import compare_people, dominant_traits
 from .services.profile_ingestion import apply_interaction_signals, hydrate_profile_from_description
 from .services.recommendation_explainer import explain_recommendation
 from .services.graph_training import record_training_run
+
+
+logger = logging.getLogger(__name__)
 
 # --- Helpers ---
 
@@ -201,25 +205,55 @@ def compare_users(request):
     def get_vec_and_conf(uid=None, desc=None):
         if uid:
             p = get_object_or_404(ElderProfile, pk=int(uid))
-            return p.feature_vector, p.feature_confidence, p
+            return p.feature_vector, p.feature_confidence, p, []
         elif desc:
             from .services.feature_extraction import (
                 extract_feature_profile,
+                extract_preference_intents,
                 extraction_to_vectors,
             )
             ext = extract_feature_profile(str(desc))
             _, vec, conf, _, _ = extraction_to_vectors(ext)
-            return vec, conf, None
-        return None, None, None
+            intents = extract_preference_intents(str(desc))
+            return vec, conf, None, intents
+        return None, None, None, []
 
-    v_left, c_left, p_left = get_vec_and_conf(body.get("left_id"), body.get("left_description"))
-    v_right, c_right, p_right = get_vec_and_conf(body.get("right_id"), body.get("right_description"))
+    v_left, c_left, p_left, intents_left = get_vec_and_conf(body.get("left_id"), body.get("left_description"))
+    v_right, c_right, p_right, intents_right = get_vec_and_conf(body.get("right_id"), body.get("right_description"))
 
     if not v_left or not v_right:
         return _json_error("Provide left_id/description and right_id/description.")
 
     # Perform comparison
-    comparison = compare_people(v_left, v_right, left_confidence=c_left, right_confidence=c_right)
+    comparison = compare_people(
+        v_left,
+        v_right,
+        left_confidence=c_left,
+        right_confidence=c_right,
+        left_intents=intents_left,
+        right_intents=intents_right,
+    )
+
+    if body.get("left_description") and body.get("right_description"):
+        from .services.feature_extraction import embedding_pair_similarity
+
+        embedding_debug = embedding_pair_similarity(
+            str(body.get("left_description") or ""),
+            str(body.get("right_description") or ""),
+        )
+        comparison["semantic_debug"] = {
+            "left_intents": intents_left,
+            "right_intents": intents_right,
+            "embedding_pair": embedding_debug,
+            "final_adjusted_similarity": comparison.get("compatibility_score"),
+        }
+        logger.info(
+            "compare_users.semantic_debug left_intents=%s right_intents=%s raw_embedding_cosine=%s final_similarity=%.3f",
+            intents_left,
+            intents_right,
+            embedding_debug.get("cosine"),
+            float(comparison.get("compatibility_score") or 0.0),
+        )
     
     # Add metadata for response
     comparison["left"] = ElderProfileSerializer(p_left).data if p_left else {"description": body.get("left_description")}

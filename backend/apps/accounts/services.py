@@ -7,6 +7,7 @@ from typing import Iterable
 
 from django.contrib.auth.models import User
 from django.db.models import Q
+from django.utils.text import slugify
 
 from recommendations.gat.feature_schema import get_default_feature_vector
 from recommendations.models import ElderProfile, SocialEdge
@@ -25,6 +26,51 @@ from .models import (
     RecommendationActivity,
     normalize_email,
 )
+
+
+def split_display_name(display_name: str) -> tuple[str, str]:
+    parts = [part for part in str(display_name or "").strip().split() if part]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+
+def build_voice_username(display_name: str, phone_number: str) -> str:
+    stem = slugify(display_name) or "voice-user"
+    digits = re.sub(r"\D+", "", phone_number or "")
+    suffix = digits[-6:] if digits else secrets.token_hex(3)
+    candidate = f"{stem}-{suffix}"[:150].strip("-")
+    if candidate and not User.objects.filter(username__iexact=candidate).exists():
+        return candidate
+
+    index = 1
+    while True:
+        fallback = f"{candidate or 'voice-user'}-{index}"[:150].strip("-")
+        if fallback and not User.objects.filter(username__iexact=fallback).exists():
+            return fallback
+        index += 1
+
+
+def build_dynamic_profile_summary(
+    *,
+    display_name: str,
+    description: str,
+    onboarding_answers: dict[str, str] | None,
+) -> str:
+    answers = onboarding_answers or {}
+    segments: list[str] = []
+    clean_description = str(description or "").strip()
+    if clean_description:
+        segments.append(clean_description)
+    for key, value in answers.items():
+        clean_value = str(value or "").strip()
+        if not clean_value:
+            continue
+        label = str(key).replace("_", " ").strip().title()
+        segments.append(f"{display_name} - {label}: {clean_value}")
+    return "\n".join(segment for segment in segments if segment)
 
 
 def build_recommendation_username(user: User) -> str:
@@ -90,6 +136,26 @@ def sync_profile_to_recommendations(
         preserve_adaptation=preserve_adaptation,
     )
     return elder_profile
+
+
+def seed_social_graph_for_profile(profile: AccountProfile) -> None:
+    viewer = sync_profile_to_recommendations(profile, preserve_adaptation=True)
+    others = (
+        AccountProfile.objects.select_related("elder_profile")
+        .exclude(pk=profile.pk)
+        .exclude(elder_profile__isnull=True)
+    )
+
+    for other in others:
+        other_elder = sync_profile_to_recommendations(other, preserve_adaptation=True)
+        comparison = compare_people(
+            viewer.feature_vector or get_default_feature_vector(),
+            other_elder.feature_vector or get_default_feature_vector(),
+            left_confidence=viewer.feature_confidence or {},
+            right_confidence=other_elder.feature_confidence or {},
+        )
+        weight = max(0.18, float(comparison.get("compatibility_score", 0.18)))
+        SocialEdge.upsert(viewer, other_elder, weight)
 
 
 def get_friend_request_between(
