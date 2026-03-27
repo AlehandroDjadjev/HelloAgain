@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart';
 
 import '../api/android_control_api.dart';
@@ -5,7 +7,7 @@ import '../models/models.dart';
 
 /// [MethodChannel] implementation of [AndroidControlApi].
 ///
-/// Every call is wrapped in a try/catch — PlatformExceptions and unexpected
+/// Every call is wrapped in a try/catch. PlatformExceptions and unexpected
 /// errors are converted to [ActionResult.bridgeError] or typed failure results.
 /// Nothing in this class ever throws to the caller.
 class DeviceControlChannel implements AndroidControlApi {
@@ -13,13 +15,12 @@ class DeviceControlChannel implements AndroidControlApi {
 
   const DeviceControlChannel();
 
-  // ── Permissions ───────────────────────────────────────────────────────────
-
   @override
   Future<Map<String, bool>> getPermissionStatus() async {
     try {
-      final raw = await _channel
-          .invokeMethod<Map<Object?, Object?>>('getPermissionStatus');
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'getPermissionStatus',
+      );
       return _castBoolMap(raw);
     } on PlatformException {
       return {'accessibilityService': false, 'overlayPermission': false};
@@ -35,8 +36,6 @@ class DeviceControlChannel implements AndroidControlApi {
     }
   }
 
-  // ── Session lifecycle ─────────────────────────────────────────────────────
-
   @override
   Future<ActionResult> startSession(SessionConfig config) =>
       _invokeAction('startSession', config.toMap());
@@ -45,15 +44,24 @@ class DeviceControlChannel implements AndroidControlApi {
   Future<ActionResult> stopSession(String sessionId) =>
       _invokeAction('stopSession', {'sessionId': sessionId});
 
-  // ── App inspection ────────────────────────────────────────────────────────
+  @override
+  Future<List<String>> listLaunchablePackages() async {
+    try {
+      final raw = await _channel.invokeMethod<List<Object?>>(
+        'listLaunchablePackages',
+      );
+      return (raw ?? []).whereType<String>().toList();
+    } on PlatformException {
+      return [];
+    }
+  }
 
   @override
   Future<bool> isPackageInstalled(String packageName) async {
     try {
-      final result = await _channel.invokeMethod<bool>(
-        'isPackageInstalled',
-        {'packageName': packageName},
-      );
+      final result = await _channel.invokeMethod<bool>('isPackageInstalled', {
+        'packageName': packageName,
+      });
       return result ?? false;
     } on PlatformException {
       return false;
@@ -64,13 +72,12 @@ class DeviceControlChannel implements AndroidControlApi {
   Future<ActionResult> launchApp(String packageName) =>
       _invokeAction('launchApp', {'packageName': packageName});
 
-  // ── Screen state ──────────────────────────────────────────────────────────
-
   @override
   Future<ScreenState> getScreenState() async {
     try {
-      final raw = await _channel
-          .invokeMethod<Map<Object?, Object?>>('getScreenState');
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'getScreenState',
+      );
       if (raw == null) {
         return _emptyScreenState();
       }
@@ -79,8 +86,6 @@ class DeviceControlChannel implements AndroidControlApi {
       return _emptyScreenState(hash: 'error:PlatformException');
     }
   }
-
-  // ── Element lookup ────────────────────────────────────────────────────────
 
   @override
   Future<UiNode?> findElement(Selector selector) async {
@@ -110,8 +115,6 @@ class DeviceControlChannel implements AndroidControlApi {
       return [];
     }
   }
-
-  // ── Actions ───────────────────────────────────────────────────────────────
 
   @override
   Future<ActionResult> tapElement(Selector selector) =>
@@ -144,14 +147,13 @@ class DeviceControlChannel implements AndroidControlApi {
     int endX,
     int endY,
     int durationMs,
-  ) =>
-      _invokeAction('swipe', {
-        'startX': startX,
-        'startY': startY,
-        'endX': endX,
-        'endY': endY,
-        'durationMs': durationMs,
-      });
+  ) => _invokeAction('swipe', {
+    'startX': startX,
+    'startY': startY,
+    'endX': endX,
+    'endY': endY,
+    'durationMs': durationMs,
+  });
 
   @override
   Future<ActionResult> goBack() => _invokeAction('goBack', null);
@@ -159,22 +161,41 @@ class DeviceControlChannel implements AndroidControlApi {
   @override
   Future<ActionResult> goHome() => _invokeAction('goHome', null);
 
-  // ── Private helpers ───────────────────────────────────────────────────────
+  @override
+  Future<String?> takeScreenshot() async {
+    try {
+      final raw = await _channel.invokeMethod<Uint8List?>('takeScreenshot');
+      if (raw == null) return null;
+      return base64Encode(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  @override
+  Future<String?> getLastScreenshotError() async {
+    try {
+      return await _channel.invokeMethod<String>('getLastScreenshotError');
+    } on PlatformException {
+      return null;
+    }
+  }
 
   Future<ActionResult> _invokeAction(
     String method,
     Map<String, Object?>? args,
   ) async {
     try {
-      final raw = await _channel
-          .invokeMethod<Map<Object?, Object?>>(method, args);
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        method,
+        args,
+      );
       if (raw == null) {
         return ActionResult.bridgeError('$method returned null');
       }
       return ActionResult.fromMap(raw);
     } on PlatformException catch (e) {
-      if (e.code == 'SERVICE_NOT_ENABLED' ||
-          e.code == 'SERVICE_UNAVAILABLE') {
+      if (e.code == 'SERVICE_NOT_ENABLED' || e.code == 'SERVICE_UNAVAILABLE') {
         return ActionResult.serviceNotEnabled();
       }
       return ActionResult.bridgeError('${e.code}: ${e.message}');
@@ -192,9 +213,9 @@ class DeviceControlChannel implements AndroidControlApi {
   }
 
   static ScreenState _emptyScreenState({String hash = ''}) => ScreenState(
-        timestampMs: DateTime.now().millisecondsSinceEpoch,
-        screenHash: hash,
-        isSensitive: false,
-        nodes: [],
-      );
+    timestampMs: DateTime.now().millisecondsSinceEpoch,
+    screenHash: hash,
+    isSensitive: false,
+    nodes: [],
+  );
 }

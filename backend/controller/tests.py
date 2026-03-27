@@ -243,6 +243,80 @@ class SemiAgentServiceTests(SimpleTestCase):
             self.assertEqual(qwen_client.calls[0]["generation_overrides"]["json_continuation_budget"], 0)
             self.assertEqual(qwen_client.calls[1]["generation_overrides"]["json_continuation_budget"], 0)
 
+    def test_run_can_use_openai_for_reasoning_steps(self) -> None:
+        class RecordingQwenClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate(self, **kwargs) -> str:
+                self.calls += 1
+                return "{}"
+
+        class RecordingLlmProvider:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def generate_reply_with_messages(self, **kwargs):
+                self.calls.append(kwargs)
+                call_index = len(self.calls)
+                if call_index == 1:
+                    return SimpleNamespace(
+                        text='{"stage":"step_1_mcp","needs_mcps":false,"mcp_calls":[]}',
+                        source="openai_chat_completions",
+                        warnings=[],
+                    )
+                if call_index == 2:
+                    return SimpleNamespace(
+                        text=(
+                            '{"stage":"step_2_board","cycle_back_to_step_one":false,'
+                            '"memory_plan":{"default_memory_type":"memory","why":"kept"},'
+                            '"focus_object":{"name":"openai_focus","text":"OpenAI focus",'
+                            '"width":280,"height":180,"memory_type":"memory",'
+                            '"delete_after_click":false,"linked_call_ids":[],'
+                            '"result_title":"OpenAI focus","result_summary":""},'
+                            '"board_commands":[],"result_bindings":[]}'
+                        ),
+                        source="openai_chat_completions",
+                        warnings=[],
+                    )
+                return SimpleNamespace(
+                    text="Здравей, подготвих резултата.",
+                    source="openai_chat_completions",
+                    warnings=[],
+                )
+
+        class MissingTtsProvider:
+            def synthesize(self, text: str):
+                raise RuntimeError("tts unavailable")
+
+            def status(self) -> str:
+                return "unavailable: test"
+
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            qwen_client = RecordingQwenClient()
+            llm_provider = RecordingLlmProvider()
+            service = SemiAgentService(
+                board_memory=store,
+                qwen_client=qwen_client,
+                llm_provider=llm_provider,
+                tts_provider=MissingTtsProvider(),
+            )
+
+            payload = service.run(
+                prompt="show me a focused board result",
+                board_state={"board": {"width": 1000, "height": 700}, "objects": []},
+                largest_empty_space={"bbox": {"x": 0, "y": 0, "width": 1000, "height": 700}},
+                reasoning_provider="openai",
+            )
+
+            self.assertEqual(payload["reasoning_provider"], "openai")
+            self.assertEqual(qwen_client.calls, 0)
+            self.assertEqual(len(llm_provider.calls), 3)
+            self.assertFalse(llm_provider.calls[0]["include_history"])
+            self.assertFalse(llm_provider.calls[0]["store_history"])
+            self.assertEqual(payload["step_two"]["focus_object"]["name"], "openai_focus")
+
     def test_run_speech_stage_survives_missing_tts(self) -> None:
         class FakeLlmProvider:
             def generate_reply_with_messages(self, **kwargs):

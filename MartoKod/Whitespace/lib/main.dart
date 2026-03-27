@@ -22,7 +22,17 @@ class AgentBoardApp extends StatelessWidget {
       title: 'Agent Space',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        scaffoldBackgroundColor: Colors.white,
+        scaffoldBackgroundColor: _BoardPalette.appShell,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: _BoardPalette.accent,
+          brightness: Brightness.light,
+          surface: _BoardPalette.surface,
+          primary: _BoardPalette.ink,
+        ),
+        textTheme: ThemeData.light().textTheme.apply(
+          bodyColor: _BoardPalette.ink,
+          displayColor: _BoardPalette.ink,
+        ),
         useMaterial3: true,
       ),
       home: const AgentBoardScreen(),
@@ -54,6 +64,21 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   bool _voiceLoopEnabled = false;
   int _voiceLoopToken = 0;
   Future<void>? _activeSpeechPlayback;
+  Timer? _debugRefreshDebounce;
+  bool _debugPanelOpen = true;
+  bool _debugAutoApply = false;
+  String _reasoningProvider = 'qwen';
+  String _debugMemoryType = 'ram';
+  bool _debugDeleteAfterClick = false;
+  int _debugColorIndex = 0;
+  double _debugWidth = 184;
+  double _debugHeight = 164;
+  double _debugScale = 1;
+  double _debugX = 72;
+  double _debugY = 168;
+  double _debugInnerInset = 18;
+  late final TextEditingController _debugNameController;
+  late final TextEditingController _debugTextController;
 
   @override
   void initState() {
@@ -61,6 +86,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     _sceneController = SceneController();
     _backendClient = AgentBackendClient();
     _voiceBridge = createBrowserVoiceBridge();
+    _debugNameController = TextEditingController(text: 'style_studio_card');
+    _debugTextController = TextEditingController(text: 'Calm, readable memory');
     _sessionId = 'whitespace_${DateTime.now().millisecondsSinceEpoch}';
     unawaited(_hydrateBoardFromBackend());
   }
@@ -69,10 +96,13 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   void dispose() {
     _voiceLoopEnabled = false;
     _voiceLoopToken += 1;
+    _debugRefreshDebounce?.cancel();
     _voiceBridge.stopRecognition();
     _voiceBridge.stopAudio();
     _sceneController.dispose();
     _promptController.dispose();
+    _debugNameController.dispose();
+    _debugTextController.dispose();
     super.dispose();
   }
 
@@ -305,6 +335,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         largestEmptySpace: _sceneController.findLargestEmptySpaceSnapshot(),
         userId: _userId,
         sessionId: _sessionId,
+        reasoningProvider: _reasoningProvider,
       );
 
       final runId = (startPayload['run_id'] ?? '').toString();
@@ -505,6 +536,182 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     return text;
   }
 
+  Color get _selectedDebugColor =>
+      _debugObjectColors[_debugColorIndex
+          .clamp(0, _debugObjectColors.length - 1)
+          .toInt()];
+
+  Future<void> _applyDebugDraft({bool announce = true}) async {
+    final name = _debugNameController.text.trim();
+    if (name.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _statusText =
+            'Debug studio needs an object name before it can preview.';
+      });
+      return;
+    }
+
+    await _sceneController.executeCommandMap({
+      'action': 'create',
+      'name': name,
+      'text': _debugTextController.text.trim().isEmpty
+          ? name
+          : _debugTextController.text.trim(),
+      'width': _debugWidth,
+      'height': _debugHeight,
+      'x': _debugX,
+      'y': _debugY,
+      'baseScale': _debugScale,
+      'innerInset': _debugInnerInset,
+      'memoryType': _debugMemoryType,
+      'deleteAfterClick': _debugDeleteAfterClick,
+      'color': _selectedDebugColor.toARGB32(),
+    });
+
+    if (!mounted || !announce) return;
+    setState(() {
+      _statusText =
+          'Debug studio refreshed "$name" so you can inspect the new styling.';
+    });
+  }
+
+  void _scheduleDebugRefresh() {
+    if (!_debugAutoApply) return;
+    _debugRefreshDebounce?.cancel();
+    _debugRefreshDebounce = Timer(const Duration(milliseconds: 140), () {
+      unawaited(_applyDebugDraft(announce: false));
+    });
+  }
+
+  Future<void> _moveDebugObject(Size boardSize) async {
+    final name = _debugNameController.text.trim();
+    if (name.isEmpty) {
+      await _applyDebugDraft();
+      return;
+    }
+
+    if (!_sceneController.objects.containsKey(name)) {
+      await _applyDebugDraft(announce: false);
+    }
+
+    final maxX = math.max(0.0, boardSize.width - _debugWidth);
+    final maxY = math.max(0.0, boardSize.height - _debugHeight);
+    final emptyRect = _sceneController.findLargestEmptyRect();
+    double targetX;
+    double targetY;
+
+    if (emptyRect != null &&
+        emptyRect.width >= _debugWidth &&
+        emptyRect.height >= _debugHeight) {
+      targetX = emptyRect.left + ((emptyRect.width - _debugWidth) * 0.08);
+      targetY = emptyRect.top + ((emptyRect.height - _debugHeight) * 0.08);
+    } else {
+      targetX = (_debugX + boardSize.width * 0.23) % (maxX == 0 ? 1 : maxX);
+      targetY = (_debugY + boardSize.height * 0.18) % (maxY == 0 ? 1 : maxY);
+    }
+
+    targetX = targetX.clamp(0.0, maxX).toDouble();
+    targetY = targetY.clamp(0.0, maxY).toDouble();
+
+    await _sceneController.executeCommandMap({
+      'action': 'move',
+      'name': name,
+      'x': targetX,
+      'y': targetY,
+    });
+
+    if (!mounted) return;
+    setState(() {
+      _debugX = targetX;
+      _debugY = targetY;
+      _statusText = 'Debug studio moved "$name" to a new spot on the board.';
+    });
+  }
+
+  Future<void> _scaleDebugObject({required bool enlarge}) async {
+    final name = _debugNameController.text.trim();
+    if (name.isEmpty) {
+      await _applyDebugDraft();
+      return;
+    }
+
+    if (!_sceneController.objects.containsKey(name)) {
+      await _applyDebugDraft(announce: false);
+    }
+
+    await _sceneController.executeCommandMap({
+      'action': enlarge ? 'enlarge' : 'shrink',
+      'name': name,
+      'factor': enlarge ? 1.14 : 0.88,
+    });
+
+    final object = _sceneController.objects[name];
+    if (!mounted || object == null) return;
+    setState(() {
+      _debugScale = object.baseScale;
+      _statusText = enlarge
+          ? 'Debug studio enlarged "$name" for animation testing.'
+          : 'Debug studio shrank "$name" for animation testing.';
+    });
+  }
+
+  Future<void> _deleteDebugObject() async {
+    final name = _debugNameController.text.trim();
+    if (name.isEmpty) return;
+    if (!_sceneController.objects.containsKey(name)) {
+      if (!mounted) return;
+      setState(() {
+        _statusText = 'There is no "$name" object on the board to delete yet.';
+      });
+      return;
+    }
+
+    await _sceneController.executeCommandMap({
+      'action': 'delete',
+      'name': name,
+    });
+
+    if (!mounted) return;
+    setState(() {
+      _statusText = 'Debug studio triggered the delete animation for "$name".';
+    });
+  }
+
+  Future<void> _openDebugObject() async {
+    final name = _debugNameController.text.trim();
+    final object = _sceneController.objects[name];
+    if (object == null) {
+      if (!mounted) return;
+      setState(() {
+        _statusText = 'Create the debug object first, then you can open it.';
+      });
+      return;
+    }
+    await _openObjectResult(object);
+  }
+
+  void _loadDebugValuesFromObject(SceneObjectData object) {
+    setState(() {
+      _debugNameController.text = object.name;
+      _debugTextController.text = object.text;
+      _debugWidth = object.width;
+      _debugHeight = object.height;
+      _debugScale = object.baseScale;
+      _debugX = object.x;
+      _debugY = object.y;
+      _debugInnerInset = object.innerInset;
+      _debugMemoryType = object.memoryType;
+      _debugDeleteAfterClick = object.deleteAfterClick;
+      final paletteIndex = _debugObjectColors.indexWhere(
+        (color) => color.toARGB32() == object.color.toARGB32(),
+      );
+      _debugColorIndex = paletteIndex >= 0 ? paletteIndex : 0;
+      _statusText =
+          'Debug studio imported "${object.name}" so you can restyle it.';
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -514,45 +721,166 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
           builder: (context, _) {
             return LayoutBuilder(
               builder: (context, constraints) {
-                final boardSize = Size(
-                  constraints.maxWidth,
-                  constraints.maxHeight,
-                );
-                _sceneController.setBoardSize(boardSize);
+                final isCompact = constraints.maxWidth < 1100;
+                final studioWidth = _debugPanelOpen
+                    ? math.min(
+                        isCompact ? constraints.maxWidth - 32 : 360.0,
+                        360.0,
+                      )
+                    : 58.0;
+                final composerWidth = isCompact
+                    ? constraints.maxWidth - 52
+                    : math.min(
+                        560.0,
+                        math.max(
+                          320.0,
+                          constraints.maxWidth - studioWidth - 96,
+                        ),
+                      );
 
                 return Stack(
                   children: [
                     Positioned.fill(
-                      child: Container(
-                        color: Colors.white,
+                      child: DecoratedBox(
+                        decoration: const BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [
+                              Color(0xFFF6F2FF),
+                              Color(0xFFEFF8FF),
+                              Color(0xFFFFF4F8),
+                            ],
+                          ),
+                        ),
                         child: Stack(
-                          children: [
-                            Positioned.fill(
-                              child: CustomPaint(painter: GridPainter()),
+                          children: const [
+                            Positioned(
+                              top: -120,
+                              right: -80,
+                              child: _BoardBackdropOrb(
+                                diameter: 300,
+                                color: Color(0x30C6D8FF),
+                              ),
                             ),
-                            ..._sceneController.objects.values.map(
-                              (object) => BoardObjectWidget(
-                                key: ValueKey(object.name),
-                                data: object,
-                                onTap: () => _openObjectResult(object),
-                                onDeleteComplete: () => _sceneController
-                                    .finalizeDelete(object.name),
-                                onDragPositionChanged: (x, y) {
-                                  _sceneController.setObjectPositionFromDrag(
-                                    object.name,
-                                    x,
-                                    y,
-                                  );
-                                },
+                            Positioned(
+                              bottom: -160,
+                              left: -100,
+                              child: _BoardBackdropOrb(
+                                diameter: 360,
+                                color: Color(0x2FFFD3E1),
                               ),
                             ),
                           ],
                         ),
                       ),
                     ),
+                    Positioned.fill(
+                      child: Padding(
+                        padding: const EdgeInsets.all(14),
+                        child: LayoutBuilder(
+                          builder: (context, boardConstraints) {
+                            final boardSize = Size(
+                              boardConstraints.maxWidth,
+                              boardConstraints.maxHeight,
+                            );
+                            _sceneController.setBoardSize(boardSize);
+
+                            return ClipRRect(
+                              borderRadius: BorderRadius.circular(34),
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  color: _BoardPalette.boardBase,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: _BoardPalette.shadow,
+                                      blurRadius: 28,
+                                      offset: const Offset(0, 14),
+                                    ),
+                                  ],
+                                ),
+                                child: Stack(
+                                  children: [
+                                    Positioned.fill(
+                                      child: DecoratedBox(
+                                        decoration: const BoxDecoration(
+                                          gradient: LinearGradient(
+                                            begin: Alignment.topCenter,
+                                            end: Alignment.bottomCenter,
+                                            colors: [
+                                              Color(0xFFFFFFFF),
+                                              Color(0xFFF8FBFF),
+                                              Color(0xFFFFF8FB),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    Positioned.fill(
+                                      child: DecoratedBox(
+                                        decoration: BoxDecoration(
+                                          gradient: LinearGradient(
+                                            begin: Alignment.topLeft,
+                                            end: Alignment.bottomRight,
+                                            colors: [
+                                              const Color(0x14000000),
+                                              Colors.transparent,
+                                              const Color(0x12FFFFFF),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    Positioned.fill(
+                                      child: CustomPaint(
+                                        painter: GridPainter(),
+                                      ),
+                                    ),
+                                    Positioned.fill(
+                                      child: DecoratedBox(
+                                        decoration: BoxDecoration(
+                                          gradient: LinearGradient(
+                                            begin: Alignment.topCenter,
+                                            end: Alignment.bottomCenter,
+                                            colors: [
+                                              Colors.white.withValues(
+                                                alpha: 0.06,
+                                              ),
+                                              Colors.transparent,
+                                              const Color(0x0ABCCEFF),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    ..._sceneController.objects.values.map(
+                                      (object) => BoardObjectWidget(
+                                        key: ValueKey(object.name),
+                                        data: object,
+                                        onTap: () => _openObjectResult(object),
+                                        onDeleteComplete: () => _sceneController
+                                            .finalizeDelete(object.name),
+                                        onDragPositionChanged: (x, y) {
+                                          _sceneController
+                                              .setObjectPositionFromDrag(
+                                                object.name,
+                                                x,
+                                                y,
+                                              );
+                                        },
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ),
                     Positioned(
-                      top: 18,
-                      left: 18,
+                      top: 26,
+                      left: 26,
                       child: AgentResponseCard(
                         speech: _lastSpeech,
                         status: _statusText,
@@ -560,101 +888,169 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                       ),
                     ),
                     Positioned(
-                      left: 18,
-                      right: 18,
-                      bottom: 18,
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: Colors.white.withValues(alpha: 0.34),
-                                border: Border.all(
-                                  color: Colors.black.withValues(alpha: 0.18),
-                                  width: 0.7,
-                                ),
-                              ),
-                              child: TextField(
-                                enabled: !_isBusy && !_isListening,
-                                controller: _promptController,
-                                onSubmitted: (_) => _sendPrompt(),
-                                decoration: InputDecoration(
-                                  hintText: _isListening
-                                      ? 'Listening in Chrome...'
-                                      : _voiceLoopEnabled
-                                      ? 'Voice mode is on. Speak your next request...'
-                                      : 'Write prompt or use the mic...',
-                                  hintStyle: TextStyle(
-                                    color: Colors.black.withValues(alpha: 0.45),
-                                  ),
-                                  border: InputBorder.none,
-                                  isDense: true,
-                                  contentPadding: const EdgeInsets.symmetric(
-                                    horizontal: 12,
-                                    vertical: 12,
-                                  ),
-                                ),
-                              ),
-                            ),
+                      top: 26,
+                      right: 26,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: studioWidth,
+                          maxHeight: constraints.maxHeight - 52,
+                        ),
+                        child: BoardDebugStudio(
+                          isOpen: _debugPanelOpen,
+                          autoApply: _debugAutoApply,
+                          boardSize: Size(
+                            constraints.maxWidth - 28,
+                            constraints.maxHeight - 28,
                           ),
-                          const SizedBox(width: 10),
-                          GestureDetector(
-                            onTap: (_isBusy && !_voiceLoopEnabled)
-                                ? null
-                                : _toggleVoiceLoop,
-                            child: Container(
-                              width: 44,
-                              height: 44,
-                              decoration: BoxDecoration(
-                                color: (_isListening || _voiceLoopEnabled)
-                                    ? const Color(0xFFD64444)
-                                    : const Color(0xFFCB4A4A),
-                                border: Border.all(
-                                  color: Colors.black.withValues(alpha: 0.18),
-                                  width: 0.7,
+                          nameController: _debugNameController,
+                          textController: _debugTextController,
+                          selectedColorIndex: _debugColorIndex,
+                          palette: _debugObjectColors,
+                          memoryType: _debugMemoryType,
+                          deleteAfterClick: _debugDeleteAfterClick,
+                          widthValue: _debugWidth,
+                          heightValue: _debugHeight,
+                          scaleValue: _debugScale,
+                          xValue: _debugX,
+                          yValue: _debugY,
+                          insetValue: _debugInnerInset,
+                          reasoningProvider: _reasoningProvider,
+                          objectNames: _sceneController.objects.keys.toList()
+                            ..sort(),
+                          onToggleOpen: () {
+                            setState(() {
+                              _debugPanelOpen = !_debugPanelOpen;
+                            });
+                          },
+                          onToggleAutoApply: (value) {
+                            setState(() {
+                              _debugAutoApply = value;
+                            });
+                            if (value) {
+                              _scheduleDebugRefresh();
+                            }
+                          },
+                          onImportObject: (name) {
+                            final object = _sceneController.objects[name];
+                            if (object != null) {
+                              _loadDebugValuesFromObject(object);
+                            }
+                          },
+                          onColorSelected: (index) {
+                            setState(() {
+                              _debugColorIndex = index;
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onMemoryTypeChanged: (value) {
+                            setState(() {
+                              _debugMemoryType = value;
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onReasoningProviderChanged: (value) {
+                            setState(() {
+                              _reasoningProvider = value;
+                            });
+                          },
+                          onDeleteAfterClickChanged: (value) {
+                            setState(() {
+                              _debugDeleteAfterClick = value;
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onWidthChanged: (value) {
+                            setState(() {
+                              _debugWidth = value;
+                              _debugX = _debugX.clamp(
+                                0.0,
+                                math.max(
+                                  0.0,
+                                  constraints.maxWidth - 28 - value,
+                                ),
+                              );
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onHeightChanged: (value) {
+                            setState(() {
+                              _debugHeight = value;
+                              _debugY = _debugY.clamp(
+                                0.0,
+                                math.max(
+                                  0.0,
+                                  constraints.maxHeight - 28 - value,
+                                ),
+                              );
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onScaleChanged: (value) {
+                            setState(() {
+                              _debugScale = value;
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onXChanged: (value) {
+                            setState(() {
+                              _debugX = value;
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onYChanged: (value) {
+                            setState(() {
+                              _debugY = value;
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onInsetChanged: (value) {
+                            setState(() {
+                              _debugInnerInset = value;
+                            });
+                            _scheduleDebugRefresh();
+                          },
+                          onDraftChanged: _scheduleDebugRefresh,
+                          onApplyPressed: () {
+                            unawaited(_applyDebugDraft());
+                          },
+                          onMovePressed: () {
+                            unawaited(
+                              _moveDebugObject(
+                                Size(
+                                  constraints.maxWidth - 28,
+                                  constraints.maxHeight - 28,
                                 ),
                               ),
-                              child: Icon(
-                                (_isListening || _voiceLoopEnabled)
-                                    ? Icons.hearing
-                                    : Icons.mic_none,
-                                color: Colors.white,
-                                size: 18,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          GestureDetector(
-                            onTap: (_isBusy || _isListening)
-                                ? null
-                                : _sendPrompt,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 14,
-                                vertical: 12,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.black.withValues(alpha: 0.045),
-                                border: Border.all(
-                                  color: Colors.black.withValues(alpha: 0.16),
-                                  width: 0.7,
-                                ),
-                              ),
-                              child: Text(
-                                _isBusy
-                                    ? 'Running'
-                                    : _isListening
-                                    ? 'Listening'
-                                    : 'Send',
-                                style: TextStyle(
-                                  color: Colors.black.withValues(alpha: 0.70),
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
+                            );
+                          },
+                          onEnlargePressed: () {
+                            unawaited(_scaleDebugObject(enlarge: true));
+                          },
+                          onShrinkPressed: () {
+                            unawaited(_scaleDebugObject(enlarge: false));
+                          },
+                          onDeletePressed: () {
+                            unawaited(_deleteDebugObject());
+                          },
+                          onOpenPressed: () {
+                            unawaited(_openDebugObject());
+                          },
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      left: 26,
+                      bottom: 26,
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(maxWidth: composerWidth),
+                        child: _AgentComposer(
+                          promptController: _promptController,
+                          isBusy: _isBusy,
+                          isListening: _isListening,
+                          voiceLoopEnabled: _voiceLoopEnabled,
+                          onSubmit: _sendPrompt,
+                          onToggleVoiceLoop: _toggleVoiceLoop,
+                        ),
                       ),
                     ),
                   ],
@@ -683,51 +1079,876 @@ class AgentResponseCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 340),
-      child: Container(
-        padding: const EdgeInsets.all(14),
+      constraints: const BoxConstraints(maxWidth: 380),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOutCubic,
+        padding: const EdgeInsets.all(18),
         decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.88),
-          border: Border.all(color: Colors.black.withValues(alpha: 0.12), width: 0.8),
-          boxShadow: [
+          color: Colors.white.withValues(alpha: 0.78),
+          borderRadius: BorderRadius.circular(28),
+          boxShadow: const [
             BoxShadow(
-              color: Colors.black.withValues(alpha: 0.08),
-              blurRadius: 18,
-              offset: const Offset(0, 8),
+              color: _BoardPalette.shadow,
+              blurRadius: 20,
+              offset: Offset(0, 10),
             ),
           ],
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              isBusy ? 'Semi Agent Running' : 'Semi Agent',
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0.4,
-              ),
+            Row(
+              children: [
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 220),
+                  width: 10,
+                  height: 10,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isBusy
+                        ? const Color(0xFFC98E64)
+                        : const Color(0xFF96A57D),
+                    boxShadow: [
+                      BoxShadow(
+                        color:
+                            (isBusy
+                                    ? const Color(0x33C98E64)
+                                    : const Color(0x3396A57D))
+                                .withValues(alpha: 0.9),
+                        blurRadius: 12,
+                        spreadRadius: 1.4,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Text(
+                  isBusy ? 'Semi Agent Working' : 'Semi Agent',
+                  style: const TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
+            const SizedBox(height: 12),
             Text(
               speech,
               style: TextStyle(
-                color: Colors.black.withValues(alpha: 0.82),
-                fontSize: 13,
+                color: _BoardPalette.ink.withValues(alpha: 0.92),
+                fontSize: 15,
                 fontWeight: FontWeight.w600,
-                height: 1.22,
+                height: 1.35,
               ),
             ),
-            const SizedBox(height: 10),
-            Text(
-              status,
-              style: TextStyle(
-                color: Colors.black.withValues(alpha: 0.58),
-                fontSize: 11.5,
-                height: 1.2,
+            const SizedBox(height: 14),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.72),
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: Text(
+                status,
+                style: TextStyle(
+                  color: _BoardPalette.ink.withValues(alpha: 0.68),
+                  fontSize: 12.5,
+                  height: 1.35,
+                ),
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _AgentComposer extends StatelessWidget {
+  const _AgentComposer({
+    required this.promptController,
+    required this.isBusy,
+    required this.isListening,
+    required this.voiceLoopEnabled,
+    required this.onSubmit,
+    required this.onToggleVoiceLoop,
+  });
+
+  final TextEditingController promptController;
+  final bool isBusy;
+  final bool isListening;
+  final bool voiceLoopEnabled;
+  final VoidCallback onSubmit;
+  final VoidCallback onToggleVoiceLoop;
+
+  @override
+  Widget build(BuildContext context) {
+    final voiceEnabled = isListening || voiceLoopEnabled;
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.76),
+        borderRadius: BorderRadius.circular(30),
+        boxShadow: const [
+          BoxShadow(
+            color: _BoardPalette.shadow,
+            blurRadius: 18,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Container(
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.82),
+                borderRadius: BorderRadius.circular(22),
+              ),
+              child: TextField(
+                enabled: !isBusy && !isListening,
+                controller: promptController,
+                onSubmitted: (_) => onSubmit(),
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w500,
+                  height: 1.35,
+                ),
+                decoration: InputDecoration(
+                  hintText: isListening
+                      ? 'Listening in Chrome...'
+                      : voiceLoopEnabled
+                      ? 'Voice mode is active. Speak your next request...'
+                      : 'Type a prompt or use the microphone...',
+                  hintStyle: TextStyle(
+                    color: _BoardPalette.ink.withValues(alpha: 0.42),
+                    fontSize: 14,
+                  ),
+                  border: InputBorder.none,
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 18,
+                    vertical: 16,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          _ComposerButton(
+            onTap: (isBusy && !voiceLoopEnabled) ? null : onToggleVoiceLoop,
+            background: voiceEnabled
+                ? const Color(0xFFB8C0C8)
+                : Colors.white.withValues(alpha: 0.72),
+            foreground: voiceEnabled ? Colors.white : _BoardPalette.ink,
+            icon: voiceEnabled ? Icons.hearing : Icons.mic_none_rounded,
+          ),
+          const SizedBox(width: 10),
+          _ComposerButton(
+            onTap: (isBusy || isListening) ? null : onSubmit,
+            background: const Color(0xFF5A646C),
+            foreground: Colors.white,
+            label: isBusy
+                ? 'Running'
+                : isListening
+                ? 'Listening'
+                : 'Send',
+            isWide: true,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ComposerButton extends StatelessWidget {
+  const _ComposerButton({
+    this.onTap,
+    required this.background,
+    required this.foreground,
+    this.icon,
+    this.label,
+    this.isWide = false,
+  });
+
+  final VoidCallback? onTap;
+  final Color background;
+  final Color foreground;
+  final IconData? icon;
+  final String? label;
+  final bool isWide;
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = onTap == null;
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 180),
+        opacity: disabled ? 0.45 : 1,
+        child: Container(
+          width: isWide ? null : 56,
+          height: 56,
+          padding: EdgeInsets.symmetric(horizontal: isWide ? 18 : 0),
+          decoration: BoxDecoration(
+            color: background,
+            borderRadius: BorderRadius.circular(22),
+            boxShadow: [
+              BoxShadow(
+                color: background.withValues(alpha: 0.18),
+                blurRadius: 12,
+                offset: const Offset(0, 6),
+              ),
+            ],
+          ),
+          alignment: Alignment.center,
+          child: label != null
+              ? Text(
+                  label!,
+                  style: TextStyle(
+                    color: foreground,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 0.2,
+                  ),
+                )
+              : Icon(icon, color: foreground, size: 22),
+        ),
+      ),
+    );
+  }
+}
+
+class BoardDebugStudio extends StatelessWidget {
+  const BoardDebugStudio({
+    super.key,
+    required this.isOpen,
+    required this.autoApply,
+    required this.boardSize,
+    required this.nameController,
+    required this.textController,
+    required this.selectedColorIndex,
+    required this.palette,
+    required this.reasoningProvider,
+    required this.memoryType,
+    required this.deleteAfterClick,
+    required this.widthValue,
+    required this.heightValue,
+    required this.scaleValue,
+    required this.xValue,
+    required this.yValue,
+    required this.insetValue,
+    required this.objectNames,
+    required this.onToggleOpen,
+    required this.onToggleAutoApply,
+    required this.onImportObject,
+    required this.onColorSelected,
+    required this.onReasoningProviderChanged,
+    required this.onMemoryTypeChanged,
+    required this.onDeleteAfterClickChanged,
+    required this.onWidthChanged,
+    required this.onHeightChanged,
+    required this.onScaleChanged,
+    required this.onXChanged,
+    required this.onYChanged,
+    required this.onInsetChanged,
+    required this.onDraftChanged,
+    required this.onApplyPressed,
+    required this.onMovePressed,
+    required this.onEnlargePressed,
+    required this.onShrinkPressed,
+    required this.onDeletePressed,
+    required this.onOpenPressed,
+  });
+
+  final bool isOpen;
+  final bool autoApply;
+  final Size boardSize;
+  final TextEditingController nameController;
+  final TextEditingController textController;
+  final int selectedColorIndex;
+  final List<Color> palette;
+  final String reasoningProvider;
+  final String memoryType;
+  final bool deleteAfterClick;
+  final double widthValue;
+  final double heightValue;
+  final double scaleValue;
+  final double xValue;
+  final double yValue;
+  final double insetValue;
+  final List<String> objectNames;
+  final VoidCallback onToggleOpen;
+  final ValueChanged<bool> onToggleAutoApply;
+  final ValueChanged<String> onImportObject;
+  final ValueChanged<int> onColorSelected;
+  final ValueChanged<String> onReasoningProviderChanged;
+  final ValueChanged<String> onMemoryTypeChanged;
+  final ValueChanged<bool> onDeleteAfterClickChanged;
+  final ValueChanged<double> onWidthChanged;
+  final ValueChanged<double> onHeightChanged;
+  final ValueChanged<double> onScaleChanged;
+  final ValueChanged<double> onXChanged;
+  final ValueChanged<double> onYChanged;
+  final ValueChanged<double> onInsetChanged;
+  final VoidCallback onDraftChanged;
+  final VoidCallback onApplyPressed;
+  final VoidCallback onMovePressed;
+  final VoidCallback onEnlargePressed;
+  final VoidCallback onShrinkPressed;
+  final VoidCallback onDeletePressed;
+  final VoidCallback onOpenPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final maxX = math.max(0.0, boardSize.width - widthValue);
+    final maxY = math.max(0.0, boardSize.height - heightValue);
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
+      width: isOpen ? null : 58,
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.78),
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: const [
+          BoxShadow(
+            color: _BoardPalette.shadow,
+            blurRadius: 20,
+            offset: Offset(0, 10),
+          ),
+        ],
+      ),
+      child: isOpen
+          ? Padding(
+              padding: const EdgeInsets.all(18),
+              child: SingleChildScrollView(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Style Studio',
+                                style: TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                'Preview layout, motion, and agent engine without touching manual JSON.',
+                                style: TextStyle(
+                                  fontSize: 12.5,
+                                  height: 1.35,
+                                  color: _BoardPalette.mutedInk,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: onToggleOpen,
+                          icon: const Icon(Icons.close_rounded),
+                          color: _BoardPalette.ink,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    if (objectNames.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: Wrap(
+                          spacing: 10,
+                          runSpacing: 10,
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          children: [
+                            _StudioPill(
+                              label: '${objectNames.length} live objects',
+                              icon: Icons.view_in_ar_rounded,
+                            ),
+                            PopupMenuButton<String>(
+                              onSelected: onImportObject,
+                              color: _BoardPalette.surface,
+                              itemBuilder: (context) {
+                                return objectNames
+                                    .map(
+                                      (name) => PopupMenuItem<String>(
+                                        value: name,
+                                        child: Text(name),
+                                      ),
+                                    )
+                                    .toList();
+                              },
+                              child: const _StudioPill(
+                                label: 'Import existing',
+                                icon: Icons.file_download_outlined,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    _StudioLabel(label: 'Object name'),
+                    _StudioTextField(
+                      controller: nameController,
+                      onChanged: (_) => onDraftChanged(),
+                    ),
+                    const SizedBox(height: 10),
+                    _StudioLabel(label: 'Visible label'),
+                    _StudioTextField(
+                      controller: textController,
+                      onChanged: (_) => onDraftChanged(),
+                    ),
+                    const SizedBox(height: 16),
+                    const _StudioLabel(label: 'Color mood'),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        for (int index = 0; index < palette.length; index++)
+                          _StudioPaletteSwatch(
+                            color: palette[index],
+                            selected: index == selectedColorIndex,
+                            onTap: () => onColorSelected(index),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    const _StudioLabel(label: 'Reasoning engine'),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final option in const ['qwen', 'openai'])
+                          ChoiceChip(
+                            label: Text(
+                              option == 'qwen' ? 'Qwen local' : 'OpenAI',
+                            ),
+                            selected: option == reasoningProvider,
+                            onSelected: (_) =>
+                                onReasoningProviderChanged(option),
+                            selectedColor: _BoardPalette.accentSoft,
+                            backgroundColor: Colors.white.withValues(
+                              alpha: 0.72,
+                            ),
+                            labelStyle: TextStyle(
+                              color: option == reasoningProvider
+                                  ? _BoardPalette.ink
+                                  : _BoardPalette.mutedInk,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            side: BorderSide.none,
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    const _StudioLabel(label: 'Memory behavior'),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        for (final option in const ['ram', 'memory', 'instant'])
+                          ChoiceChip(
+                            label: Text(option),
+                            selected: option == memoryType,
+                            onSelected: (_) => onMemoryTypeChanged(option),
+                            selectedColor: _BoardPalette.accentSoft,
+                            backgroundColor: Colors.white.withValues(
+                              alpha: 0.72,
+                            ),
+                            labelStyle: TextStyle(
+                              color: option == memoryType
+                                  ? _BoardPalette.ink
+                                  : _BoardPalette.mutedInk,
+                              fontWeight: FontWeight.w600,
+                            ),
+                            side: BorderSide.none,
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    SwitchListTile.adaptive(
+                      value: deleteAfterClick,
+                      onChanged: onDeleteAfterClickChanged,
+                      activeThumbColor: _BoardPalette.accent,
+                      activeTrackColor: _BoardPalette.accentSoft,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text(
+                        'Delete after one tap',
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    SwitchListTile.adaptive(
+                      value: autoApply,
+                      onChanged: onToggleAutoApply,
+                      activeThumbColor: _BoardPalette.accent,
+                      activeTrackColor: _BoardPalette.accentSoft,
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text(
+                        'Auto apply edits',
+                        style: TextStyle(
+                          fontSize: 13.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    _StudioSlider(
+                      label: 'Width',
+                      value: widthValue,
+                      min: 120,
+                      max: 280,
+                      onChanged: onWidthChanged,
+                    ),
+                    _StudioSlider(
+                      label: 'Height',
+                      value: heightValue,
+                      min: 110,
+                      max: 240,
+                      onChanged: onHeightChanged,
+                    ),
+                    _StudioSlider(
+                      label: 'Scale',
+                      value: scaleValue,
+                      min: 0.7,
+                      max: 1.8,
+                      divisions: 22,
+                      precision: 2,
+                      onChanged: onScaleChanged,
+                    ),
+                    _StudioSlider(
+                      label: 'Inner inset',
+                      value: insetValue,
+                      min: 10,
+                      max: 30,
+                      onChanged: onInsetChanged,
+                    ),
+                    _StudioSlider(
+                      label: 'Horizontal position',
+                      value: xValue.clamp(0.0, maxX).toDouble(),
+                      min: 0,
+                      max: maxX == 0 ? 1 : maxX,
+                      onChanged: onXChanged,
+                    ),
+                    _StudioSlider(
+                      label: 'Vertical position',
+                      value: yValue.clamp(0.0, maxY).toDouble(),
+                      min: 0,
+                      max: maxY == 0 ? 1 : maxY,
+                      onChanged: onYChanged,
+                    ),
+                    const SizedBox(height: 8),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        _StudioActionButton(
+                          label: 'Apply card',
+                          onTap: onApplyPressed,
+                          background: _BoardPalette.ink,
+                          foreground: Colors.white,
+                        ),
+                        _StudioActionButton(
+                          label: 'Move',
+                          onTap: onMovePressed,
+                        ),
+                        _StudioActionButton(
+                          label: 'Enlarge',
+                          onTap: onEnlargePressed,
+                        ),
+                        _StudioActionButton(
+                          label: 'Shrink',
+                          onTap: onShrinkPressed,
+                        ),
+                        _StudioActionButton(
+                          label: 'Delete',
+                          onTap: onDeletePressed,
+                        ),
+                        _StudioActionButton(
+                          label: 'Open',
+                          onTap: onOpenPressed,
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            )
+          : IconButton(
+              onPressed: onToggleOpen,
+              icon: const Icon(Icons.tune_rounded),
+              color: _BoardPalette.ink,
+              tooltip: 'Open style studio',
+            ),
+    );
+  }
+}
+
+class _StudioLabel extends StatelessWidget {
+  const _StudioLabel({required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Text(
+        label,
+        style: const TextStyle(
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+          color: _BoardPalette.mutedInk,
+          letterSpacing: 0.2,
+        ),
+      ),
+    );
+  }
+}
+
+class _StudioTextField extends StatelessWidget {
+  const _StudioTextField({required this.controller, this.onChanged});
+
+  final TextEditingController controller;
+  final ValueChanged<String>? onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: controller,
+      onChanged: onChanged,
+      style: const TextStyle(fontSize: 14.5, fontWeight: FontWeight.w500),
+      decoration: InputDecoration(
+        filled: true,
+        fillColor: Colors.white.withValues(alpha: 0.76),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 14,
+          vertical: 12,
+        ),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(18),
+          borderSide: BorderSide.none,
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(18),
+          borderSide: BorderSide.none,
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(18),
+          borderSide: BorderSide.none,
+        ),
+      ),
+    );
+  }
+}
+
+class _StudioSlider extends StatelessWidget {
+  const _StudioSlider({
+    required this.label,
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.onChanged,
+    this.divisions,
+    this.precision = 0,
+  });
+
+  final String label;
+  final double value;
+  final double min;
+  final double max;
+  final ValueChanged<double> onChanged;
+  final int? divisions;
+  final int precision;
+
+  @override
+  Widget build(BuildContext context) {
+    final displayValue = precision == 0
+        ? value.round().toString()
+        : value.toStringAsFixed(precision);
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: _BoardPalette.mutedInk,
+                  ),
+                ),
+              ),
+              Text(
+                displayValue,
+                style: const TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              activeTrackColor: _BoardPalette.accent,
+              inactiveTrackColor: _BoardPalette.accentSoft,
+              thumbColor: _BoardPalette.ink,
+              overlayColor: _BoardPalette.accent.withValues(alpha: 0.14),
+            ),
+            child: Slider(
+              value: value.clamp(min, max).toDouble(),
+              min: min,
+              max: max,
+              divisions: divisions,
+              onChanged: onChanged,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StudioActionButton extends StatelessWidget {
+  const _StudioActionButton({
+    required this.label,
+    required this.onTap,
+    this.background = _BoardPalette.surface,
+    this.foreground = _BoardPalette.ink,
+  });
+
+  final String label;
+  final VoidCallback onTap;
+  final Color background;
+  final Color foreground;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: background,
+          borderRadius: BorderRadius.circular(18),
+          boxShadow: [
+            BoxShadow(
+              color: background.withValues(alpha: 0.18),
+              blurRadius: 14,
+              offset: const Offset(0, 8),
+            ),
+          ],
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: foreground,
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _StudioPaletteSwatch extends StatelessWidget {
+  const _StudioPaletteSwatch({
+    required this.color,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final Color color;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        width: 34,
+        height: 34,
+        decoration: BoxDecoration(
+          color: color,
+          shape: BoxShape.circle,
+          boxShadow: [
+            BoxShadow(
+              color: (selected ? _BoardPalette.ink : color).withValues(
+                alpha: selected ? 0.18 : 0.28,
+              ),
+              blurRadius: selected ? 18 : 14,
+              offset: const Offset(0, 8),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _StudioPill extends StatelessWidget {
+  const _StudioPill({required this.label, required this.icon});
+
+  final String label;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.70),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 16, color: _BoardPalette.mutedInk),
+          const SizedBox(width: 7),
+          Text(
+            label,
+            style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BoardBackdropOrb extends StatelessWidget {
+  const _BoardBackdropOrb({required this.diameter, required this.color});
+
+  final double diameter;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Container(
+        width: diameter,
+        height: diameter,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: RadialGradient(
+            colors: [color, color.withValues(alpha: 0.16), Colors.transparent],
+          ),
         ),
       ),
     );
@@ -815,7 +2036,8 @@ class AgentUserProfileView extends StatelessWidget {
         ? Map<String, dynamic>.from(user['match_summary'] as Map)
         : null;
     final whyTheyMatch = (matchSummary?['why_they_match'] as List?) ?? const [];
-    final sharedInterests = (matchSummary?['shared_interests'] as List?) ?? const [];
+    final sharedInterests =
+        (matchSummary?['shared_interests'] as List?) ?? const [];
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -826,15 +2048,9 @@ class AgentUserProfileView extends StatelessWidget {
           value: (user['display_name'] ?? user['username'] ?? 'Unknown user')
               .toString(),
         ),
-        _UserSectionLabel(
-          text: 'Friend status',
-          value: friendStatus,
-        ),
+        _UserSectionLabel(text: 'Friend status', value: friendStatus),
         if (description.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Description',
-            value: description,
-          ),
+          _UserSectionLabel(text: 'Description', value: description),
         if (topTraits.isNotEmpty)
           _UserSectionLabel(
             text: 'Top traits',
@@ -857,25 +2073,16 @@ class AgentUserProfileView extends StatelessWidget {
             value: whyTheyMatch.map((item) => item.toString()).join(' '),
           ),
         if (email != null && email.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Email',
-            value: email,
-          ),
+          _UserSectionLabel(text: 'Email', value: email),
         if (phoneNumber != null && phoneNumber.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Phone',
-            value: phoneNumber,
-          ),
+          _UserSectionLabel(text: 'Phone', value: phoneNumber),
       ],
     );
   }
 }
 
 class _UserSectionLabel extends StatelessWidget {
-  const _UserSectionLabel({
-    required this.text,
-    required this.value,
-  });
+  const _UserSectionLabel({required this.text, required this.value});
 
   final String text;
   final String value;
@@ -890,7 +2097,7 @@ class _UserSectionLabel extends StatelessWidget {
           Text(
             text,
             style: TextStyle(
-              color: Colors.black.withOpacity(0.58),
+              color: Colors.black.withValues(alpha: 0.58),
               fontSize: 11.5,
               fontWeight: FontWeight.w700,
               letterSpacing: 0.2,
@@ -968,6 +2175,7 @@ class AgentBackendClient {
     required Map<String, dynamic> largestEmptySpace,
     required String userId,
     required String sessionId,
+    required String reasoningProvider,
   }) {
     return _postJson('/api/agent/run/start/', {
       'prompt': prompt,
@@ -975,6 +2183,7 @@ class AgentBackendClient {
       'largest_empty_space': largestEmptySpace,
       'user_id': userId,
       'session_id': sessionId,
+      'reasoning_provider': reasoningProvider,
     });
   }
 
@@ -1048,14 +2257,14 @@ class SceneController extends ChangeNotifier {
   Map<String, SceneObjectData> get objects => _objects;
 
   static const List<Color> _mainColors = [
-    Color(0xFFD36E6A),
-    Color(0xFF6E9ACC),
-    Color(0xFF6EA886),
-    Color(0xFFD59667),
-    Color(0xFF9A77B7),
-    Color(0xFFD7C46C),
-    Color(0xFF5FA39A),
-    Color(0xFFC4749C),
+    Color(0xFFFFC8D9),
+    Color(0xFFC8E6FF),
+    Color(0xFFD5CCFF),
+    Color(0xFFFFDEB8),
+    Color(0xFFCCF1D6),
+    Color(0xFFFFF0A8),
+    Color(0xFFFFD3F3),
+    Color(0xFFCFE7DD),
   ];
 
   void setBoardSize(Size size) {
@@ -1428,7 +2637,7 @@ class SceneController extends ChangeNotifier {
   Color _randomMainColor() {
     return _desaturateColor(
       _mainColors[_random.nextInt(_mainColors.length)],
-      0.20,
+      0.08,
     );
   }
 
@@ -1440,7 +2649,7 @@ class SceneController extends ChangeNotifier {
     if (value == null) return null;
 
     if (value is int) {
-      return _desaturateColor(Color(value), 0.20);
+      return _desaturateColor(Color(value), 0.08);
     }
 
     final raw = value.toString().trim();
@@ -1449,14 +2658,14 @@ class SceneController extends ChangeNotifier {
     final lower = raw.toLowerCase();
 
     const byName = <String, Color>{
-      'red': Color(0xFFD36E6A),
-      'blue': Color(0xFF6E9ACC),
-      'green': Color(0xFF6EA886),
-      'orange': Color(0xFFD59667),
-      'purple': Color(0xFF9A77B7),
-      'yellow': Color(0xFFD7C46C),
-      'teal': Color(0xFF5FA39A),
-      'pink': Color(0xFFC4749C),
+      'red': Color(0xFFFFC8D9),
+      'blue': Color(0xFFC8E6FF),
+      'green': Color(0xFFCCF1D6),
+      'orange': Color(0xFFFFDEB8),
+      'purple': Color(0xFFD5CCFF),
+      'yellow': Color(0xFFFFF0A8),
+      'teal': Color(0xFFBFEDE8),
+      'pink': Color(0xFFFFD3F3),
       'random': Color(0x00000000),
     };
 
@@ -1465,7 +2674,7 @@ class SceneController extends ChangeNotifier {
     }
 
     if (byName.containsKey(lower)) {
-      return _desaturateColor(byName[lower]!, 0.20);
+      return _desaturateColor(byName[lower]!, 0.08);
     }
 
     final clean = lower.replaceFirst('#', '');
@@ -1473,7 +2682,7 @@ class SceneController extends ChangeNotifier {
     final parsed = int.tryParse(hex, radix: 16);
     if (parsed == null) return null;
 
-    return _desaturateColor(Color(parsed), 0.20);
+    return _desaturateColor(Color(parsed), 0.08);
   }
 
   double _readDouble(dynamic value, {required double fallback}) {
@@ -1647,6 +2856,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
   double _scaleAnimTarget = 1;
   bool _deletionDone = false;
   bool _isDragging = false;
+  bool _isHovered = false;
   Offset? _dragPointerOffset;
 
   @override
@@ -1661,7 +2871,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     _moveController =
         AnimationController(
           vsync: this,
-          duration: const Duration(milliseconds: 900),
+          duration: const Duration(milliseconds: 760),
         )..addListener(() {
           setState(() {});
         });
@@ -1669,7 +2879,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     _scaleController =
         AnimationController(
           vsync: this,
-          duration: const Duration(milliseconds: 220),
+          duration: const Duration(milliseconds: 300),
         )..addListener(() {
           setState(() {});
         });
@@ -1677,7 +2887,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     _deleteController =
         AnimationController(
             vsync: this,
-            duration: const Duration(milliseconds: 380),
+            duration: const Duration(milliseconds: 520),
           )
           ..addListener(() {
             setState(() {});
@@ -1735,8 +2945,8 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     _toPosition = to;
 
     final distance = (to - from).distance;
-    final milliseconds = (distance / 430.0 * 1000)
-        .clamp(420.0, 2600.0)
+    final milliseconds = (distance / 520.0 * 1000)
+        .clamp(320.0, 1600.0)
         .toDouble()
         .round();
 
@@ -1773,8 +2983,8 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     final livePosition = Offset.lerp(_fromPosition, _toPosition, moveT)!;
 
     final motionEffect = _isDragging ? 1.0 : _motionEffectProgress(moveRaw);
-    final motionScale = lerpDouble(1.0, 0.8, motionEffect)!;
-    final saturation = lerpDouble(1.0, 0.0, motionEffect)!;
+    final moveCompression = lerpDouble(1.0, 0.88, motionEffect)!;
+    final moveDarkenAmount = lerpDouble(0.0, 0.18, motionEffect)!;
 
     final scaleValue = _scaleController.isAnimating
         ? _computeScalePopValue(
@@ -1784,174 +2994,106 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
           )
         : _displayScale;
 
-    final opacity = _computeDeleteOpacity(_deleteController.value);
-    final visualScale = scaleValue * motionScale;
-
-    final innerSize = math
-        .max(
-          12.0,
-          math.min(widget.data.width, widget.data.height) -
-              (widget.data.innerInset * 2),
-        )
-        .toDouble();
-
-    final textBoxWidth = (innerSize * 0.72)
-        .clamp(36.0, widget.data.width)
-        .toDouble();
+    final deleteProgress = _deleteController.value;
+    final opacity = _computeDeleteOpacity(deleteProgress);
+    final deleteScale = _computeDeleteScale(deleteProgress);
+    final hoverScale = _isHovered && !_isDragging ? 1.018 : 1.0;
+    final visualScale = scaleValue * moveCompression * deleteScale * hoverScale;
+    final verticalLift = _isDragging
+        ? -4.0
+        : (_isHovered ? -2.0 : -1.5 * motionEffect);
+    final deleteLift = lerpDouble(
+      0.0,
+      -18.0,
+      Curves.easeOut.transform(deleteProgress),
+    )!;
+    final borderRadius = BorderRadius.circular(
+      math.min(widget.data.width, widget.data.height) * 0.08,
+    );
+    final baseColor = _darken(widget.data.color, moveDarkenAmount);
 
     return Positioned(
       left: livePosition.dx,
       top: livePosition.dy,
-      child: Transform.scale(
-        scale: visualScale,
-        alignment: Alignment.center,
-        child: Opacity(
-          opacity: opacity,
-          child: ColorFiltered(
-            colorFilter: ColorFilter.matrix(_saturationMatrix(saturation)),
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: widget.onTap,
-              onPanStart: (details) {
-                final box = context.findRenderObject() as RenderBox?;
-                if (box == null) return;
-                _dragPointerOffset = box.globalToLocal(details.globalPosition);
-                setState(() {
-                  _isDragging = true;
-                });
-              },
-              onPanUpdate: (details) {
-                final board = context
-                    .findAncestorRenderObjectOfType<RenderBox>();
-                final dragOffset = _dragPointerOffset;
-                if (board == null || dragOffset == null) return;
-                final localOnBoard = board.globalToLocal(
-                  details.globalPosition,
-                );
-                widget.onDragPositionChanged(
-                  localOnBoard.dx - dragOffset.dx,
-                  localOnBoard.dy - dragOffset.dy,
-                );
-              },
-              onPanEnd: (_) {
-                setState(() {
-                  _isDragging = false;
-                  _dragPointerOffset = null;
-                });
-              },
-              onPanCancel: () {
-                setState(() {
-                  _isDragging = false;
-                  _dragPointerOffset = null;
-                });
-              },
-              child: SizedBox(
-                width: widget.data.width,
-                height: widget.data.height,
-                child: Stack(
-                  children: [
-                    Container(
-                      width: widget.data.width,
-                      height: widget.data.height,
+      child: Transform.translate(
+        offset: Offset(0, verticalLift + deleteLift),
+        child: Transform.scale(
+          scale: visualScale,
+          alignment: Alignment.center,
+          child: Opacity(
+            opacity: opacity,
+            child: RepaintBoundary(
+              child: MouseRegion(
+                cursor: SystemMouseCursors.click,
+                onEnter: (_) {
+                  if (_isDragging) return;
+                  setState(() {
+                    _isHovered = true;
+                  });
+                },
+                onExit: (_) {
+                  setState(() {
+                    _isHovered = false;
+                  });
+                },
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: widget.onTap,
+                  onPanStart: (details) {
+                    final box = context.findRenderObject() as RenderBox?;
+                    if (box == null) return;
+                    _dragPointerOffset = box.globalToLocal(
+                      details.globalPosition,
+                    );
+                    setState(() {
+                      _isDragging = true;
+                    });
+                  },
+                  onPanUpdate: (details) {
+                    final board = context
+                        .findAncestorRenderObjectOfType<RenderBox>();
+                    final dragOffset = _dragPointerOffset;
+                    if (board == null || dragOffset == null) return;
+                    final localOnBoard = board.globalToLocal(
+                      details.globalPosition,
+                    );
+                    widget.onDragPositionChanged(
+                      localOnBoard.dx - dragOffset.dx,
+                      localOnBoard.dy - dragOffset.dy,
+                    );
+                  },
+                  onPanEnd: (_) {
+                    setState(() {
+                      _isDragging = false;
+                      _dragPointerOffset = null;
+                    });
+                  },
+                  onPanCancel: () {
+                    setState(() {
+                      _isDragging = false;
+                      _dragPointerOffset = null;
+                    });
+                  },
+                  child: SizedBox(
+                    width: widget.data.width,
+                    height: widget.data.height,
+                    child: DecoratedBox(
                       decoration: BoxDecoration(
-                        color: widget.data.color,
-                        border: Border.all(
-                          color: Colors.black.withValues(alpha: 0.08),
-                          width: 1,
-                        ),
+                        color: baseColor,
+                        borderRadius: borderRadius,
                         boxShadow: [
                           BoxShadow(
-                            color: widget.data.color.withValues(alpha: 0.22),
-                            blurRadius: 22,
-                            spreadRadius: 2,
-                            offset: const Offset(0, 6),
-                          ),
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            blurRadius: 24,
-                            spreadRadius: 0.5,
+                            color: baseColor.withValues(alpha: 0.20),
+                            blurRadius: _isHovered ? 16 : 12,
                             offset: const Offset(0, 8),
                           ),
                         ],
                       ),
-                    ),
-                    Positioned.fill(
                       child: Center(
-                        child: Container(
-                          width: innerSize,
-                          height: innerSize,
-                          decoration: BoxDecoration(
-                            color: _darken(widget.data.color, 0.22),
-                          ),
-                        ),
-                      ),
-                    ),
-                    Positioned(
-                      top: 8,
-                      left: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.10),
-                          border: Border.all(
-                            color: Colors.black.withValues(alpha: 0.14),
-                            width: 0.7,
-                          ),
-                        ),
-                        child: Text(
-                          widget.data.memoryType,
-                          style: TextStyle(
-                            color: _bestTextColor(widget.data.color),
-                            fontSize: 10,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 0.3,
-                          ),
-                        ),
-                      ),
-                    ),
-                    if (widget.data.deleteAfterClick)
-                      Positioned(
-                        top: 8,
-                        right: 8,
-                        child: Container(
+                        child: Padding(
                           padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 4,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.16),
-                            border: Border.all(
-                              color: Colors.black.withValues(alpha: 0.18),
-                              width: 0.7,
-                            ),
-                          ),
-                          child: Text(
-                            'one tap',
-                            style: TextStyle(
-                              color: _bestTextColor(widget.data.color),
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ),
-                    Positioned.fill(
-                      child: Center(
-                        child: Container(
-                          width: textBoxWidth,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.10),
-                            border: Border.all(
-                              color: Colors.black.withValues(alpha: 0.18),
-                              width: 0.7,
-                            ),
+                            horizontal: 16,
+                            vertical: 12,
                           ),
                           child: Text(
                             widget.data.text,
@@ -1959,23 +3101,26 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                             maxLines: 3,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
-                              color: _bestTextColor(widget.data.color),
+                              color: _BoardPalette.ink,
                               fontWeight: FontWeight.w700,
-                              fontSize: math.max(
-                                12,
-                                math.min(
-                                      widget.data.width,
-                                      widget.data.height,
-                                    ) *
-                                    0.14,
-                              ),
-                              height: 1.05,
+                              fontSize: math
+                                  .max(
+                                    14,
+                                    math.min(
+                                          widget.data.width,
+                                          widget.data.height,
+                                        ) *
+                                        0.125,
+                                  )
+                                  .clamp(14.0, 22.0)
+                                  .toDouble(),
+                              height: 1.18,
                             ),
                           ),
                         ),
                       ),
                     ),
-                  ],
+                  ),
                 ),
               ),
             ),
@@ -2005,7 +3150,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
 
   double _computeScalePopValue(double t, double fromScale, double targetScale) {
     final direction = targetScale >= fromScale ? 1.0 : -1.0;
-    final overshootMagnitude = (targetScale - fromScale).abs() * 0.18 + 0.015;
+    final overshootMagnitude = (targetScale - fromScale).abs() * 0.11 + 0.012;
     final overshoot = targetScale + (direction * overshootMagnitude);
 
     if (t < 0.68) {
@@ -2022,13 +3167,26 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
       return 1;
     }
 
-    if (t <= 0.78) {
-      final local = Curves.easeOut.transform(t / 0.78);
-      return lerpDouble(1.0, 0.15, local)!;
+    if (t <= 0.55) {
+      return 1;
     }
 
-    final local = Curves.easeInOut.transform((t - 0.78) / 0.22);
-    return lerpDouble(0.15, 0.0, local)!;
+    final local = Curves.easeInOutCubicEmphasized.transform((t - 0.55) / 0.45);
+    return lerpDouble(1.0, 0.0, local)!;
+  }
+
+  double _computeDeleteScale(double t) {
+    if (!_deleteController.isAnimating && !widget.data.isDeleting) {
+      return 1;
+    }
+
+    if (t <= 0.36) {
+      final local = Curves.easeOutCubic.transform(t / 0.36);
+      return lerpDouble(1.0, 1.09, local)!;
+    }
+
+    final local = Curves.easeInOutCubicEmphasized.transform((t - 0.36) / 0.64);
+    return lerpDouble(1.09, 0.68, local)!;
   }
 }
 
@@ -2118,17 +3276,17 @@ class GridPainter extends CustomPainter {
 
     return [
       _GridLayer(
-        color: const Color(0x14000000),
+        color: const Color(0x326D727A),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),
       _GridLayer(
-        color: const Color(0x22000000),
+        color: const Color(0x38636870),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),
       _GridLayer(
-        color: const Color(0x30000000),
+        color: const Color(0x426A7078),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),
@@ -2137,20 +3295,83 @@ class GridPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    for (final layer in _layers) {
+    for (int layerIndex = 0; layerIndex < _layers.length; layerIndex++) {
+      final layer = _layers[layerIndex];
       final paint = Paint()
         ..color = layer.color
-        ..strokeWidth = 0.8;
+        ..strokeWidth = 0.95;
 
       for (final x in layer.verticalPositions) {
         if (x < 0 || x > size.width) continue;
-        canvas.drawLine(Offset(x, 0), Offset(x, size.height), paint);
+        _drawBrokenVerticalLine(
+          canvas,
+          paint,
+          x: x,
+          height: size.height,
+          seed: layerIndex * 100000 + x.round(),
+        );
       }
 
       for (final y in layer.horizontalPositions) {
         if (y < 0 || y > size.height) continue;
-        canvas.drawLine(Offset(0, y), Offset(size.width, y), paint);
+        _drawBrokenHorizontalLine(
+          canvas,
+          paint,
+          y: y,
+          width: size.width,
+          seed: layerIndex * 100000 + y.round() + 50000,
+        );
       }
+    }
+  }
+
+  void _drawBrokenVerticalLine(
+    Canvas canvas,
+    Paint paint, {
+    required double x,
+    required double height,
+    required int seed,
+  }) {
+    final random = math.Random(seed);
+    if (random.nextDouble() < 0.34) {
+      canvas.drawLine(Offset(x, 0), Offset(x, height), paint);
+      return;
+    }
+
+    double cursor = 0;
+    while (cursor < height) {
+      final segmentLength = 110 + random.nextInt(180).toDouble();
+      final segmentEnd = math.min(height, cursor + segmentLength);
+      canvas.drawLine(Offset(x, cursor), Offset(x, segmentEnd), paint);
+      if (segmentEnd >= height) {
+        break;
+      }
+      cursor = segmentEnd + 14 + random.nextInt(54).toDouble();
+    }
+  }
+
+  void _drawBrokenHorizontalLine(
+    Canvas canvas,
+    Paint paint, {
+    required double y,
+    required double width,
+    required int seed,
+  }) {
+    final random = math.Random(seed);
+    if (random.nextDouble() < 0.34) {
+      canvas.drawLine(Offset(0, y), Offset(width, y), paint);
+      return;
+    }
+
+    double cursor = 0;
+    while (cursor < width) {
+      final segmentLength = 110 + random.nextInt(180).toDouble();
+      final segmentEnd = math.min(width, cursor + segmentLength);
+      canvas.drawLine(Offset(cursor, y), Offset(segmentEnd, y), paint);
+      if (segmentEnd >= width) {
+        break;
+      }
+      cursor = segmentEnd + 14 + random.nextInt(54).toDouble();
     }
   }
 
@@ -2170,37 +3391,6 @@ class _GridLayer {
   final List<double> horizontalPositions;
 }
 
-List<double> _saturationMatrix(double saturation) {
-  final s = saturation.clamp(0.0, 1.0).toDouble();
-  final inv = 1 - s;
-  const rw = 0.2126;
-  const gw = 0.7152;
-  const bw = 0.0722;
-
-  return <double>[
-    inv * rw + s,
-    inv * gw,
-    inv * bw,
-    0,
-    0,
-    inv * rw,
-    inv * gw + s,
-    inv * bw,
-    0,
-    0,
-    inv * rw,
-    inv * gw,
-    inv * bw + s,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-  ];
-}
-
 Color _desaturateColor(Color color, double amount) {
   final hsl = HSLColor.fromColor(color);
   final next = hsl.withSaturation(
@@ -2217,6 +3407,22 @@ Color _darken(Color color, double amount) {
   return next.toColor();
 }
 
-Color _bestTextColor(Color color) {
-  return color.computeLuminance() > 0.58 ? Colors.black : Colors.white;
+class _BoardPalette {
+  static const Color appShell = Color(0xFFF4F3FF);
+  static const Color boardBase = Color(0xFFFCFCFF);
+  static const Color surface = Color(0xFFEFF4FF);
+  static const Color accentSoft = Color(0xFFD8E4FF);
+  static const Color accent = Color(0xFF7E93D6);
+  static const Color ink = Color(0xFF435065);
+  static const Color mutedInk = Color(0xFF71809A);
+  static const Color shadow = Color(0x142B3470);
 }
+
+const List<Color> _debugObjectColors = [
+  Color(0xFFFFC8D9),
+  Color(0xFFC8E6FF),
+  Color(0xFFD5CCFF),
+  Color(0xFFFFDEB8),
+  Color(0xFFCCF1D6),
+  Color(0xFFFFF0A8),
+];

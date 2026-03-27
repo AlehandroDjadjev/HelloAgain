@@ -22,6 +22,7 @@ abstract class AndroidControlApi {
 
   // ── App inspection ────────────────────────────────────────────────────────
 
+  Future<List<String>> listLaunchablePackages();
   Future<bool> isPackageInstalled(String packageName);
   Future<ActionResult> launchApp(String packageName);
 
@@ -51,4 +52,9 @@ abstract class AndroidControlApi {
   );
   Future<ActionResult> goBack();
   Future<ActionResult> goHome();
+
+  /// Capture a JPEG screenshot of the default display and return it as a
+  /// base64-encoded string. Returns null on API < 30, timeout, or failure.
+  Future<String?> takeScreenshot();
+  Future<String?> getLastScreenshotError();
 }

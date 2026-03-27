@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from django.conf import settings
 from django.db import transaction
 
 from apps.agent_core.enums import ActionSensitivity, ActionType
@@ -104,12 +105,38 @@ class PolicyEnforcer:
         user_policy=None,                   # UserAutomationPolicy | None
         session=None,                        # AgentSession | None (for DB logging)
     ) -> PolicyResult:
+        if getattr(settings, "AGENT_UNSAFE_AUTOMATION_MODE", False):
+            decisions = [
+                PolicyDecision(
+                    rule_name="unsafe_mode.override",
+                    decision="allow",
+                    reason="Unsafe automation mode bypassed plan policy enforcement.",
+                )
+            ]
+            _persist_decisions(decisions, plan, session)
+            return PolicyResult(
+                approved=True,
+                modified_plan=plan,
+                blocked_reason=None,
+                policy_decisions=decisions,
+                is_modified=False,
+            )
+
         decisions: list[PolicyDecision] = []
 
         # ── Load system policy overrides from DB if an admin has set them ────
         sys_cfg = _load_system_config()
 
-        allowed_packages = sys_cfg.get("allowed_packages") or list(SYSTEM_ALLOWED_PACKAGES)
+        configured_packages = set(sys_cfg.get("allowed_packages") or [])
+        session_packages = set(getattr(session, "supported_packages", None) or [])
+        if session_packages:
+            allowed_packages = list(
+                session_packages & configured_packages
+                if configured_packages
+                else session_packages
+            )
+        else:
+            allowed_packages = list(configured_packages or SYSTEM_ALLOWED_PACKAGES)
         blocked_goals    = set(sys_cfg.get("blocked_goals")    or SYSTEM_BLOCKED_GOALS)
         blocked_kw       = list(sys_cfg.get("blocked_keywords") or SYSTEM_BLOCKED_KEYWORDS)
         max_length       = sys_cfg.get("max_plan_length") or SYSTEM_MAX_PLAN_LENGTH
@@ -378,6 +405,24 @@ class PolicyEnforcer:
         screen_state: dict | None = None,
         session=None,      # AgentSession | None
     ) -> StepPolicyResult:
+        if getattr(settings, "AGENT_UNSAFE_AUTOMATION_MODE", False):
+            decisions = [
+                PolicyDecision(
+                    rule_name="unsafe_mode.override",
+                    decision="allow",
+                    reason="Unsafe automation mode bypassed step policy enforcement.",
+                    action_type=str(getattr(step, "action_type", "") or ""),
+                )
+            ]
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=True,
+                requires_confirmation=False,
+                blocked_reason=None,
+                modified_sensitivity=None,
+            )
+
         decisions: list[PolicyDecision] = []
         action_type = str(getattr(step, "action_type", "") or "")
         params = getattr(step, "params", {}) or {}
@@ -386,7 +431,16 @@ class PolicyEnforcer:
         modified_sensitivity: str | None = None
 
         sys_cfg = _load_system_config()
-        allowed_packages = set(sys_cfg.get("allowed_packages") or SYSTEM_ALLOWED_PACKAGES)
+        configured_packages = set(sys_cfg.get("allowed_packages") or [])
+        session_packages = set(getattr(session, "supported_packages", None) or [])
+        if session_packages:
+            allowed_packages = (
+                session_packages & configured_packages
+                if configured_packages
+                else session_packages
+            )
+        else:
+            allowed_packages = set(configured_packages or SYSTEM_ALLOWED_PACKAGES)
         system_keywords = list(sys_cfg.get("blocked_keywords") or SYSTEM_BLOCKED_KEYWORDS)
         goal_lower = (session_goal or "").lower()
         user_keywords = list(getattr(user_policy, "blocked_keywords", None) or [])

@@ -30,8 +30,10 @@ _RECENT_HISTORY_WINDOW = 5
 class _NodeView:
     ref: str
     raw: dict
+    order: int
     depth: int
     relevance: int
+    parent_ref: str | None
     child_refs: tuple[str, ...]
 
 
@@ -47,7 +49,10 @@ def format_screen_for_llm(
     into ``screen_header`` and ``screen_tree``.
     """
     header = _build_header(screen_state)
-    if screen_state.get("is_sensitive"):
+    if (
+        screen_state.get("is_sensitive")
+        and not getattr(settings, "AGENT_UNSAFE_AUTOMATION_MODE", False)
+    ):
         return f"{header}\n{SENSITIVE_SENTINEL}"
 
     nodes = screen_state.get("nodes") or []
@@ -61,11 +66,13 @@ def format_screen_for_llm(
         ref: _NodeView(
             ref=ref,
             raw=node,
+            order=idx,
             depth=depths.get(ref, 0),
             relevance=_score_node(node),
+            parent_ref=_text_value(node, "parent_ref") or None,
             child_refs=tuple(_child_refs(node)),
         )
-        for ref, node in node_map.items()
+        for idx, (ref, node) in enumerate(node_map.items())
     }
 
     budget = _effective_screen_budget(token_budget)
@@ -180,6 +187,8 @@ def _score_node(node: dict) -> int:
     score = 0
     if _is_true(node, "clickable") or _is_true(node, "editable"):
         score += 3
+    if _is_true(node, "scrollable") or _is_true(node, "long_clickable"):
+        score += 1
     if _text_value(node, "text") or _text_value(node, "content_desc"):
         score += 2
     if _text_value(node, "view_id"):
@@ -249,7 +258,7 @@ def _render_screen(
                     walk(child_ref, visible_depth)
             return
 
-        line = f"{'  ' * visible_depth}{_format_node_line(view)}"
+        line = f"{'  ' * visible_depth}{_format_node_line(view, views)}"
         if not append_line(line):
             return
 
@@ -283,58 +292,25 @@ def _dedupe_child_refs(
     child_refs: tuple[str, ...],
     views: dict[str, _NodeView],
 ) -> list[str | tuple[str, str]]:
-    if len(child_refs) <= 5:
-        return list(child_refs)
-
-    deduped: list[str | tuple[str, str]] = []
-    i = 0
-    while i < len(child_refs):
-        ref = child_refs[i]
-        view = views.get(ref)
-        if view is None:
-            deduped.append(ref)
-            i += 1
-            continue
-
-        signature = _sibling_signature(view)
-        run: list[str] = [ref]
-        j = i + 1
-        while j < len(child_refs):
-            next_ref = child_refs[j]
-            next_view = views.get(next_ref)
-            if next_view is None or _sibling_signature(next_view) != signature:
-                break
-            run.append(next_ref)
-            j += 1
-
-        if len(run) > 5:
-            deduped.extend(run[:3])
-            class_name = _short_class_name(_text_value(view.raw, "class_name") or "item")
-            deduped.append(("marker", f"[... {len(run) - 3} more {class_name} items]"))
-        else:
-            deduped.extend(run)
-        i = j
-    return deduped
+    # Return every child ref unconditionally.  List items (chat rows, contacts,
+    # search results, etc.) are never collapsed — the model must see all of them
+    # to pick the correct one.
+    return list(child_refs)
 
 
-def _sibling_signature(view: _NodeView) -> tuple:
-    raw = view.raw
-    return (
-        _short_class_name(_text_value(raw, "class_name") or ""),
-        bool(_text_value(raw, "text")),
-        bool(_text_value(raw, "content_desc")),
-        _is_true(raw, "clickable"),
-        _is_true(raw, "editable"),
-        min(len(view.child_refs), 3),
-    )
 
-
-def _format_node_line(view: _NodeView) -> str:
+def _format_node_line(view: _NodeView, views: dict[str, _NodeView]) -> str:
     node = view.raw
     parts = [f"[{view.ref}]", _short_class_name(_text_value(node, "class_name") or "View")]
     text = _truncate_inline(_text_value(node, "text"), 48)
     content_desc = _truncate_inline(_text_value(node, "content_desc"), 48)
     view_id = _truncate_inline(_text_value(node, "view_id"), 36)
+    descendant_label = _truncate_inline(_best_inherited_label(view, views), 48)
+    kind = _infer_node_kind(view, views, descendant_label)
+    actions = _action_hints(node)
+    region = _region_hint(view, views)
+    index_in_parent = _int_value(node, "index_in_parent")
+    child_count = _int_value(node, "child_count")
 
     if text:
         parts.append(f"\"{text}\"")
@@ -342,16 +318,182 @@ def _format_node_line(view: _NodeView) -> str:
         parts.append(f"contentDesc='{content_desc}'")
     if view_id:
         parts.append(f"id={view_id}")
-    if _is_true(node, "clickable"):
-        parts.append("clickable")
-    if _is_true(node, "editable"):
-        parts.append("editable")
-    if _is_true(node, "focused"):
-        parts.append("focused")
-    if not _is_true(node, "enabled", default=True):
-        parts.append("disabled")
+    if kind:
+        parts.append(f"kind={kind}")
+    if descendant_label and _is_true(node, "clickable") and not text and not content_desc:
+        parts.append(f"label='{descendant_label}'")
+    if view.parent_ref:
+        parts.append(f"parent={view.parent_ref}")
+        parts.append(f"idx={index_in_parent}")
+    if child_count > 0 and _is_true(node, "clickable"):
+        parts.append(f"children={child_count}")
+    if actions:
+        parts.append(f"actions={','.join(actions)}")
+    if region:
+        parts.append(f"region={region}")
+    parts.append(f"clickable={str(_is_true(node, 'clickable')).lower()}")
+    if _is_true(node, "long_clickable"):
+        parts.append("longClickable=true")
+    if _is_true(node, "scrollable"):
+        parts.append("scrollable=true")
+    parts.append(f"editable={str(_is_true(node, 'editable')).lower()}")
+    parts.append(f"focused={str(_is_true(node, 'focused')).lower()}")
+    parts.append(f"enabled={str(_is_true(node, 'enabled', default=True)).lower()}")
+    if _is_true(node, "selected"):
+        parts.append("selected=true")
+    if _is_true(node, "checkable"):
+        parts.append("checkable=true")
+    if _is_true(node, "checked"):
+        parts.append("checked=true")
     parts.append(f"depth={view.depth}")
     return " ".join(parts)
+
+
+def _infer_node_kind(view: _NodeView, views: dict[str, _NodeView], descendant_label: str) -> str:
+    node = view.raw
+    class_name = _short_class_name(_text_value(node, "class_name") or "View")
+    class_lower = class_name.lower()
+    view_id = _text_value(node, "view_id").lower()
+
+    if "toolbar" in view_id:
+        return "toolbar"
+    if _is_true(node, "editable") or "edittext" in class_lower or "autocomplete" in class_lower:
+        return "input"
+    if _is_true(node, "scrollable") or any(
+        name in class_lower for name in ("recyclerview", "listview", "scrollview", "viewpager")
+    ):
+        return "list"
+    if _is_true(node, "checkable") or any(
+        name in class_lower for name in ("checkbox", "switch", "radiobutton", "togglebutton")
+    ):
+        return "toggle"
+    if "imagebutton" in class_lower or ("imageview" in class_lower and _is_true(node, "clickable")):
+        return "icon_button"
+    if "button" in class_lower:
+        return "button"
+    if "textview" in class_lower:
+        if "title" in view_id:
+            return "title"
+        if "subtitle" in view_id:
+            return "subtitle"
+        if "header" in view_id:
+            return "header"
+        return "text"
+    if descendant_label and _is_true(node, "clickable"):
+        return "row"
+    if _is_true(node, "clickable"):
+        return "control"
+    return "container"
+
+
+def _action_hints(node: dict) -> list[str]:
+    hints: list[str] = []
+    if _is_true(node, "clickable"):
+        hints.append("tap")
+    if _is_true(node, "long_clickable"):
+        hints.append("long_press")
+    if _is_true(node, "editable"):
+        hints.extend(["focus", "type"])
+    if _is_true(node, "checkable"):
+        hints.append("toggle")
+    if _is_true(node, "scrollable"):
+        hints.append("scroll")
+    return hints
+
+
+def _region_hint(view: _NodeView, views: dict[str, _NodeView]) -> str:
+    bounds = view.raw.get("bounds") or {}
+    if not isinstance(bounds, dict):
+        return ""
+
+    bottom = int(bounds.get("bottom", 0))
+    top = int(bounds.get("top", 0))
+    max_bottom = max(
+        int((candidate.raw.get("bounds") or {}).get("bottom", 0))
+        for candidate in views.values()
+    )
+    if max_bottom <= 0:
+        return ""
+
+    center = (top + bottom) / 2
+    if center <= max_bottom / 3:
+        return "top"
+    if center >= (max_bottom * 2) / 3:
+        return "bottom"
+    return "middle"
+
+
+def _first_descendant_label(view: _NodeView, views: dict[str, _NodeView]) -> str:
+    queue: deque[str] = deque(view.child_refs)
+    seen: set[str] = set()
+    best_content_desc = ""
+
+    while queue:
+        ref = queue.popleft()
+        if ref in seen:
+            continue
+        seen.add(ref)
+
+        child = views.get(ref)
+        if child is None:
+            continue
+
+        text = _text_value(child.raw, "text")
+        if text:
+            return text
+
+        if not best_content_desc:
+            content_desc = _text_value(child.raw, "content_desc")
+            if content_desc:
+                best_content_desc = content_desc
+
+        queue.extend(child.child_refs)
+
+    return best_content_desc
+
+
+def _best_inherited_label(view: _NodeView, views: dict[str, _NodeView]) -> str:
+    descendant_label = _first_descendant_label(view, views)
+    if descendant_label:
+        return descendant_label
+    return _flat_sibling_label(view, views)
+
+
+def _flat_sibling_label(view: _NodeView, views: dict[str, _NodeView]) -> str:
+    ordered = sorted(views.values(), key=lambda item: item.order)
+    max_lookahead = 5
+    fallback = ""
+
+    for candidate in ordered[view.order + 1:view.order + 1 + max_lookahead]:
+        raw = candidate.raw
+        if _is_true(raw, "clickable"):
+            break
+        text = _text_value(raw, "text")
+        if text:
+            if not fallback:
+                fallback = text
+            if not _looks_like_section_header(text):
+                return text
+        content_desc = _text_value(raw, "content_desc")
+        if content_desc:
+            if not fallback:
+                fallback = content_desc
+            if not _looks_like_section_header(content_desc):
+                return content_desc
+
+    return fallback
+
+
+def _looks_like_section_header(value: str) -> bool:
+    normalized = " ".join(str(value or "").split())
+    if not normalized:
+        return False
+
+    if any(ch.isdigit() for ch in normalized):
+        return False
+
+    letters = "".join(ch for ch in normalized if ch.isalpha())
+    return bool(letters) and letters.isupper() and 3 <= len(letters) <= 24
 
 
 def _summarize_older_steps(steps: list[dict]) -> str:
@@ -471,6 +613,7 @@ def _text_value(node: dict, snake_name: str) -> str:
         "class_name": "className",
         "content_desc": "contentDesc",
         "view_id": "viewId",
+        "parent_ref": "parentRef",
     }.get(snake_name)
     value = node.get(snake_name)
     if not value and camel:
@@ -478,11 +621,29 @@ def _text_value(node: dict, snake_name: str) -> str:
     return str(value or "")
 
 
+def _int_value(node: dict, snake_name: str) -> int:
+    camel = {
+        "index_in_parent": "indexInParent",
+        "child_count": "childCount",
+    }.get(snake_name)
+    value = node.get(snake_name)
+    if value is None and camel:
+        value = node.get(camel)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _is_true(node: dict, snake_name: str, default: bool = False) -> bool:
     camel = {
         "content_desc": "contentDesc",
         "view_id": "viewId",
         "class_name": "className",
+        "parent_ref": "parentRef",
+        "long_clickable": "longClickable",
+        "index_in_parent": "indexInParent",
+        "child_count": "childCount",
     }.get(snake_name, snake_name)
     if snake_name in node:
         return bool(node.get(snake_name))

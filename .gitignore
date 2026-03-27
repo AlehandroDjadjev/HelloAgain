@@ -111,7 +111,13 @@ coverage/
 app.*.symbols
 
 venv/
-.env/
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+backend/sqlite_export.json
+.env.example
 
 # Exceptions to above rules.
 !**/ios/**/default.mode1v3

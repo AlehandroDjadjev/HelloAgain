@@ -86,4 +86,12 @@ interface DeviceControlGateway {
 
     fun goBack(): ActionResultDto
     fun goHome(): ActionResultDto
+
+    /**
+     * Capture a JPEG screenshot of the default display.
+     * Returns null on API < 30 or if the capture times out / fails.
+     * The bytes are JPEG-compressed at quality 65 (~120 KB for 1080p).
+     */
+    fun takeScreenshot(): ByteArray?
+    fun getLastScreenshotError(): String?
 }

@@ -6,10 +6,10 @@ import 'dart:typed_data';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:record/record.dart';
 
 import 'src/api/voice_gateway_client.dart';
+import 'src/config/backend_base_url.dart';
 
 class VoiceLabScreen extends StatefulWidget {
   const VoiceLabScreen({super.key});
@@ -70,13 +70,7 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
   }
 
   String _resolveBaseUrl() {
-    try {
-      final configured = dotenv.get('API_BASE_URL');
-      if (configured.trim().isNotEmpty) {
-        return configured.trim();
-      }
-    } catch (_) {}
-    return kIsWeb ? 'http://localhost:8000' : 'http://10.0.2.2:8000';
+    return resolveBackendBaseUrl();
   }
 
   Future<void> _initialize() async {

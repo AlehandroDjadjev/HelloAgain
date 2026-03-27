@@ -12,7 +12,7 @@ class VoiceGatewayClient {
   final String _base;
 
   Future<VoiceGatewayHealth> getHealth() async {
-    final data = await _get('/api/voice-gateway/health/');
+    final data = await _get('/api/voice/health/');
     return VoiceGatewayHealth.fromJson(data);
   }
 
@@ -23,10 +23,7 @@ class VoiceGatewayClient {
     String sessionId = 'voice-lab-session',
   }) async {
     final request =
-        http.MultipartRequest(
-            'POST',
-            Uri.parse('$_base/api/voice-gateway/transcribe/'),
-          )
+        http.MultipartRequest('POST', Uri.parse('$_base/api/voice/transcribe/'))
           ..fields['user_id'] = userId
           ..fields['session_id'] = sessionId;
 
@@ -67,7 +64,7 @@ class VoiceGatewayClient {
       final request =
           http.MultipartRequest(
               'POST',
-              Uri.parse('$_base/api/voice-gateway/conversation/'),
+              Uri.parse('$_base/api/voice/conversation/'),
             )
             ..fields['user_id'] = userId
             ..fields['session_id'] = sessionId;
@@ -90,7 +87,7 @@ class VoiceGatewayClient {
       final response = await http.Response.fromStream(streamed);
       data = _decode(response);
     } else {
-      data = await _post('/api/voice-gateway/conversation/', {
+      data = await _post('/api/voice/conversation/', {
         'user_id': userId,
         'session_id': sessionId,
         'message': trimmedMessage,
@@ -122,7 +119,7 @@ class VoiceGatewayClient {
     String userId = 'flutter-voice-lab',
     String sessionId = 'voice-lab-session',
   }) async {
-    final data = await _post('/api/voice-gateway/speak/', {
+    final data = await _post('/api/voice/speak/', {
       'user_id': userId,
       'session_id': sessionId,
       'text': text,

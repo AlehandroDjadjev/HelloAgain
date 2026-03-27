@@ -3,11 +3,12 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
+
+import 'src/config/backend_base_url.dart';
 
 const _kBackground = Color(0xFFF8FAFC);
 const _kCard = Colors.white;
@@ -42,14 +43,13 @@ class MeetupScreen extends StatefulWidget {
 }
 
 class _MeetupScreenState extends State<MeetupScreen> {
-  final FlutterLocalNotificationsPlugin _notificationsPlugin =
-      FlutterLocalNotificationsPlugin();
-  final Set<Marker> _markers = {};
-
   GoogleMapController? _mapController;
   Map<String, dynamic>? _bestMatch;
   bool _isLoading = false;
   String? _errorMessage;
+  final Set<Marker> _markers = {};
+  final FlutterLocalNotificationsPlugin _notificationsPlugin =
+      FlutterLocalNotificationsPlugin();
 
   @override
   void initState() {
@@ -58,33 +58,27 @@ class _MeetupScreenState extends State<MeetupScreen> {
   }
 
   String _backendBaseUrl() {
-    final configured = dotenv.env['API_BASE_URL']?.trim();
-    if (configured != null && configured.isNotEmpty) {
-      return configured;
-    }
-    if (kIsWeb) {
-      return 'http://localhost:8000';
-    }
-    return defaultTargetPlatform == TargetPlatform.android
-        ? 'http://10.0.2.2:8000'
-        : 'http://localhost:8000';
+    return resolveBackendBaseUrl();
   }
 
   Future<void> _initNotifications() async {
     if (kIsWeb) return;
 
-    const androidSettings = AndroidInitializationSettings(
+    const initializationSettingsAndroid = AndroidInitializationSettings(
       '@mipmap/ic_launcher',
     );
-    const settings = InitializationSettings(android: androidSettings);
-    await _notificationsPlugin.initialize(settings: settings);
+    const initializationSettings = InitializationSettings(
+      android: initializationSettingsAndroid,
+    );
 
-    final androidPlugin = _notificationsPlugin
+    await _notificationsPlugin.initialize(settings: initializationSettings);
+
+    final androidImpl = _notificationsPlugin
         .resolvePlatformSpecificImplementation<
           AndroidFlutterLocalNotificationsPlugin
         >();
-    await androidPlugin?.requestNotificationsPermission();
-    await androidPlugin?.requestExactAlarmsPermission();
+    await androidImpl?.requestNotificationsPermission();
+    await androidImpl?.requestExactAlarmsPermission();
   }
 
   Future<void> fetchRecommendation() async {
@@ -107,41 +101,38 @@ class _MeetupScreenState extends State<MeetupScreen> {
         }),
       );
 
-      if (response.statusCode != 200) {
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body) as Map<String, dynamic>;
+        final match = data['best_match'] as Map<String, dynamic>?;
+        setState(() {
+          _bestMatch = match;
+          _isLoading = false;
+          _updateMarkers();
+        });
+        if (match != null && _mapController != null) {
+          await _mapController!.animateCamera(
+            CameraUpdate.newLatLngZoom(
+              LatLng(
+                (match['place_lat'] as num).toDouble(),
+                (match['place_lng'] as num).toDouble(),
+              ),
+              15.5,
+            ),
+          );
+        }
+      } else {
         final body = jsonDecode(response.body);
-        final apiError = body is Map<String, dynamic>
-            ? body['error'] as String?
-            : null;
+        final apiError =
+            body is Map<String, dynamic> ? body['error'] as String? : null;
         setState(() {
           _errorMessage =
               apiError ?? 'Could not find a suitable meeting place.';
           _isLoading = false;
         });
-        return;
-      }
-
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      final bestMatch = data['best_match'] as Map<String, dynamic>?;
-      setState(() {
-        _bestMatch = bestMatch;
-        _isLoading = false;
-        _updateMarkers();
-      });
-
-      if (_bestMatch != null && _mapController != null) {
-        await _mapController!.animateCamera(
-          CameraUpdate.newLatLngZoom(
-            LatLng(
-              (_bestMatch!['place_lat'] as num).toDouble(),
-              (_bestMatch!['place_lng'] as num).toDouble(),
-            ),
-            15.5,
-          ),
-        );
       }
     } catch (_) {
       setState(() {
-        _errorMessage = 'Could not connect to the meetup service.';
+        _errorMessage = 'Няма връзка със сървъра.';
         _isLoading = false;
       });
     }
@@ -161,9 +152,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
         ),
       );
 
-    if (_bestMatch == null) {
-      return;
-    }
+    if (_bestMatch == null) return;
 
     _markers.add(
       Marker(
@@ -187,34 +176,29 @@ class _MeetupScreenState extends State<MeetupScreen> {
       initialTime: TimeOfDay.now(),
       builder: (context, child) {
         return Theme(
-          data: Theme.of(
-            context,
-          ).copyWith(colorScheme: const ColorScheme.light(primary: _kAccent)),
+          data: Theme.of(context).copyWith(
+            colorScheme: const ColorScheme.light(primary: _kAccent),
+          ),
           child: child!,
         );
       },
     );
 
-    if (selectedTime == null) {
-      return;
-    }
+    if (selectedTime == null) return;
 
     await _scheduleNotification(selectedTime);
-    if (!mounted) {
-      return;
-    }
-
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text('Reminder saved for ${selectedTime.format(context)}.'),
+        content: Text(
+          'Напомнянето е запазено за ${selectedTime.format(context)}!',
+        ),
       ),
     );
   }
 
   Future<void> _scheduleNotification(TimeOfDay time) async {
-    if (kIsWeb || _bestMatch == null) {
-      return;
-    }
+    if (kIsWeb || _bestMatch == null) return;
 
     final now = DateTime.now();
     var scheduled = DateTime(
@@ -224,6 +208,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
       time.hour,
       time.minute,
     );
+
     if (scheduled.isBefore(now)) {
       scheduled = scheduled.add(const Duration(days: 1));
     }
@@ -235,22 +220,23 @@ class _MeetupScreenState extends State<MeetupScreen> {
       importance: Importance.max,
       priority: Priority.high,
     );
+    const platformDetails = NotificationDetails(android: androidDetails);
 
-    final timeLabel =
-        '${scheduled.hour.toString().padLeft(2, '0')}:${scheduled.minute.toString().padLeft(2, '0')}';
-
+    final meetStartStr =
+        '${scheduled.hour.toString().padLeft(2, '0')}:'
+        '${scheduled.minute.toString().padLeft(2, '0')}';
     await _notificationsPlugin.show(
       id: 0,
-      title: 'Meetup reminder',
+      title: 'Срещата наближава!',
       body:
-          'You have a meetup at ${_bestMatch!['place_name']} around $timeLabel.',
-      notificationDetails: const NotificationDetails(android: androidDetails),
+          'Имате среща в ${_bestMatch!['place_name']} след 30 минути (в $meetStartStr).',
+      notificationDetails: platformDetails,
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final initialPosition = LatLng(
+    final initialPos = LatLng(
       widget.userPosition.latitude,
       widget.userPosition.longitude,
     );
@@ -269,7 +255,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
             flex: 5,
             child: GoogleMap(
               initialCameraPosition: CameraPosition(
-                target: initialPosition,
+                target: initialPos,
                 zoom: 14,
               ),
               markers: _markers,
@@ -278,7 +264,9 @@ class _MeetupScreenState extends State<MeetupScreen> {
               zoomControlsEnabled: false,
               mapToolbarEnabled: false,
               style: _kMapStyle,
-              onMapCreated: (controller) => _mapController = controller,
+              onMapCreated: (controller) {
+                _mapController = controller;
+              },
             ),
           ),
           Container(
@@ -331,6 +319,41 @@ class _MeetupScreenState extends State<MeetupScreen> {
                     ),
                   ),
                   const SizedBox(height: 12),
+                  Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 10,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFEFF6FF),
+                        borderRadius: BorderRadius.circular(50),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(
+                            Icons.schedule_rounded,
+                            color: _kAccent,
+                            size: 20,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            _bestMatch!['recommended_time']
+                                .toString()
+                                .split(' ')
+                                .last,
+                            style: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w700,
+                              color: _kAccent,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
                   TextButton.icon(
                     onPressed: _showReminderDialog,
                     icon: const Icon(Icons.alarm_add, color: _kAccent),

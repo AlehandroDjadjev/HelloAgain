@@ -1,9 +1,11 @@
 """Django settings for HelloAgain backend."""
 
 import os
+import sqlite3
 from pathlib import Path
 
 from dotenv import load_dotenv
+from django.db.backends.signals import connection_created
 
 # Load .env so os.environ values are available below.
 load_dotenv()
@@ -24,9 +26,37 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "True") == "True"
 ALLOWED_HOSTS = ["*"] if DEBUG else [
     host for host in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if host
 ]
+AGENT_UNSAFE_AUTOMATION_MODE = (
+    os.environ.get("AGENT_UNSAFE_AUTOMATION_MODE", "False").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+INSTALLED_APPS = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+    "rest_framework",
+    "corsheaders",
+    "voice_gateway",
+    "meetup",
+    "apps.accounts",
+    "apps.agent_core",
+    "apps.agent_sessions",
+    "apps.agent_plans",
+    "apps.agent_policy",
+    "apps.agent_executors",
+    "apps.device_bridge",
+    "apps.audit_log",
+    "recommendations",
+]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
+    "core.middleware.ApiJsonErrorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -93,17 +123,56 @@ TEMPLATES = [
 WSGI_APPLICATION = "core.wsgi.application"
 
 # Database
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-        "OPTIONS": {
-            "timeout": int(os.environ.get("SQLITE_TIMEOUT", "20")),
-        },
-    }
-}
+_USE_SQLITE_ENV = os.environ.get("USE_SQLITE")
+_POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD")
 
-# ── Cache (Redis) ─────────────────────────────────────────────────────────────
+if _USE_SQLITE_ENV is None:
+    # Local dev should default to SQLite unless Postgres was explicitly configured.
+    USE_SQLITE = not bool(_POSTGRES_PASSWORD)
+else:
+    USE_SQLITE = _USE_SQLITE_ENV.strip().lower() in {"1", "true", "yes", "on"}
+
+if USE_SQLITE:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+            "OPTIONS": {
+                "timeout": int(os.environ.get("SQLITE_TIMEOUT", "20")),
+            },
+        }
+    }
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.environ.get("POSTGRES_DB", "app_db"),
+            "USER": os.environ.get("POSTGRES_USER", "app_user"),
+            "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "set_in_env"),
+            "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
+            "PORT": int(os.environ.get("POSTGRES_PORT", "5432")),
+            "CONN_MAX_AGE": int(os.environ.get("POSTGRES_CONN_MAX_AGE", "60")),
+        }
+    }
+
+
+def _configure_sqlite_connection(sender, connection, **kwargs):
+    if connection.vendor != "sqlite":
+        return
+    try:
+        cursor = connection.connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.execute(
+            f"PRAGMA busy_timeout={int(os.environ.get('SQLITE_BUSY_TIMEOUT_MS', '30000'))};"
+        )
+        cursor.close()
+    except sqlite3.Error:
+        pass
+
+
+connection_created.connect(_configure_sqlite_connection)
+
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 CACHES = {
@@ -118,18 +187,17 @@ CACHES = {
 }
 
 if os.environ.get("REDIS_URL"):
+    redis_options = {"CLIENT_CLASS": "django_redis.client.DefaultClient"}
     CACHES = {
         "default": {
             "BACKEND": "django_redis.cache.RedisCache",
             "LOCATION": REDIS_URL,
-            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
-            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+            "OPTIONS": redis_options,
         },
         "sessions": {
             "BACKEND": "django_redis.cache.RedisCache",
             "LOCATION": REDIS_URL,
-            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
-            "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
+            "OPTIONS": redis_options,
         },
     }
 
@@ -150,10 +218,8 @@ REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": ["rest_framework.permissions.AllowAny"],
 }
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
 CORS_ALLOW_ALL_ORIGINS = True
 
-# Password validation
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
@@ -161,7 +227,6 @@ AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
 
-# i18n
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_I18N = True
@@ -170,40 +235,22 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# ── LLM configuration ─────────────────────────────────────────────────────────
+# LLM configuration
 #
-# Default provider: transformers (Qwen/Qwen3-14B loaded locally).
-# Switch provider by setting LLM_PROVIDER env var — no code changes needed:
-#
-#   transformers  local HuggingFace model (default)
-#                 Requires: pip install transformers torch accelerate
-#                 Optional 4-bit quant: pip install bitsandbytes
-#                 First run downloads ~28 GB from HuggingFace Hub.
-#
-#   ollama        local Ollama server  (no API key, fast iteration)
-#                 Start with: ollama run qwen2.5:14b
-#
-#   groq          Groq cloud inference (fastest, free tier available)
-#                 Set LLM_API_KEY to your key from console.groq.com
-#
-#   openai        OpenAI or any OpenAI-compatible endpoint (LM Studio, vLLM…)
-#                 Set LLM_API_KEY + optionally LLM_BASE_URL
-#
-# Quick-start examples:
-#   python manage.py runserver                                         # transformers, downloads on first use
-#   LLM_PROVIDER=ollama python manage.py runserver                     # needs: ollama run qwen2.5:14b
-#   LLM_PROVIDER=groq LLM_API_KEY=gsk_xxx python manage.py runserver
+# Default provider: transformers.
+# Switch provider by setting LLM_PROVIDER env var with no code changes.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "transformers")
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen3-14B")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
 
-LLM_PROVIDER  = os.environ.get("LLM_PROVIDER",  "transformers")
-LLM_MODEL     = os.environ.get("LLM_MODEL",     "Qwen/Qwen3-14B")
-LLM_API_KEY   = os.environ.get("LLM_API_KEY",   "")
-LLM_BASE_URL  = os.environ.get("LLM_BASE_URL",  "")   # empty → use provider default
-LLM_TIMEOUT   = int(os.environ.get("LLM_TIMEOUT", "60"))  # 60s for local model generation
 LOCAL_LLM_PROVIDER = os.environ.get("LOCAL_LLM_PROVIDER", "transformers")
 LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen3-14B")
 LOCAL_LLM_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "")
 LOCAL_LLM_BASE_URL = os.environ.get("LOCAL_LLM_BASE_URL", "")
 LOCAL_LLM_TIMEOUT = int(os.environ.get("LOCAL_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+
 OPENAI_LLM_MODEL = os.environ.get("OPENAI_LLM_MODEL", "gpt-5-mini")
 OPENAI_LLM_API_KEY = os.environ.get(
     "OPENAI_LLM_API_KEY",
@@ -214,12 +261,16 @@ OPENAI_LLM_BASE_URL = os.environ.get(
     os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 )
 OPENAI_LLM_TIMEOUT = int(os.environ.get("OPENAI_LLM_TIMEOUT", str(LLM_TIMEOUT)))
-LLM_TOKEN_BUDGET_SYSTEM_PROMPT = int(os.environ.get("LLM_TOKEN_BUDGET_SYSTEM_PROMPT", "2000"))
-LLM_TOKEN_BUDGET_SCREEN_STATE  = int(os.environ.get("LLM_TOKEN_BUDGET_SCREEN_STATE", "6000"))
-LLM_TOKEN_BUDGET_HISTORY       = int(os.environ.get("LLM_TOKEN_BUDGET_HISTORY", "2000"))
-LLM_TOKEN_BUDGET_RESPONSE      = int(os.environ.get("LLM_TOKEN_BUDGET_RESPONSE", "500"))
-LLM_MAX_CONTEXT                = int(os.environ.get("LLM_MAX_CONTEXT", "12000"))
 
+LLM_TOKEN_BUDGET_SYSTEM_PROMPT = int(
+    os.environ.get("LLM_TOKEN_BUDGET_SYSTEM_PROMPT", "2000")
+)
+LLM_TOKEN_BUDGET_SCREEN_STATE = int(
+    os.environ.get("LLM_TOKEN_BUDGET_SCREEN_STATE", "6000")
+)
+LLM_TOKEN_BUDGET_HISTORY = int(os.environ.get("LLM_TOKEN_BUDGET_HISTORY", "2000"))
+LLM_TOKEN_BUDGET_RESPONSE = int(os.environ.get("LLM_TOKEN_BUDGET_RESPONSE", "500"))
+LLM_MAX_CONTEXT = int(os.environ.get("LLM_MAX_CONTEXT", "12000"))
 # ── Logging ───────────────────────────────────────────────────────────────────
 CORS_ALLOW_ALL_ORIGINS = True
 

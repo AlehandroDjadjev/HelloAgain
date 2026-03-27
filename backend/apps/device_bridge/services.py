@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
+from django.core.cache import cache
 from django.db import transaction
 
 from apps.agent_core.enums import ActionResultStatus
@@ -118,19 +119,28 @@ class DeviceBridgeService:
                     "error_detail": error_detail,
                 },
             )
-            if status in (
-                ActionResultStatus.ABORTED.value,
-                ActionResultStatus.FAILURE.value,
-            ):
-                SessionService.transition(session, SessionStatus.FAILED)
-                AuditService.record(
-                    session=session,
-                    event_type=AuditEventType.SESSION_ABORTED,
-                    actor=AuditActor.SYSTEM,
-                    payload={"reason": status, "step_id": step_id},
-                )
+            # Session lifecycle decisions (abort, retry, continue) belong
+            # exclusively to ExecutionService.decide_after_result, which runs
+            # after this call and applies nuanced LLM-mode / plan-mode logic.
+            # record_action_result must not kill the session here.
 
         return event
+
+
+_SCREENSHOT_TTL = 30  # seconds — long enough for the next /next-step/ call
+
+
+def store_screenshot(session_id: str, screenshot_b64: str) -> None:
+    """Cache a failure screenshot keyed by session; expires after 30 s."""
+    cache.set(f"screenshot:{session_id}", screenshot_b64, timeout=_SCREENSHOT_TTL)
+
+
+def pop_screenshot(session_id: str) -> Optional[str]:
+    """Consume and return the cached screenshot, or None if absent/expired."""
+    val = cache.get(f"screenshot:{session_id}")
+    if val:
+        cache.delete(f"screenshot:{session_id}")
+    return val
 
 
 def _coerce_text(value: object) -> str:

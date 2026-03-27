@@ -9,10 +9,9 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from threading import Lock
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from .custom_mcp_registry import CustomMcpRegistry
-from .graph_service import GraphService
 from .llm_parser import QwenPromptParser
 from .qwen_worker_client import QwenWorkerClient
 from .semi_agent_prompts import (
@@ -21,6 +20,9 @@ from .semi_agent_prompts import (
 )
 from .whiteboard_memory import WhiteboardMemoryStore
 from voice_gateway.services.providers import OpenAILLMProvider, PiperTTSProvider
+
+if TYPE_CHECKING:
+    from .graph_service import GraphService
 
 
 class SemiAgentService:
@@ -40,11 +42,12 @@ class SemiAgentService:
     FOCUS_TITLE_MAX_CHARS = 42
     FOCUS_OBJECT_NAME_MAX_CHARS = 64
     USER_OBJECT_TAG = "type:user"
+    SUPPORTED_REASONING_PROVIDERS = {"qwen", "openai"}
 
     def __init__(
         self,
         *,
-        graph_service: GraphService | None = None,
+        graph_service: "GraphService" | None = None,
         qwen_client: QwenWorkerClient | None = None,
         registry: CustomMcpRegistry | None = None,
         board_memory: WhiteboardMemoryStore | None = None,
@@ -52,7 +55,7 @@ class SemiAgentService:
         tts_provider: PiperTTSProvider | None = None,
         connections_service: Any | None = None,
     ) -> None:
-        self.graph_service = graph_service or GraphService()
+        self.graph_service = graph_service
         self.qwen_client = qwen_client or QwenWorkerClient()
         self.registry = registry or CustomMcpRegistry()
         self.board_memory = board_memory or WhiteboardMemoryStore()
@@ -66,6 +69,13 @@ class SemiAgentService:
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
+
+    def _get_graph_service(self) -> "GraphService":
+        if self.graph_service is None:
+            from .graph_service import GraphService
+
+            self.graph_service = GraphService()
+        return self.graph_service
 
     def get_registry_payload(self, *, base_url: str = "") -> Dict[str, Any]:
         return self.registry.load_registry(base_url=base_url)
@@ -87,12 +97,15 @@ class SemiAgentService:
         largest_empty_space: Dict[str, Any] | None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
+        reasoning_provider: str = "qwen",
     ) -> Dict[str, Any]:
         context = self._prepare_run_context(
             prompt=prompt,
             board_state=board_state,
             largest_empty_space=largest_empty_space,
             user_id=user_id,
+            session_id=session_id,
+            reasoning_provider=reasoning_provider,
         )
         speech_future = self._executor.submit(
             self._run_speech_stage,
@@ -112,10 +125,13 @@ class SemiAgentService:
             chain_history=context["chain_history"],
             registry_payload=context["mcp_registry"],
             user_id=user_id,
+            session_id=session_id,
+            reasoning_provider=context["reasoning_provider"],
         )
         speech_payload = speech_future.result()
         return {
             **board_payload,
+            "reasoning_provider": context["reasoning_provider"],
             "speech_response": self._clean_text(speech_payload.get("assistant_text")),
             "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
             "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
@@ -131,6 +147,7 @@ class SemiAgentService:
         largest_empty_space: Dict[str, Any] | None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
+        reasoning_provider: str = "qwen",
     ) -> Dict[str, Any]:
         self._prune_run_jobs()
         context = self._prepare_run_context(
@@ -138,6 +155,8 @@ class SemiAgentService:
             board_state=board_state,
             largest_empty_space=largest_empty_space,
             user_id=user_id,
+            session_id=session_id,
+            reasoning_provider=reasoning_provider,
         )
         run_id = f"run_{uuid.uuid4().hex}"
         speech_future = self._executor.submit(
@@ -159,11 +178,14 @@ class SemiAgentService:
             chain_history=context["chain_history"],
             registry_payload=context["mcp_registry"],
             user_id=user_id,
+            session_id=session_id,
+            reasoning_provider=context["reasoning_provider"],
         )
         with self._run_jobs_lock:
             self._run_jobs[run_id] = {
                 "created_at": time.time(),
                 "prompt": context["prompt"],
+                "reasoning_provider": context["reasoning_provider"],
                 "speech_future": speech_future,
                 "whitespace_future": whitespace_future,
             }
@@ -171,6 +193,7 @@ class SemiAgentService:
             "ok": True,
             "run_id": run_id,
             "prompt": context["prompt"],
+            "reasoning_provider": context["reasoning_provider"],
             "step_one": context["step_one"],
             "mcp_results": context["mcp_results"],
             "speech_status": "running",
@@ -198,10 +221,15 @@ class SemiAgentService:
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
         user_id: str,
+        session_id: str,
+        reasoning_provider: str,
     ) -> Dict[str, Any]:
         clean_prompt = self._clean_text(prompt)
         if not clean_prompt:
             raise ValueError("prompt required")
+        normalized_reasoning_provider = self._normalize_reasoning_provider(
+            reasoning_provider,
+        )
 
         normalized_board_state = self.board_memory.normalize_board_state(board_state)
         empty_space_payload = (
@@ -221,6 +249,9 @@ class SemiAgentService:
             ),
             user_prompt=clean_prompt,
             default_payload=self._default_step_one_plan(clean_prompt),
+            reasoning_provider=normalized_reasoning_provider,
+            user_id=user_id,
+            session_id=session_id,
         )
         step_one = self._normalize_step_one_plan(step_one_raw, clean_prompt)
         chain_history.append({"stage": "step_1_mcp", "payload": step_one})
@@ -240,6 +271,7 @@ class SemiAgentService:
             "largest_empty_space": empty_space_payload,
             "chain_history": chain_history,
             "mcp_registry": registry_payload,
+            "reasoning_provider": normalized_reasoning_provider,
             "step_one": step_one,
             "mcp_results": mcp_results,
         }
@@ -255,6 +287,8 @@ class SemiAgentService:
         chain_history: List[Dict[str, Any]],
         registry_payload: Dict[str, Any],
         user_id: str,
+        session_id: str,
+        reasoning_provider: str,
     ) -> Dict[str, Any]:
         step_two, final_mcp_results = self._run_step_two_loop(
             prompt=clean_prompt,
@@ -264,6 +298,8 @@ class SemiAgentService:
             mcp_results=mcp_results,
             chain_history=chain_history,
             user_id=user_id,
+            session_id=session_id,
+            reasoning_provider=reasoning_provider,
         )
 
         final_board_commands = step_two.get("board_commands", [])
@@ -285,6 +321,7 @@ class SemiAgentService:
             "status": "completed",
             "prompt": clean_prompt,
             "mcp_registry": registry_payload,
+            "reasoning_provider": reasoning_provider,
             "step_one": step_one,
             "mcp_results": final_mcp_results,
             "step_two": step_two,
@@ -466,6 +503,7 @@ class SemiAgentService:
                 "kind": kind,
                 "status": "running",
                 "prompt": job.get("prompt", ""),
+                "reasoning_provider": job.get("reasoning_provider", "qwen"),
             }
 
         try:
@@ -482,6 +520,7 @@ class SemiAgentService:
         return {
             "run_id": run_id,
             "kind": kind,
+            "reasoning_provider": job.get("reasoning_provider", "qwen"),
             **payload,
         }
 
@@ -602,6 +641,8 @@ class SemiAgentService:
         mcp_results: List[Dict[str, Any]],
         chain_history: List[Dict[str, Any]],
         user_id: str,
+        session_id: str,
+        reasoning_provider: str,
     ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         current_results = list(mcp_results)
         current_history = list(chain_history)
@@ -618,6 +659,9 @@ class SemiAgentService:
                 ),
                 user_prompt=prompt,
                 default_payload=step_two,
+                reasoning_provider=reasoning_provider,
+                user_id=user_id,
+                session_id=session_id,
             )
             step_two = self._normalize_step_two_plan(
                 step_two_raw,
@@ -1462,19 +1506,49 @@ class SemiAgentService:
             if self._clean_text(item.get("call_id"))
         ]
 
-    def _generate_json(self, *, system_prompt: str, user_prompt: str, default_payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _generate_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        default_payload: Dict[str, Any],
+        reasoning_provider: str = "qwen",
+        user_id: str = "anonymous",
+        session_id: str = "default_session",
+    ) -> Dict[str, Any]:
+        normalized_provider = self._normalize_reasoning_provider(reasoning_provider)
         try:
-            raw = self.qwen_client.generate(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                generation_overrides={
-                    "max_new_tokens": self.BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS,
-                    "json_continuation_budget": self.BOARD_PIPELINE_JSON_CONTINUATION_BUDGET,
-                },
-            )
+            if normalized_provider == "openai":
+                llm_result = self.llm_provider.generate_reply_with_messages(
+                    system_prompt=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                    session_id=f"{self._clean_text(session_id) or 'default_session'}_planner",
+                    user_id=self._clean_text(user_id) or "anonymous",
+                    include_history=False,
+                    store_history=False,
+                )
+                raw = llm_result.text
+            else:
+                raw = self.qwen_client.generate(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    generation_overrides={
+                        "max_new_tokens": self.BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS,
+                        "json_continuation_budget": self.BOARD_PIPELINE_JSON_CONTINUATION_BUDGET,
+                    },
+                )
             return QwenPromptParser._extract_json(raw)
         except Exception:
             return deepcopy(default_payload)
+
+    def _normalize_reasoning_provider(self, value: Any) -> str:
+        normalized = self._clean_text(value).lower() or "qwen"
+        if normalized not in self.SUPPORTED_REASONING_PROVIDERS:
+            raise ValueError(
+                f"Unsupported reasoning_provider '{value}'. "
+                f"Supported: {', '.join(sorted(self.SUPPORTED_REASONING_PROVIDERS))}."
+            )
+        return normalized
 
     def _generate_text(self, *, system_prompt: str, user_prompt: str, fallback: str) -> str:
         try:
