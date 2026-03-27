@@ -35,144 +35,371 @@
 <body>
   <script>
     window.helloAgainVoice = (() => {
-      let activeRecognition = null;
       let activeAudio = null;
+      let activeCapture = null;
 
-      function getRecognitionConstructor() {
-        return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+      const captureConfig = {
+        startThreshold: 0.07,
+        stopThreshold: 0.03,
+        speechFramesToStart: 4,
+        silenceMsToStop: 900,
+        minSpeechMs: 650,
+        startupTimeoutMs: 10000,
+      };
+
+      const captureState = {
+        mediaStream: null,
+        mediaRecorder: null,
+        audioContext: null,
+        analyser: null,
+        sourceNode: null,
+        frameData: null,
+        chunks: [],
+        recording: false,
+        recordingStartedAt: 0,
+        silenceStartedAt: null,
+        speechFrameCount: 0,
+        rafId: null,
+        pendingMimeType: '',
+      };
+
+      function getAudioContextConstructor() {
+        return window.AudioContext || window.webkitAudioContext || null;
       }
 
       function isSpeechCaptureSupported() {
-        return !!getRecognitionConstructor();
+        return !!(
+          navigator.mediaDevices &&
+          navigator.mediaDevices.getUserMedia &&
+          window.MediaRecorder &&
+          getAudioContextConstructor()
+        );
       }
 
-      function stopRecognition() {
-        if (!activeRecognition) {
+      function chooseMimeType() {
+        const candidates = [
+          'audio/webm;codecs=opus',
+          'audio/webm',
+          'audio/ogg;codecs=opus',
+        ];
+        for (const type of candidates) {
+          if (MediaRecorder.isTypeSupported(type)) {
+            return type;
+          }
+        }
+        return '';
+      }
+
+      function clearActiveCaptureTimer() {
+        if (activeCapture && activeCapture.startupTimer !== null) {
+          clearTimeout(activeCapture.startupTimer);
+          activeCapture.startupTimer = null;
+        }
+      }
+
+      function clearMonitorLoop() {
+        if (captureState.rafId !== null) {
+          cancelAnimationFrame(captureState.rafId);
+          captureState.rafId = null;
+        }
+      }
+
+      function resetRecorderState() {
+        captureState.chunks = [];
+        captureState.recording = false;
+        captureState.recordingStartedAt = 0;
+        captureState.silenceStartedAt = null;
+        captureState.speechFrameCount = 0;
+        captureState.pendingMimeType = '';
+        captureState.mediaRecorder = null;
+      }
+
+      function teardownAudioCapture() {
+        clearMonitorLoop();
+        resetRecorderState();
+
+        if (captureState.sourceNode) {
+          try {
+            captureState.sourceNode.disconnect();
+          } catch (_) {}
+          captureState.sourceNode = null;
+        }
+
+        if (captureState.analyser) {
+          try {
+            captureState.analyser.disconnect();
+          } catch (_) {}
+          captureState.analyser = null;
+        }
+
+        if (captureState.mediaStream) {
+          captureState.mediaStream.getTracks().forEach((track) => track.stop());
+          captureState.mediaStream = null;
+        }
+
+        if (captureState.audioContext) {
+          try {
+            captureState.audioContext.close();
+          } catch (_) {}
+          captureState.audioContext = null;
+        }
+
+        captureState.frameData = null;
+      }
+
+      async function ensureAudioCapture() {
+        if (captureState.mediaStream && captureState.audioContext && captureState.analyser) {
           return;
         }
-        try {
-          activeRecognition.abort();
-        } catch (_) {}
-        activeRecognition = null;
+
+        teardownAudioCapture();
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+
+        const AudioContextCtor = getAudioContextConstructor();
+        const audioContext = new AudioContextCtor();
+        await audioContext.resume();
+
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0.82;
+
+        const sourceNode = audioContext.createMediaStreamSource(stream);
+        sourceNode.connect(analyser);
+
+        captureState.mediaStream = stream;
+        captureState.audioContext = audioContext;
+        captureState.analyser = analyser;
+        captureState.sourceNode = sourceNode;
+        captureState.frameData = new Float32Array(analyser.fftSize);
       }
 
-      function captureSpeechTurn(language) {
-        return new Promise((resolve, reject) => {
-          if (!isSpeechCaptureSupported()) {
-            reject(new Error('Speech recognition is not supported in this browser.'));
+      function rmsFromAnalyser() {
+        if (!captureState.analyser || !captureState.frameData) {
+          return 0;
+        }
+        captureState.analyser.getFloatTimeDomainData(captureState.frameData);
+        let sum = 0;
+        for (let index = 0; index < captureState.frameData.length; index += 1) {
+          const value = captureState.frameData[index];
+          sum += value * value;
+        }
+        return Math.sqrt(sum / captureState.frameData.length);
+      }
+
+      function blobToBase64(blob) {
+        return blob.arrayBuffer().then((buffer) => {
+          const bytes = new Uint8Array(buffer);
+          let binary = '';
+          for (let index = 0; index < bytes.length; index += 1) {
+            binary += String.fromCharCode(bytes[index]);
+          }
+          return btoa(binary);
+        });
+      }
+
+      function finalizeCaptureFailure(message, preserveMic = true) {
+        if (!activeCapture || activeCapture.done) {
+          return;
+        }
+        const pending = activeCapture;
+        pending.done = true;
+        clearActiveCaptureTimer();
+        activeCapture = null;
+        clearMonitorLoop();
+        const shouldTearDown = !preserveMic;
+        resetRecorderState();
+        if (shouldTearDown) {
+          teardownAudioCapture();
+        }
+        pending.reject(new Error(message));
+      }
+
+      function startRecorder() {
+        if (!activeCapture || !captureState.mediaStream) {
+          return;
+        }
+
+        const mimeType = chooseMimeType();
+        const options = mimeType ? { mimeType } : undefined;
+        captureState.chunks = [];
+        captureState.pendingMimeType = mimeType;
+
+        const recorder = new MediaRecorder(captureState.mediaStream, options);
+        captureState.mediaRecorder = recorder;
+        recorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            captureState.chunks.push(event.data);
+          }
+        };
+        recorder.onerror = (event) => {
+          const reason =
+            event && event.error && event.error.message
+              ? event.error.message
+              : 'Audio recording failed.';
+          finalizeCaptureFailure(reason);
+        };
+        recorder.onstop = async () => {
+          if (!activeCapture || activeCapture.done) {
+            resetRecorderState();
             return;
           }
 
-          stopRecognition();
-          const Recognition = getRecognitionConstructor();
-          const recognition = new Recognition();
-          activeRecognition = recognition;
-          recognition.lang = language || 'bg-BG';
-          recognition.continuous = true;
-          recognition.interimResults = true;
-          recognition.maxAlternatives = 1;
+          const blob = new Blob(captureState.chunks, {
+            type: recorder.mimeType || mimeType || 'audio/webm',
+          });
+          const pending = activeCapture;
 
-          let done = false;
-          let transcript = '';
-          let silenceTimer = null;
-          let startupTimer = null;
-
-          const cleanup = () => {
-            if (silenceTimer !== null) {
-              clearTimeout(silenceTimer);
-              silenceTimer = null;
-            }
-            if (startupTimer !== null) {
-              clearTimeout(startupTimer);
-              startupTimer = null;
-            }
-            if (activeRecognition === recognition) {
-              activeRecognition = null;
-            }
-          };
-
-          const fail = (message) => {
-            if (done) {
-              return;
-            }
-            done = true;
-            cleanup();
-            reject(new Error(message));
-          };
-
-          const finish = () => {
-            if (done) {
-              return;
-            }
-            const finalTranscript = transcript.trim();
-            if (!finalTranscript) {
-              fail('No speech was captured.');
-              return;
-            }
-            done = true;
-            cleanup();
-            resolve(finalTranscript);
-          };
-
-          const armSilenceTimer = () => {
-            if (silenceTimer !== null) {
-              clearTimeout(silenceTimer);
-            }
-            silenceTimer = setTimeout(() => {
-              try {
-                recognition.stop();
-              } catch (_) {
-                finish();
-              }
-            }, 900);
-          };
-
-          recognition.onresult = (event) => {
-            let latest = '';
-            for (let index = 0; index < event.results.length; index += 1) {
-              const result = event.results[index];
-              if (!result || !result[0]) {
-                continue;
-              }
-              const piece = (result[0].transcript || '').trim();
-              if (!piece) {
-                continue;
-              }
-              latest = piece;
-            }
-            if (!latest) {
-              return;
-            }
-            transcript = latest;
-            armSilenceTimer();
-          };
-
-          recognition.onerror = (event) => {
-            fail(event.error || 'Speech recognition failed.');
-          };
-
-          recognition.onend = () => {
-            if (done) {
-              return;
-            }
-            finish();
-          };
-
-          startupTimer = setTimeout(() => {
-            if (!transcript.trim()) {
-              try {
-                recognition.stop();
-              } catch (_) {
-                fail('No speech was captured.');
-              }
-            }
-          }, 10000);
+          if (blob.size < 2048) {
+            finalizeCaptureFailure('No speech was captured.');
+            return;
+          }
 
           try {
-            recognition.start();
+            const audioBase64 = await blobToBase64(blob);
+            if (!activeCapture || activeCapture !== pending || pending.done) {
+              resetRecorderState();
+              return;
+            }
+
+            pending.done = true;
+            clearActiveCaptureTimer();
+            activeCapture = null;
+            clearMonitorLoop();
+            resetRecorderState();
+            pending.resolve(
+              JSON.stringify({
+                audioBase64,
+                mimeType: blob.type || recorder.mimeType || mimeType || 'audio/webm',
+                language: pending.language || 'bg-BG',
+              }),
+            );
           } catch (error) {
-            fail(error && error.message ? error.message : 'Microphone access failed.');
+            finalizeCaptureFailure(
+              error && error.message ? error.message : 'Audio encoding failed.',
+            );
           }
+        };
+        recorder.start(250);
+        captureState.recording = true;
+        captureState.recordingStartedAt = performance.now();
+        captureState.silenceStartedAt = null;
+      }
+
+      function monitorCaptureLoop() {
+        if (!activeCapture || !captureState.analyser) {
+          clearMonitorLoop();
+          return;
+        }
+
+        const rms = rmsFromAnalyser();
+        const now = performance.now();
+
+        if (!captureState.recording) {
+          if (rms >= captureConfig.startThreshold) {
+            captureState.speechFrameCount += 1;
+            if (captureState.speechFrameCount >= captureConfig.speechFramesToStart) {
+              captureState.speechFrameCount = 0;
+              startRecorder();
+            }
+          } else {
+            captureState.speechFrameCount = 0;
+          }
+        } else if (captureState.mediaRecorder) {
+          const elapsed = now - captureState.recordingStartedAt;
+          if (rms < captureConfig.stopThreshold) {
+            if (captureState.silenceStartedAt === null) {
+              captureState.silenceStartedAt = now;
+            }
+
+            const silenceElapsed = now - captureState.silenceStartedAt;
+            if (
+              elapsed >= captureConfig.minSpeechMs &&
+              silenceElapsed >= captureConfig.silenceMsToStop
+            ) {
+              try {
+                captureState.mediaRecorder.stop();
+              } catch (_) {
+                finalizeCaptureFailure('Audio recording stopped unexpectedly.');
+                return;
+              }
+            }
+          } else {
+            captureState.silenceStartedAt = null;
+          }
+        }
+
+        captureState.rafId = requestAnimationFrame(monitorCaptureLoop);
+      }
+
+      function stopRecognition() {
+        if (!activeCapture) {
+          teardownAudioCapture();
+          return;
+        }
+
+        const pending = activeCapture;
+        pending.done = true;
+        clearActiveCaptureTimer();
+        activeCapture = null;
+        clearMonitorLoop();
+
+        if (captureState.mediaRecorder && captureState.mediaRecorder.state !== 'inactive') {
+          try {
+            captureState.mediaRecorder.stop();
+          } catch (_) {}
+        }
+
+        resetRecorderState();
+        teardownAudioCapture();
+        pending.reject(new Error('Audio capture aborted.'));
+      }
+
+      function captureAudioTurn(language) {
+        return new Promise(async (resolve, reject) => {
+          if (!isSpeechCaptureSupported()) {
+            reject(new Error('Audio capture is not supported in this browser.'));
+            return;
+          }
+
+          if (activeCapture) {
+            stopRecognition();
+          }
+          clearMonitorLoop();
+          resetRecorderState();
+
+          try {
+            await ensureAudioCapture();
+          } catch (error) {
+            reject(
+              new Error(
+                error && error.message ? error.message : 'Microphone access failed.',
+              ),
+            );
+            return;
+          }
+
+          activeCapture = {
+            resolve,
+            reject,
+            done: false,
+            language: language || 'bg-BG',
+            startupTimer: setTimeout(() => {
+              if (captureState.recording) {
+                return;
+              }
+              finalizeCaptureFailure('No speech was captured.');
+            }, captureConfig.startupTimeoutMs),
+          };
+
+          monitorCaptureLoop();
         });
       }
 
@@ -232,7 +459,7 @@
 
       return {
         isSpeechCaptureSupported,
-        captureSpeechTurn,
+        captureAudioTurn,
         stopRecognition,
         playBase64Audio,
         stopAudio,

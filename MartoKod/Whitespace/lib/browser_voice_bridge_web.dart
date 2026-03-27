@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
 
 @JS('helloAgainVoice')
@@ -10,7 +11,7 @@ class _HelloAgainVoiceBridge {}
 
 extension _HelloAgainVoiceBridgeApi on _HelloAgainVoiceBridge {
   external bool isSpeechCaptureSupported();
-  external JSPromise<JSString> captureSpeechTurn(JSString language);
+  external JSPromise<JSString> captureAudioTurn(JSString language);
   external void stopRecognition();
   external JSPromise<JSAny?> playBase64Audio(
     JSString audioBase64,
@@ -19,19 +20,54 @@ extension _HelloAgainVoiceBridgeApi on _HelloAgainVoiceBridge {
   external void stopAudio();
 }
 
+class CapturedAudioTurn {
+  const CapturedAudioTurn({
+    required this.audioBase64,
+    required this.mimeType,
+    required this.language,
+  });
+
+  final String audioBase64;
+  final String mimeType;
+  final String language;
+}
+
 class BrowserVoiceBridge {
   _HelloAgainVoiceBridge? get _api => _helloAgainVoice;
 
   bool get isSpeechRecognitionSupported =>
       _api?.isSpeechCaptureSupported() ?? false;
 
-  Future<String> captureSpeechTurn({String language = 'bg-BG'}) async {
-    final payload = await _requireApi().captureSpeechTurn(language.toJS).toDart;
-    final transcript = payload.toDart.trim();
-    if (transcript.isEmpty) {
+  Future<CapturedAudioTurn> captureAudioTurn({
+    String language = 'bg-BG',
+  }) async {
+    final payload = await _requireApi().captureAudioTurn(language.toJS).toDart;
+    final raw = payload.toDart.trim();
+    if (raw.isEmpty) {
       throw StateError('No speech was captured.');
     }
-    return transcript;
+
+    final decoded = jsonDecode(raw);
+    if (decoded is! Map) {
+      throw const FormatException(
+        'Browser voice bridge did not return a valid audio payload.',
+      );
+    }
+
+    final map = Map<String, dynamic>.from(decoded);
+    final audioBase64 = (map['audioBase64'] ?? '').toString().trim();
+    final mimeType = (map['mimeType'] ?? 'audio/webm').toString().trim();
+    final resolvedLanguage = (map['language'] ?? language).toString().trim();
+
+    if (audioBase64.isEmpty) {
+      throw StateError('No speech was captured.');
+    }
+
+    return CapturedAudioTurn(
+      audioBase64: audioBase64,
+      mimeType: mimeType.isEmpty ? 'audio/webm' : mimeType,
+      language: resolvedLanguage.isEmpty ? language : resolvedLanguage,
+    );
   }
 
   Future<void> playBase64Audio({

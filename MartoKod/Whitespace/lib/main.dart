@@ -209,9 +209,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         _statusText = 'Voice conversation mode is on. Listening...';
       });
 
-      String transcript;
+      CapturedAudioTurn capturedTurn;
       try {
-        transcript = await _voiceBridge.captureSpeechTurn(language: 'bg-BG');
+        capturedTurn = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
       } catch (error) {
         if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
           return;
@@ -238,7 +238,31 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
 
       setState(() {
         _isListening = false;
+        _statusText = 'Speech captured. Transcribing with the voice gateway...';
       });
+
+      String transcript;
+      try {
+        transcript = await _transcribeCapturedTurn(capturedTurn);
+      } catch (error) {
+        if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
+          return;
+        }
+        setState(() {
+          _statusText = _isRecoverableListeningError(error)
+              ? 'Voice conversation mode is on. Still listening...'
+              : 'Speech transcription failed. ${_formatError(error)}';
+        });
+        await Future<void>.delayed(
+          Duration(
+            milliseconds: _isRecoverableListeningError(error) ? 250 : 900,
+          ),
+        );
+        continue;
+      }
+      if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
+        return;
+      }
       _fillPromptFromTranscript(transcript);
       await _submitPrompt(message: transcript, triggeredBySpeech: true);
       await _waitForActiveSpeechPlayback();
@@ -307,6 +331,23 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         });
       }
     }
+  }
+
+  Future<String> _transcribeCapturedTurn(CapturedAudioTurn capturedTurn) async {
+    final payload = await _backendClient.transcribeSpeechTurn(
+      audioBase64: capturedTurn.audioBase64,
+      audioMimeType: capturedTurn.mimeType,
+      userId: _userId,
+      sessionId: _sessionId,
+      language: capturedTurn.language,
+    );
+    final transcript = (payload['transcript'] ?? payload['message'] ?? '')
+        .toString()
+        .trim();
+    if (transcript.isEmpty) {
+      throw StateError('The voice gateway did not return a transcript.');
+    }
+    return transcript;
   }
 
   Future<void> _waitForSpeech(String runId) async {
@@ -424,6 +465,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     final lowered = error.toString().toLowerCase();
     return lowered.contains('no speech') ||
         lowered.contains('no-speech') ||
+        lowered.contains('did not return a transcript') ||
         lowered.contains('aborted') ||
         lowered.contains('audio capture aborted');
   }
