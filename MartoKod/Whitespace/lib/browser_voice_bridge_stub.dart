@@ -1,9 +1,9 @@
 class BrowserVoiceBridge {
   bool get isSpeechRecognitionSupported => false;
 
-  Future<String> startRecognition({String language = 'bg-BG'}) async {
+  Future<String> captureSpeechTurn({String language = 'bg-BG'}) async {
     throw UnsupportedError(
-      'Browser speech recognition is only available on Flutter web in Chrome-like browsers.',
+      'Browser speech capture is only available on Flutter web in Chrome-like browsers.',
     );
   }
 
@@ -11,6 +11,8 @@ class BrowserVoiceBridge {
     required String audioBase64,
     required String mimeType,
   }) async {}
+
+  void stopRecognition() {}
 
   void stopAudio() {}
 }

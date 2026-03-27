@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     # Platform
+    'controller',
     'voice_gateway',
     'meetup',
     "apps.accounts",

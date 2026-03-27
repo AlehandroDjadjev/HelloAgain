@@ -165,6 +165,7 @@ def transcribe_view(request):
         return JsonResponse({"error": "Method not allowed"}, status=405)
 
     try:
+        print("[voice_gateway] transcribe request received", flush=True)
         data, audio_bytes = _parse_request_payload(request)
         if not audio_bytes:
             return JsonResponse({"error": "Audio is required."}, status=400)

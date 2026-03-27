@@ -29,6 +29,7 @@ This is step 1.
 - Keep the full JSON within 256 output tokens.
 
 Return exactly one JSON object and nothing else.
+
 JSON shape:
 {{
   "stage": "step_1_mcp",
@@ -170,6 +171,7 @@ Rules:
 - Make the focus object big.
 - The created whitespace object is a lightweight board shell for the result.
 - The visible object `text` must be a compact summarized title, ideally 2 to 6 words.
+- Deliberately choose that visible title as its own tiny front-facing name. Do not copy it from raw payload structure, JSON keys, or serialized result text.
 - Keep the full MCP structure in the background mapping through `linked_call_ids` and `result_bindings`.
 - Never paste raw MCP JSON, argument blobs, or long response text into `name` or `text`.
 - If there is richer added content, place it in the second layer protocol behind the object using `result_title` and `result_summary`, not in the visible board title.
@@ -195,4 +197,3 @@ MCP results so far:
 Previous chain history:
 {_pretty_json(chain_history)}
 """.strip()
-
