@@ -1,8 +1,6 @@
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("kotlin-android")

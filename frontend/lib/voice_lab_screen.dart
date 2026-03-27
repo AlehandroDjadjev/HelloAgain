@@ -44,7 +44,7 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
   String _lastMimeType = 'audio/wav';
   String _status = kIsWeb
       ? 'Tap start to enable the microphone in Chrome.'
-      : 'Preparing always-listening mode...';
+      : 'Ready. Tap start when you want to test voice.';
   String _language = 'bg-BG';
   String? _error;
   String? _healthError;
@@ -75,12 +75,6 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
 
   Future<void> _initialize() async {
     await _refreshHealth();
-    if (_requiresManualStart || !mounted) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
-        unawaited(_startConversation(autoStarted: true));
-      }
-    });
   }
 
   Future<AudioRecorder> _ensureRecorder() async =>
@@ -276,11 +270,11 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
       setState(() {
         _processing = true;
         _error = null;
-        _status = 'Sending audio to the conversation endpoint...';
+        _status = 'Transcribing with the voice gateway...';
       });
     }
     try {
-      final response = await _client.conversation(
+      final transcription = await _client.transcribe(
         audioBytes: _wrapPcmAsWav(
           pcmBytes,
           sampleRate: _sampleRate,
@@ -289,14 +283,36 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
         language: _language,
         sessionId: _sessionId,
       );
-      _providerStatus = response.providerStatus;
+      final transcript = transcription.transcript.trim();
+      if (transcript.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _status = 'No speech detected. Listening again...';
+          });
+        }
+        return;
+      }
+
+      if (mounted) {
+        setState(() {
+          _messages.add(_Message('You', transcript));
+          _status = 'Generating a spoken reply with /get-response...';
+        });
+      }
+
+      final response = await _client.getResponse(
+        prompt: transcript,
+        userId: 'voice-lab',
+        sessionId: _sessionId,
+      );
+      _providerStatus = <String, String>{
+        'stt': transcription.provider,
+        ...response.providerStatus,
+      };
       _lastAudio = response.assistantAudioBytes;
       _lastMimeType = response.assistantAudioMimeType;
       if (!mounted) return;
       setState(() {
-        if (response.transcript.trim().isNotEmpty) {
-          _messages.add(_Message('You', response.transcript.trim()));
-        }
         if (response.assistantText.trim().isNotEmpty) {
           _messages.add(_Message('HelloAgain', response.assistantText.trim()));
         }

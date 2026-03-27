@@ -7,6 +7,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart' as permission;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'src/theme/app_theme.dart';
 import 'android_phone_number_hint.dart';
 import 'browser_voice_bridge.dart';
 import 'meetup_screen.dart';
@@ -31,14 +32,10 @@ class HelloAgainApp extends StatelessWidget {
     return MaterialApp(
       title: 'Hello Again',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
+      theme: buildHelloAgainTheme(
         scaffoldBackgroundColor: const Color(0xFFF4EDE3),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFB56B4D),
-          brightness: Brightness.light,
-          surface: const Color(0xFFFFFBF7),
-        ),
+        seedColor: const Color(0xFFB56B4D),
+        surfaceColor: const Color(0xFFFFFBF7),
       ),
       home: const HelloAgainShell(),
     );
@@ -54,7 +51,6 @@ class HelloAgainShell extends StatefulWidget {
   State<HelloAgainShell> createState() => _HelloAgainShellState();
 }
 
-class _HelloAgainShellState extends State<HelloAgainShell> {
   static const _tokenKey = 'hello_again.account_token';
   static const _onboardingSessionKey = 'hello_again.onboarding_session_id';
 
@@ -651,6 +647,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
             _selectedIndex = value;
           });
         },
+        backgroundColor: const Color(0xFF162040),
+        indicatorColor: const Color(0xFF3B82F6).withValues(alpha: 0.25),
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.dashboard_outlined),
