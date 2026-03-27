@@ -186,6 +186,8 @@ class AppProfile {
     required this.sharePhoneWithFriends,
     required this.shareEmailWithFriends,
     required this.onboardingAnswers,
+    this.homeLat,
+    this.homeLng,
     this.matchPercent,
     this.rawScore,
     this.scoreComponents = const <String, double>{},
@@ -209,6 +211,8 @@ class AppProfile {
   final bool sharePhoneWithFriends;
   final bool shareEmailWithFriends;
   final Map<String, String> onboardingAnswers;
+  final double? homeLat;
+  final double? homeLng;
   final int? matchPercent;
   final double? rawScore;
   final Map<String, double> scoreComponents;
@@ -259,6 +263,8 @@ class AppProfile {
       sharePhoneWithFriends: json['share_phone_with_friends'] != false,
       shareEmailWithFriends: json['share_email_with_friends'] != false,
       onboardingAnswers: parsedAnswers,
+      homeLat: _toDouble(json['home_lat']),
+      homeLng: _toDouble(json['home_lng']),
       matchPercent: (json['match_percent'] as num?)?.toInt(),
       rawScore: _toDouble(json['raw_score']),
       scoreComponents: rawScoreComponents,
@@ -276,6 +282,8 @@ class AppProfile {
     bool? sharePhoneWithFriends,
     bool? shareEmailWithFriends,
     Map<String, String>? onboardingAnswers,
+    double? homeLat,
+    double? homeLng,
     int? matchPercent,
     double? rawScore,
     Map<String, double>? scoreComponents,
@@ -302,10 +310,105 @@ class AppProfile {
       shareEmailWithFriends:
           shareEmailWithFriends ?? this.shareEmailWithFriends,
       onboardingAnswers: onboardingAnswers ?? this.onboardingAnswers,
+      homeLat: homeLat ?? this.homeLat,
+      homeLng: homeLng ?? this.homeLng,
       matchPercent: matchPercent ?? this.matchPercent,
       rawScore: rawScore ?? this.rawScore,
       scoreComponents: scoreComponents ?? this.scoreComponents,
       discoveryMode: discoveryMode ?? this.discoveryMode,
+    );
+  }
+}
+
+class MeetupInviteRow {
+  const MeetupInviteRow({
+    required this.id,
+    required this.status,
+    required this.direction,
+    required this.requesterUserId,
+    required this.requesterDisplayName,
+    required this.invitedUserId,
+    required this.invitedDisplayName,
+    required this.proposedTime,
+    required this.placeName,
+    required this.placeLat,
+    required this.placeLng,
+    required this.weather,
+    required this.temperature,
+    required this.score,
+    required this.payload,
+  });
+
+  final int id;
+  final String status;
+  final String direction;
+  final int requesterUserId;
+  final String requesterDisplayName;
+  final int invitedUserId;
+  final String invitedDisplayName;
+  final DateTime? proposedTime;
+  final String placeName;
+  final double placeLat;
+  final double placeLng;
+  final String weather;
+  final double? temperature;
+  final double score;
+  final Map<String, dynamic> payload;
+
+  factory MeetupInviteRow.fromJson(Map<String, dynamic> json) {
+    DateTime? proposedTime;
+    final rawTime = json['proposed_time']?.toString();
+    if (rawTime != null && rawTime.isNotEmpty) {
+      proposedTime = DateTime.tryParse(rawTime);
+    }
+
+    final rawPayload = json['payload'];
+    final parsedPayload = <String, dynamic>{};
+    if (rawPayload is Map) {
+      for (final entry in rawPayload.entries) {
+        parsedPayload[entry.key.toString()] = entry.value;
+      }
+    }
+
+    return MeetupInviteRow(
+      id: (json['id'] as num?)?.toInt() ?? 0,
+      status: (json['status'] ?? '').toString(),
+      direction: (json['direction'] ?? '').toString(),
+      requesterUserId: (json['requester_user_id'] as num?)?.toInt() ?? 0,
+      requesterDisplayName: (json['requester_display_name'] ?? '').toString(),
+      invitedUserId: (json['invited_user_id'] as num?)?.toInt() ?? 0,
+      invitedDisplayName: (json['invited_display_name'] ?? '').toString(),
+      proposedTime: proposedTime,
+      placeName: (json['place_name'] ?? '').toString(),
+      placeLat: _toDouble(json['place_lat']) ?? 0.0,
+      placeLng: _toDouble(json['place_lng']) ?? 0.0,
+      weather: (json['weather'] ?? '').toString(),
+      temperature: _toDouble(json['temperature']),
+      score: _toDouble(json['score']) ?? 0.0,
+      payload: parsedPayload,
+    );
+  }
+}
+
+class MeetupInviteBucket {
+  const MeetupInviteBucket({
+    required this.incoming,
+    required this.outgoing,
+  });
+
+  final List<MeetupInviteRow> incoming;
+  final List<MeetupInviteRow> outgoing;
+
+  factory MeetupInviteBucket.fromJson(Map<String, dynamic> json) {
+    return MeetupInviteBucket(
+      incoming: (json['incoming'] as List? ?? const <dynamic>[])
+          .whereType<Map>()
+          .map((item) => MeetupInviteRow.fromJson(item.cast<String, dynamic>()))
+          .toList(),
+      outgoing: (json['outgoing'] as List? ?? const <dynamic>[])
+          .whereType<Map>()
+          .map((item) => MeetupInviteRow.fromJson(item.cast<String, dynamic>()))
+          .toList(),
     );
   }
 }
@@ -604,6 +707,57 @@ class SocialApiClient {
       body: body,
     );
   }
+
+  Future<MeetupInviteRow> proposeMeetup({
+    required AppProfile friend,
+    DateTime? proposedTime,
+    AppProfile? me,
+  }) async {
+    final body = <String, dynamic>{
+      'friend_user_id': friend.userId,
+      if (proposedTime != null) 'proposed_time': proposedTime.toIso8601String(),
+    };
+    if (me?.homeLat != null && me?.homeLng != null) {
+      body['requester_location'] = <String, dynamic>{
+        'lat': me!.homeLat,
+        'lng': me.homeLng,
+      };
+    }
+    if (friend.homeLat != null && friend.homeLng != null) {
+      body['friend_location'] = <String, dynamic>{
+        'lat': friend.homeLat,
+        'lng': friend.homeLng,
+      };
+    }
+
+    final payload = await _request(
+      'POST',
+      '/api/meetup/friends/propose/',
+      body: body,
+    );
+    return MeetupInviteRow.fromJson(
+      (payload['invite'] as Map).cast<String, dynamic>(),
+    );
+  }
+
+  Future<MeetupInviteBucket> fetchMeetupInvites() async {
+    final payload = await _request('GET', '/api/meetup/friends/invites/');
+    return MeetupInviteBucket.fromJson(payload);
+  }
+
+  Future<MeetupInviteRow> respondMeetupInvite({
+    required int inviteId,
+    required String action,
+  }) async {
+    final payload = await _request(
+      'POST',
+      '/api/meetup/friends/invites/$inviteId/respond/',
+      body: <String, dynamic>{'action': action},
+    );
+    return MeetupInviteRow.fromJson(
+      (payload['invite'] as Map).cast<String, dynamic>(),
+    );
+  }
 }
 
 class SessionController extends ChangeNotifier {
@@ -640,6 +794,8 @@ class SessionController extends ChangeNotifier {
       }
     } on ApiException {
       await _clearSession(notifyListenersAfter: false);
+    } on Exception {
+      // Keep startup resilient when the backend is temporarily unreachable.
     } finally {
       isBootstrapping = false;
       notifyListeners();

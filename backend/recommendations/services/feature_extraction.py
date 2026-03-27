@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 import re
 from functools import lru_cache
 
@@ -8,8 +10,87 @@ import torch
 from recommendations.gat.feature_schema import get_default_feature_vector, get_feature_names
 from recommendations.services.intake_clarification import build_clarification_signal_map
 
-_TOKEN_RE = re.compile(r"[a-zA-Z']+")
-_NEGATION_WORDS = {"not", "no", "never", "dont", "don't", "cannot", "can't", "avoid", "avoids", "dislike", "dislikes", "hate", "hates"}
+logger = logging.getLogger(__name__)
+
+_TOKEN_RE = re.compile(r"[a-zA-Zа-яА-Я0-9']+")
+_NEGATION_WORDS = {
+    "not",
+    "no",
+    "never",
+    "dont",
+    "don't",
+    "cannot",
+    "can't",
+    "avoid",
+    "avoids",
+    "dislike",
+    "dislikes",
+    "hate",
+    "hates",
+    "не",
+    "никога",
+    "без",
+    "никак",
+    "никакъв",
+    "никаква",
+    "никакви",
+}
+
+_POSITIVE_PREFERENCE_VERBS = {
+    "like",
+    "likes",
+    "love",
+    "loves",
+    "prefer",
+    "prefers",
+    "enjoy",
+    "enjoys",
+    "харесвам",
+    "обичам",
+    "предпочитам",
+    "искам",
+}
+
+_NEGATIVE_PREFERENCE_VERBS = {
+    "dislike",
+    "dislikes",
+    "hate",
+    "hates",
+    "avoid",
+    "avoids",
+    "мразя",
+    "ненавиждам",
+    "избягвам",
+    "нехаресвам",
+    "необичам",
+    "неискам",
+}
+
+_OBJECT_STOPWORDS = {
+    "и",
+    "или",
+    "за",
+    "с",
+    "в",
+    "на",
+    "по",
+    "от",
+    "to",
+    "and",
+    "or",
+    "with",
+    "for",
+    "a",
+    "an",
+    "the",
+    "аз",
+    "ти",
+    "той",
+    "тя",
+    "ние",
+    "вие",
+    "те",
+}
 
 
 def _normalize_token(token: str) -> str:
@@ -323,14 +404,141 @@ def _clamp(value: float) -> float:
 
 @lru_cache(maxsize=1)
 def _load_embedding_model():
+    enabled = os.getenv("ENABLE_SEMANTIC_EMBEDDINGS", "0").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return None
+
     try:
         from sentence_transformers import SentenceTransformer
     except Exception:
         return None
-    try:
-        return SentenceTransformer("all-MiniLM-L6-v2")
-    except Exception:
-        return None
+    for model_name in (
+        "paraphrase-multilingual-MiniLM-L12-v2",
+        "all-MiniLM-L6-v2",
+    ):
+        try:
+            return SentenceTransformer(model_name)
+        except Exception:
+            continue
+    return None
+
+
+def extract_preference_intents(description: str) -> list[dict[str, object]]:
+    tokens = _tokenize(description)
+    if not tokens:
+        return []
+
+    intents: list[dict[str, object]] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        polarity = 0
+        action = ""
+        object_start = idx + 1
+        consumed_next_token = False
+
+        if token in _POSITIVE_PREFERENCE_VERBS:
+            if idx > 0 and tokens[idx - 1] in _NEGATION_WORDS:
+                idx += 1
+                continue
+            polarity = 1
+            action = token
+        elif token in _NEGATIVE_PREFERENCE_VERBS:
+            if idx > 0 and tokens[idx - 1] in _NEGATION_WORDS:
+                idx += 1
+                continue
+            polarity = -1
+            action = token
+        elif token in _NEGATION_WORDS and idx + 1 < len(tokens):
+            next_token = tokens[idx + 1]
+            if next_token in _POSITIVE_PREFERENCE_VERBS:
+                polarity = -1
+                action = f"{token} {next_token}"
+                object_start = idx + 2
+                consumed_next_token = True
+            elif next_token in _NEGATIVE_PREFERENCE_VERBS:
+                polarity = 1
+                action = f"{token} {next_token}"
+                object_start = idx + 2
+                consumed_next_token = True
+
+        if polarity == 0:
+            idx += 1
+            continue
+
+        object_token = ""
+        for look_ahead in range(object_start, min(len(tokens), object_start + 4)):
+            candidate = tokens[look_ahead]
+            if (
+                candidate in _NEGATION_WORDS
+                or candidate in _POSITIVE_PREFERENCE_VERBS
+                or candidate in _NEGATIVE_PREFERENCE_VERBS
+                or candidate in _OBJECT_STOPWORDS
+                or len(candidate) < 2
+            ):
+                continue
+            object_token = candidate
+            break
+
+        if not object_token:
+            idx += 2 if consumed_next_token else 1
+            continue
+
+        intents.append(
+            {
+                "subject": "I",
+                "action": action,
+                "object": object_token,
+                "polarity": polarity,
+            }
+        )
+        idx += 2 if consumed_next_token else 1
+
+    # Keep first intent per (object, polarity) to avoid token-repeat dominance.
+    dedup: dict[tuple[str, int], dict[str, object]] = {}
+    for intent in intents:
+        key = (str(intent["object"]), int(intent["polarity"]))
+        if key not in dedup:
+            dedup[key] = intent
+    return list(dedup.values())
+
+
+def summarize_preference_intents(intents: list[dict[str, object]]) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    for intent in intents:
+        obj = str(intent.get("object", "")).strip()
+        if not obj:
+            continue
+        polarity = float(intent.get("polarity", 0.0))
+        summary[obj] = max(-1.0, min(1.0, polarity))
+    return summary
+
+
+def embedding_pair_similarity(left_text: str, right_text: str) -> dict[str, object]:
+    model = _load_embedding_model()
+    if model is None:
+        return {
+            "backend": "rules_only",
+            "cosine": None,
+            "left_preview": [],
+            "right_preview": [],
+        }
+
+    embeddings = model.encode([left_text or "", right_text or ""], convert_to_tensor=True)
+    left_embedding, right_embedding = embeddings
+    cosine = float(torch.nn.functional.cosine_similarity(left_embedding, right_embedding, dim=0).item())
+    left_preview = [round(float(item), 4) for item in left_embedding[:6].tolist()]
+    right_preview = [round(float(item), 4) for item in right_embedding[:6].tolist()]
+    left_norm = float(torch.linalg.norm(left_embedding).item())
+    right_norm = float(torch.linalg.norm(right_embedding).item())
+    return {
+        "backend": "sentence_transformers",
+        "cosine": round(cosine, 4),
+        "left_preview": left_preview,
+        "right_preview": right_preview,
+        "left_norm": round(left_norm, 4),
+        "right_norm": round(right_norm, 4),
+    }
 
 
 @lru_cache(maxsize=1)
@@ -437,9 +645,17 @@ def extract_feature_profile(
     feature_names = get_feature_names()
     normalized_description = " ".join(_tokenize(description))
     tokens = _tokenize(description)
+    semantic_intents = extract_preference_intents(description)
+    semantic_intent_summary = summarize_preference_intents(semantic_intents)
     overrides = manual_overrides or {}
     clarification_signals = build_clarification_signal_map(clarification_answers)
     result: dict[str, dict] = {}
+
+    logger.info(
+        "feature_extraction.semantic_intents intents=%s summary=%s",
+        semantic_intents,
+        semantic_intent_summary,
+    )
 
     for feature_name in feature_names:
         default_value = float(defaults.get(feature_name, 0.5))

@@ -71,6 +71,8 @@ class AccountProfile(models.Model):
     contacts_permission_granted_at = models.DateTimeField(null=True, blank=True)
     share_phone_with_friends = models.BooleanField(default=True)
     share_email_with_friends = models.BooleanField(default=True)
+    home_lat = models.FloatField(null=True, blank=True)
+    home_lng = models.FloatField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

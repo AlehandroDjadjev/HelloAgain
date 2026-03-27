@@ -183,6 +183,8 @@ def _serialize_profile(
                 "profile_notes": target.profile_notes,
                 "effective_description": target.effective_description,
                 "onboarding_answers": target.onboarding_answers,
+                "home_lat": target.home_lat,
+                "home_lng": target.home_lng,
             }
         )
     return data
