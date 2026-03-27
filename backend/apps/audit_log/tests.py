@@ -11,7 +11,7 @@ from apps.agent_sessions.services import SessionService
 
 
 class AuditServiceTests(TestCase):
-    def test_record_swallows_sqlite_lock_errors(self):
+    def test_record_swallows_database_lock_errors(self):
         session = SessionService.create(
             user_id="audit-test",
             device_id="device-1",

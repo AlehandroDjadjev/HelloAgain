@@ -1,6 +1,7 @@
 from django.db import models
+from pgvector.django import VectorField
 
-from .gat.feature_schema import get_default_feature_vector
+from .gat.feature_schema import FEATURE_DIM, FEATURE_NAMES, get_default_feature_vector
 
 
 class ElderProfile(models.Model):
@@ -14,6 +15,7 @@ class ElderProfile(models.Model):
     feature_vector = models.JSONField(default=dict)
     base_feature_vector = models.JSONField(default=dict)
     adapted_feature_vector = models.JSONField(default=dict)
+    embedding = VectorField(dimensions=FEATURE_DIM, null=True, blank=True)
     manual_overrides = models.JSONField(default=dict)
     feature_confidence = models.JSONField(default=dict)
     extraction_evidence = models.JSONField(default=dict)
@@ -37,6 +39,9 @@ class ElderProfile(models.Model):
             synced.setdefault(feature_name, default_value)
         return synced
 
+    def _embedding_from_vector(self, payload: dict[str, float], defaults: dict[str, float]) -> list[float]:
+        return [float(payload.get(feature_name, defaults.get(feature_name, 0.5))) for feature_name in FEATURE_NAMES]
+
     def save(self, *args, **kwargs):
         defaults = get_default_feature_vector()
         self.base_feature_vector = self._sync_vector(self.base_feature_vector, defaults)
@@ -59,6 +64,7 @@ class ElderProfile(models.Model):
             if feature_name in defaults
         }
         self.extraction_evidence = self.extraction_evidence or {}
+        self.embedding = self._embedding_from_vector(self.feature_vector, defaults)
         super().save(*args, **kwargs)
 
 
