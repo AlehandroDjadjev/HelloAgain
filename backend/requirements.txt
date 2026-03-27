@@ -1,14 +1,12 @@
 asgiref==3.11.1
-Django==6.0.3
-djangorestframework==3.17.1
 pydantic>=2.7,<3
 sqlparse==0.5.5
 tzdata==2025.3
 # Core Django
-Django==6.0.3
-djangorestframework==3.17.1
-django-cors-headers==4.9.0
-python-dotenv==1.0.1
+Django
+djangorestframework
+django-cors-headers
+python-dotenv
 
 # Caching & Task Queues
 celery==5.4.0
@@ -31,3 +29,15 @@ piper-tts==1.4.1
 # Testing
 pytest==9.0.2
 pytest-django==4.12.0
+
+transformers>=4.51.0
+accelerate>=0.33.0
+bitsandbytes>=0.43.0
+torch>=2.3.0
+torchvision>=0.18.0
+numpy>=1.26.0
+safetensors>=0.4.3
+Pillow>=10.0.0
+six>=1.16.0
+piper-tts
+google-cloud-speech

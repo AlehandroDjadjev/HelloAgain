@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'corsheaders',
     # Platform
+    'controller',
     'meetup',
     "apps.accounts",
     # Agent apps

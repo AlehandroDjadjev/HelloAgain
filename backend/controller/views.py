@@ -215,6 +215,7 @@ def agent_run_view(request: HttpRequest):
 def agent_run_start_view(request: HttpRequest):
     if request.method != "POST":
         return JsonResponse({"detail": "POST required"}, status=405)
+    print("[controller] semi-agent start request received", file=sys.stderr, flush=True)
     try:
         payload = _parse_json_request(request)
     except json.JSONDecodeError as exc:
@@ -235,10 +236,12 @@ def agent_run_start_view(request: HttpRequest):
             session_id=str(payload.get("session_id") or "default_session"),
         )
     except ValueError as exc:
+        print(f"[controller] semi-agent start rejected: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=400)
     except Exception as exc:
         print(f"[controller] semi-agent start failed: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=500)
+    print("[controller] semi-agent start request completed", file=sys.stderr, flush=True)
     return JsonResponse(result)
 
 
