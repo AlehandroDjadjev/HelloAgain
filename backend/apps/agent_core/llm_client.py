@@ -22,14 +22,16 @@ Usage:
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import Any, Optional
 
 import requests
 
@@ -94,6 +96,7 @@ class LLMClient:
 
         self._tf_pipeline = None
         self._tf_runtime_state: dict[str, Any] = {}
+        self._is_vl_processor: bool = False
 
     @classmethod
     def from_settings(cls) -> "LLMClient":
@@ -146,12 +149,14 @@ class LLMClient:
         user_prompt: str,
         json_mode: bool = False,
         json_schema: dict | None = None,
+        image_b64: Optional[str] = None,
     ) -> dict:
         """
         Call the configured LLM and return a parsed dict.
 
         json_mode=True instructs the provider to return JSON only.
         json_schema is passed as structured-output schema where supported.
+        image_b64 is a base64-encoded JPEG; passed to vision-capable providers only.
 
         Raises LLMError on network failure after 1 retry.
         Raises LLMParseError if the response cannot be JSON-decoded after 1 retry.
@@ -171,7 +176,12 @@ class LLMClient:
                 up = up + "\n\nRemember: output ONLY valid JSON."
 
             try:
-                raw_content = self._call(sp, up, json_mode=json_mode, json_schema=json_schema)
+                raw_content = self._call(
+                    sp, up,
+                    json_mode=json_mode,
+                    json_schema=json_schema,
+                    image_b64=image_b64,
+                )
                 return _parse_json(raw_content)
             except LLMParseError as exc:
                 logger.warning("LLM JSON parse error (attempt %d): %s", attempt + 1, exc)
@@ -191,13 +201,18 @@ class LLMClient:
         user_prompt: str,
         json_mode: bool,
         json_schema: dict | None,
+        image_b64: Optional[str] = None,
     ) -> str:
         if self.provider == "ollama":
             return self._call_ollama(system_prompt, user_prompt, json_mode)
         if self.provider in ("groq", "openai"):
-            return self._call_openai_compat(system_prompt, user_prompt, json_mode, json_schema)
+            return self._call_openai_compat(
+                system_prompt, user_prompt, json_mode, json_schema, image_b64=image_b64
+            )
         if self.provider == "transformers":
-            return self._call_transformers(system_prompt, user_prompt, json_mode=json_mode)
+            return self._call_transformers(
+                system_prompt, user_prompt, json_mode=json_mode, image_b64=image_b64
+            )
         raise LLMError(f"Unknown LLM provider: {self.provider!r}")
 
     def _call_ollama(self, system_prompt: str, user_prompt: str, json_mode: bool) -> str:
@@ -235,16 +250,24 @@ class LLMClient:
         user_prompt: str,
         json_mode: bool,
         json_schema: dict | None,
+        image_b64: Optional[str] = None,
     ) -> str:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+        if image_b64:
+            user_content: Any = [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": user_prompt},
+            ]
+        else:
+            user_content = user_prompt
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
         }
 
@@ -285,15 +308,79 @@ class LLMClient:
         system_prompt: str,
         user_prompt: str,
         json_mode: bool = False,
+        image_b64: Optional[str] = None,
     ) -> str:
         """
         Lazily loads the model + tokenizer on first call.
         Uses the model's own chat template so it works correctly with Qwen,
         Llama, Mistral, and other instruction models.
+
+        When image_b64 is provided and the loaded model is a VL processor model,
+        the image is decoded and passed via the processor's multimodal message path.
+        Streaming logs are skipped for VL inference (processor handles tokenisation
+        internally and does not expose a streaming interface at this level).
         """
         model_obj, tokenizer = self._get_tf_model()
         started = time.perf_counter()
         max_new_tokens = _transformers_max_new_tokens(json_mode)
+
+        import torch
+
+        # ── Vision-language path ──────────────────────────────────────────────
+        if image_b64 and self._is_vl_processor:
+            try:
+                from PIL import Image as PILImage  # type: ignore[import]
+            except ImportError as exc:
+                raise LLMError(
+                    "Pillow not installed. Run: pip install pillow"
+                ) from exc
+
+            pil_image = PILImage.open(BytesIO(base64.b64decode(image_b64))).convert("RGB")
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": pil_image},
+                        {"type": "text", "text": user_prompt},
+                    ],
+                },
+            ]
+            inputs = tokenizer(
+                messages,
+                return_tensors="pt",
+                add_generation_prompt=True,
+            ).to(model_obj.device)
+            prompt_tokens = int(inputs["input_ids"].shape[1])
+
+            self._log_transformers_inference_start(
+                prompt_chars=len(system_prompt) + len(user_prompt),
+                prompt_tokens=prompt_tokens,
+                input_device=str(model_obj.device),
+                max_new_tokens=max_new_tokens,
+                use_streaming_logs=False,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            with torch.inference_mode():
+                output_ids = model_obj.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    pad_token_id=_tokenizer_attr(tokenizer, "eos_token_id"),
+                )
+            new_ids = output_ids[0][prompt_tokens:]
+            output_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            self._log_transformers_inference_end(
+                output_text=output_text,
+                prompt_tokens=prompt_tokens,
+                elapsed_s=time.perf_counter() - started,
+            )
+            return output_text
+
+        # ── Text-only path ────────────────────────────────────────────────────
         use_streaming_logs = _get_bool_env("LOCAL_LLM_LOG_STREAMING", False)
 
         messages = [
@@ -318,8 +405,6 @@ class LLMClient:
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
-
-        import torch
 
         with torch.inference_mode():
             if use_streaming_logs:
@@ -430,6 +515,7 @@ class LLMClient:
             local_files_only=local_files_only,
         )
         uses_vl_processor = _is_vl_model_config(model_config)
+        self._is_vl_processor = uses_vl_processor
 
         if uses_vl_processor:
             tokenizer = AutoProcessor.from_pretrained(

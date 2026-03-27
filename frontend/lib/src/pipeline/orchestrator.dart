@@ -23,6 +23,7 @@ class PipelineOrchestrator extends ChangeNotifier {
   ConfirmationRequest? pendingConfirmation;
   String? errorMessage;
   final List<LogEntry> log = [];
+  List<String> _supportedPackages = const [];
 
   bool get canPause =>
       phase == PipelinePhase.executing ||
@@ -122,17 +123,24 @@ class PipelineOrchestrator extends ChangeNotifier {
 
   Future<void> _createSession(String reasoningProvider) async {
     _setPhase(PipelinePhase.creatingSession);
+    _log('Discovering installed Android apps...');
+    _supportedPackages = await _gateway.listLaunchablePackages();
+    if (_supportedPackages.isEmpty) {
+      _log(
+        'Could not discover launchable apps. Continuing with backend fallback handling.',
+        level: LogLevel.warning,
+      );
+    } else {
+      _log(
+        'Discovered ${_supportedPackages.length} launchable apps on this device.',
+      );
+    }
+
     _log('Creating agent session...');
     final resp = await client.createSession(
       inputMode: 'text',
       reasoningProvider: reasoningProvider,
-      supportedPackages: const [
-        'com.whatsapp',
-        'com.google.android.apps.maps',
-        'com.android.chrome',
-        'com.google.android.gm',
-        'com.supercell.brawlstars',
-      ],
+      supportedPackages: _supportedPackages,
     );
     sessionId = resp['session_id'] as String;
     _log('Session created: $sessionId', level: LogLevel.success);
@@ -162,7 +170,9 @@ class PipelineOrchestrator extends ChangeNotifier {
     final result = await _gateway.startSession(
       SessionConfig(
         sessionId: sessionId!,
-        allowedPackages: [appPackage],
+        allowedPackages: _supportedPackages.isNotEmpty
+            ? _supportedPackages
+            : [if (appPackage.isNotEmpty) appPackage],
         confirmationMode: 'always',
         allowTextEntry: true,
         allowSendActions: true,
@@ -337,6 +347,7 @@ class PipelineOrchestrator extends ChangeNotifier {
     pendingConfirmation = null;
     errorMessage = null;
     log.clear();
+    _supportedPackages = const [];
     _cancelRequested = false;
     _runner = null;
   }

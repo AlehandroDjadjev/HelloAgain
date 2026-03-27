@@ -5,11 +5,12 @@ Validates incoming plans against the Pydantic ActionPlan schema before persistin
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from django.db import transaction
+from django.db import IntegrityError, OperationalError, transaction
 
 from apps.agent_core.schemas import ActionPlan as ActionPlanSchema
 from apps.agent_sessions.models import AgentSession, SessionStatus
@@ -20,6 +21,9 @@ from apps.audit_log.models import AuditEventType, AuditActor
 from ..models import ActionPlanRecord, IntentRecord, PlanStatus
 
 logger = logging.getLogger(__name__)
+
+_SQLITE_LOCK_RETRY_ATTEMPTS = 4
+_SQLITE_LOCK_RETRY_DELAY_SECONDS = 0.05
 
 # Maps app package names to executor identifiers
 _APP_EXECUTOR_MAP = {
@@ -33,7 +37,6 @@ _APP_EXECUTOR_MAP = {
 
 class PlanService:
     @staticmethod
-    @transaction.atomic
     def store_intent(
         session: AgentSession,
         raw_transcript: str,
@@ -43,7 +46,7 @@ class PlanService:
         confidence: float = 1.0,
         ambiguity_flags: list | None = None,
     ) -> IntentRecord:
-        intent, _ = IntentRecord.objects.update_or_create(
+        intent = _store_intent_record_with_retry(
             session=session,
             defaults={
                 "raw_transcript": raw_transcript,
@@ -147,3 +150,57 @@ class PlanService:
     @staticmethod
     def get_executor_hint(app_package: str) -> str:
         return _APP_EXECUTOR_MAP.get(app_package, "generic_v1")
+
+
+def _store_intent_record_with_retry(
+    *,
+    session: AgentSession,
+    defaults: dict,
+) -> IntentRecord:
+    last_error: OperationalError | IntegrityError | None = None
+    for attempt in range(1, _SQLITE_LOCK_RETRY_ATTEMPTS + 1):
+        try:
+            return _store_intent_record_once(session=session, defaults=defaults)
+        except OperationalError as exc:
+            last_error = exc
+            if "database is locked" not in str(exc).lower():
+                raise
+            if attempt >= _SQLITE_LOCK_RETRY_ATTEMPTS:
+                raise
+            logger.warning(
+                "PlanService.store_intent retrying after SQLite lock for session=%s (attempt %d/%d)",
+                session.id,
+                attempt,
+                _SQLITE_LOCK_RETRY_ATTEMPTS,
+            )
+            time.sleep(_SQLITE_LOCK_RETRY_DELAY_SECONDS * attempt)
+        except IntegrityError as exc:
+            last_error = exc
+            if attempt >= _SQLITE_LOCK_RETRY_ATTEMPTS:
+                raise
+            logger.warning(
+                "PlanService.store_intent retrying after concurrent upsert race for session=%s (attempt %d/%d)",
+                session.id,
+                attempt,
+                _SQLITE_LOCK_RETRY_ATTEMPTS,
+            )
+            time.sleep(_SQLITE_LOCK_RETRY_DELAY_SECONDS * attempt)
+
+    assert last_error is not None
+    raise last_error
+
+
+@transaction.atomic
+def _store_intent_record_once(
+    *,
+    session: AgentSession,
+    defaults: dict,
+) -> IntentRecord:
+    intent = IntentRecord.objects.filter(session=session).first()
+    if intent is None:
+        return IntentRecord.objects.create(session=session, **defaults)
+
+    for field, value in defaults.items():
+        setattr(intent, field, value)
+    intent.save(update_fields=[*defaults.keys()])
+    return intent

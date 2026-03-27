@@ -83,6 +83,7 @@ class AgentClient {
     int durationMs = 0,
     String actionType = '',
     String reasoning = '',
+    String? screenshotBase64,
   }) => _post('/api/agent/sessions/$sessionId/action-result/', {
     'action_id': actionId,
     'result': {'success': success, 'code': code, 'message': message},
@@ -91,6 +92,7 @@ class AgentClient {
     'executed_at': DateTime.now().toUtc().toIso8601String(),
     if (actionType.isNotEmpty) 'action_type': actionType,
     if (reasoning.isNotEmpty) 'reasoning': reasoning,
+    if (screenshotBase64 != null) 'screenshot_b64': screenshotBase64,
   });
 
   // ── Confirmation ───────────────────────────────────────────────────────────

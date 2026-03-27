@@ -3,9 +3,12 @@ package com.example.control.service
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.graphics.Bitmap
 import android.graphics.Path
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.example.control.gateway.DeviceControlGateway
@@ -16,6 +19,7 @@ import com.example.control.model.SessionConfigDto
 import com.example.control.model.UiNodeDto
 import com.example.control.util.NodeMatcher
 import com.example.control.util.ScreenTreeSerializer
+import java.io.ByteArrayOutputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -62,6 +66,9 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
      */
     @Volatile
     private var eventCallback: ((ScreenStateDto) -> Unit)? = null
+
+    @Volatile
+    private var lastScreenshotError: String? = null
 
     // ── Service lifecycle ─────────────────────────────────────────────────────
 
@@ -224,13 +231,17 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
             Log.d(TAG, "FOCUS requested selector=${selectorSummary(selector)}")
             val node = NodeMatcher.findFirst(root, selector)
                 ?: return ActionResultDto.failure(
-                    "ELEMENT_NOT_FOUND", "No node matches selector for action FOCUS"
+                    "ELEMENT_NOT_FOUND",
+                    "No node matches selector for action FOCUS",
+                    takeScreenshot(),
                 )
             try {
                 Log.d(TAG, "FOCUS matched ${nodeSummary(node)}")
                 if (!node.isEnabled) {
                     return ActionResultDto.failure(
-                        "ELEMENT_NOT_CLICKABLE", "Matched node is disabled"
+                        "ELEMENT_NOT_CLICKABLE",
+                        "Matched node is disabled",
+                        takeScreenshot(),
                     )
                 }
 
@@ -392,6 +403,55 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
         return ActionResultDto.success("HOME", screen)
     }
 
+    override fun takeScreenshot(): ByteArray? {
+        lastScreenshotError = null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            lastScreenshotError = "SCREENSHOT_UNSUPPORTED: requires Android 11 / API 30+"
+            Log.w(TAG, "takeScreenshot failed: $lastScreenshotError")
+            return null
+        }
+        var result: ByteArray? = null
+        var failureReason: String? = null
+        val latch = CountDownLatch(1)
+        takeScreenshot(
+            Display.DEFAULT_DISPLAY,
+            mainExecutor,
+            object : TakeScreenshotCallback {
+                override fun onSuccess(screenshot: ScreenshotResult) {
+                    val bmp = Bitmap.wrapHardwareBuffer(
+                        screenshot.hardwareBuffer, screenshot.colorSpace
+                    )?.copy(Bitmap.Config.ARGB_8888, false)
+                    screenshot.hardwareBuffer.close()
+                    if (bmp != null) {
+                        val out = ByteArrayOutputStream()
+                        bmp.compress(Bitmap.CompressFormat.JPEG, 65, out)
+                        bmp.recycle()
+                        result = out.toByteArray()
+                    } else {
+                        failureReason = "SCREENSHOT_BITMAP_CONVERSION_FAILED"
+                    }
+                    latch.countDown()
+                }
+                override fun onFailure(errorCode: Int) {
+                    failureReason = "SCREENSHOT_CAPTURE_FAILED(code=$errorCode)"
+                    Log.w(TAG, "takeScreenshot onFailure code=$errorCode")
+                    latch.countDown()
+                }
+            },
+        )
+        val completed = latch.await(3, TimeUnit.SECONDS)
+        if (!completed) {
+            failureReason = "SCREENSHOT_TIMEOUT: capture did not complete within 3000ms"
+        }
+        if (result == null) {
+            lastScreenshotError = failureReason ?: "SCREENSHOT_FAILED: capture returned no image"
+            Log.w(TAG, "takeScreenshot failed: $lastScreenshotError")
+        }
+        return result
+    }
+
+    override fun getLastScreenshotError(): String? = lastScreenshotError
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /**
@@ -409,13 +469,17 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
             Log.d(TAG, "$actionName requested selector=${selectorSummary(selector)}")
             val node = NodeMatcher.findFirst(root, selector)
                 ?: return ActionResultDto.failure(
-                    "ELEMENT_NOT_FOUND", "No node matches selector for action $actionName"
+                    "ELEMENT_NOT_FOUND",
+                    "No node matches selector for action $actionName",
+                    takeScreenshot(),
                 )
             try {
                 Log.d(TAG, "$actionName matched ${nodeSummary(node)}")
                 if (!node.isEnabled) {
                     return ActionResultDto.failure(
-                        "ELEMENT_NOT_CLICKABLE", "Matched node is disabled"
+                        "ELEMENT_NOT_CLICKABLE",
+                        "Matched node is disabled",
+                        takeScreenshot(),
                     )
                 }
                 val ok = action(node)

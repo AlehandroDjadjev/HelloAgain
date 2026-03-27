@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from django.test import SimpleTestCase
+from django.db import OperationalError
+from django.test import SimpleTestCase, TestCase
 
+from apps.agent_plans.models import IntentRecord
 from apps.agent_plans.services.intent_service import IntentService
 from apps.agent_plans.services.plan_compiler import PlanCompiler
 from apps.agent_plans.services.plan_service import PlanService
+from apps.agent_sessions.services import SessionService
 
 
 class BrawlStarsSupportTests(SimpleTestCase):
@@ -47,3 +50,84 @@ class BrawlStarsSupportTests(SimpleTestCase):
         self.assertEqual(result.app_package, "com.android.chrome")
         self.assertEqual(result.goal_type, "search")
         self.assertIn("keyword detection fallback", " ".join(result.ambiguity_flags))
+
+    def test_parse_intent_accepts_dynamic_supported_package(self):
+        client = Mock()
+        client.generate.return_value = {
+            "goal": "Open Instagram",
+            "goal_type": "open_app",
+            "target_app": "com.instagram.android",
+            "entities": {},
+            "risk_level": "low",
+            "confidence": 0.93,
+            "ambiguity_flags": [],
+        }
+
+        result = IntentService(client=client).parse_intent(
+            "Open Instagram",
+            supported_packages=["com.instagram.android", "com.android.chrome"],
+        )
+
+        self.assertEqual(result.app_package, "com.instagram.android")
+        self.assertEqual(result.goal_type, "open_app")
+
+
+class PlanServiceStoreIntentTests(TestCase):
+    def test_store_intent_retries_after_sqlite_lock(self):
+        session = SessionService.create(
+            user_id="plan-test",
+            device_id="device-1",
+            transcript="open chrome",
+            input_mode="text",
+            supported_packages=["com.android.chrome"],
+        )
+
+        real_create = IntentRecord.objects.create
+        calls = {"count": 0}
+
+        def flaky_create(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise OperationalError("database is locked")
+            return real_create(*args, **kwargs)
+
+        with patch.object(IntentRecord.objects, "create", side_effect=flaky_create):
+            intent = PlanService.store_intent(
+                session=session,
+                raw_transcript="open chrome",
+                parsed_intent={"app_package": "com.android.chrome"},
+                goal_type="open_app",
+                confidence=0.8,
+            )
+
+        self.assertEqual(intent.session_id, session.id)
+        self.assertEqual(IntentRecord.objects.filter(session=session).count(), 1)
+
+    def test_store_intent_updates_existing_record(self):
+        session = SessionService.create(
+            user_id="plan-test",
+            device_id="device-2",
+            transcript="first",
+            input_mode="text",
+            supported_packages=["com.android.chrome"],
+        )
+
+        first = PlanService.store_intent(
+            session=session,
+            raw_transcript="first",
+            parsed_intent={"app_package": "com.android.chrome"},
+            goal_type="open_app",
+            confidence=0.6,
+        )
+        second = PlanService.store_intent(
+            session=session,
+            raw_transcript="second",
+            parsed_intent={"app_package": "com.whatsapp"},
+            goal_type="send_message",
+            confidence=0.9,
+        )
+
+        self.assertEqual(first.id, second.id)
+        second.refresh_from_db()
+        self.assertEqual(second.raw_transcript, "second")
+        self.assertEqual(second.goal_type, "send_message")

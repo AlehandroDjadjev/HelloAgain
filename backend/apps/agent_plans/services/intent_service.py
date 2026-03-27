@@ -30,6 +30,10 @@ SUPPORTED_APPS: dict[str, str] = {
     "com.supercell.brawlstars":        "Brawl Stars (game launcher)",
 }
 
+
+def _describe_supported_app(package_name: str) -> str:
+    return SUPPORTED_APPS.get(package_name, "Installed Android app")
+
 SUPPORTED_GOAL_TYPES: list[str] = [
     "send_message",        # send a chat/SMS message to a recipient
     "open_app",            # simply open an application
@@ -65,12 +69,12 @@ class IntentResult:
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 def _build_system_prompt(supported_packages: list[str]) -> str:
-    # Only include apps that the device reports as installed
+    package_list = supported_packages or list(SUPPORTED_APPS.keys())
+
     apps_section = "\n".join(
-        f'  - "{pkg}": {desc}'
-        for pkg, desc in SUPPORTED_APPS.items()
-        if pkg in supported_packages
-    ) or "\n".join(f'  - "{k}": {v}' for k, v in SUPPORTED_APPS.items())
+        f'  - "{pkg}": {_describe_supported_app(pkg)}'
+        for pkg in package_list
+    )
 
     goal_types_section = "\n".join(f"  - {g}" for g in SUPPORTED_GOAL_TYPES)
 
@@ -170,7 +174,12 @@ class IntentService:
                 json_mode=True,
             )
             raw_response = json.dumps(result_dict)
-            parsed = self._parse_llm_result(result_dict, transcript, raw_response)
+            parsed = self._parse_llm_result(
+                result_dict,
+                transcript,
+                raw_response,
+                allowed_packages=packages,
+            )
             if parsed.app_package and parsed.goal:
                 return parsed
 
@@ -210,11 +219,13 @@ class IntentService:
         data: dict,
         transcript: str,
         raw_response: str,
+        allowed_packages: list[str] | None = None,
     ) -> IntentResult:
         goal_type = str(data.get("goal_type", "")).strip()
         app_package = str(data.get("target_app", "")).strip()
         ambiguity: list[str] = list(data.get("ambiguity_flags", []))
         confidence: float = float(data.get("confidence", 1.0))
+        allowed_package_set = set(allowed_packages or SUPPORTED_APPS.keys())
 
         # Validate goal_type
         if goal_type not in SUPPORTED_GOAL_TYPES:
@@ -223,7 +234,7 @@ class IntentService:
             confidence = min(confidence, 0.4)
 
         # Validate app_package
-        if app_package not in SUPPORTED_APPS:
+        if app_package not in allowed_package_set:
             ambiguity.append(f"Unknown app package '{app_package}'")
             confidence = min(confidence, 0.4)
             app_package = ""

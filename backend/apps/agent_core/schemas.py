@@ -93,11 +93,20 @@ class AccessibilityNode(BaseModel):
     content_desc: Optional[str] = None
     view_id: Optional[str] = None
     class_name: Optional[str] = None
+    package_name: Optional[str] = None
+    parent_ref: Optional[str] = None
     bounds: Optional[Bounds] = None
     clickable: bool = False
+    long_clickable: bool = False
+    scrollable: bool = False
     enabled: bool = True
     focused: bool = False
+    selected: bool = False
+    editable: bool = False
+    checkable: bool = False
+    checked: bool = False
     index_in_parent: int = Field(default=0, ge=0)
+    child_count: int = Field(default=0, ge=0)
     children: List[str] = Field(default_factory=list)
 
     model_config = {"frozen": True}

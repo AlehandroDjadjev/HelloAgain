@@ -33,6 +33,10 @@ class MethodChannelHandler(private val appContext: Context) :
                 result.success(PermissionHelper.getPermissionStatus(appContext))
                 return
             }
+            "listLaunchablePackages" -> {
+                result.success(LaunchableAppsHelper.listLaunchablePackages(appContext))
+                return
+            }
             "openAccessibilitySettings" -> {
                 PermissionHelper.openAccessibilitySettings(appContext)
                 result.success(null)
@@ -138,6 +142,8 @@ class MethodChannelHandler(private val appContext: Context) :
             }
             "goBack" -> service.goBack().toMap()
             "goHome" -> service.goHome().toMap()
+            "takeScreenshot" -> service.takeScreenshot()
+            "getLastScreenshotError" -> service.getLastScreenshotError()
             else -> null.also { Log.w(TAG, "Unhandled method: ${call.method}") }
         }
     }

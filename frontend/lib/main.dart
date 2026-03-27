@@ -193,16 +193,6 @@ class _MainShellState extends State<MainShell> {
           ),
         ],
       ),
-      filledButtonTheme: FilledButtonThemeData(
-        style: FilledButton.styleFrom(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-        ),
-      ),
-        style: OutlinedButton.styleFrom(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
     );
   }
 }
@@ -210,6 +200,7 @@ class _MainShellState extends State<MainShell> {
 class _LocationFeaturePlaceholder extends StatelessWidget {
   const _LocationFeaturePlaceholder({
     required this.title,
+    required this.description,
     required this.icon,
     required this.isLoading,
     required this.errorMessage,

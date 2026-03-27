@@ -228,6 +228,7 @@ class StepRunner {
           durationMs: stopwatch.elapsedMilliseconds,
           actionType: stepType,
           reasoning: reasoning,
+          screenshotBase64: result.screenshotBase64,
         ),
       );
     } catch (e) {
@@ -408,6 +409,27 @@ class StepRunner {
           code: 'ABORTED',
           message: params['reason'] as String? ?? 'ABORT step reached',
         );
+
+      case 'GET_SCREENSHOT':
+        final screenshotB64 = await gateway.takeScreenshot();
+        final screenshotError = screenshotB64 == null
+            ? await gateway.getLastScreenshotError()
+            : null;
+        return ActionResult(
+          success: screenshotB64 != null,
+          code: screenshotB64 != null ? 'OK' : 'SCREENSHOT_FAILED',
+          message: screenshotB64 == null
+              ? (screenshotError ??
+                  'takeScreenshot returned null (API < 30 or capture failed)')
+              : null,
+          screenshotBase64: screenshotB64,
+        );
+
+      case 'TAP_COORDINATES':
+        // Single-point gesture with a short duration is equivalent to a tap.
+        final x = (params['x'] as num?)?.toInt() ?? 540;
+        final y = (params['y'] as num?)?.toInt() ?? 960;
+        return gateway.swipe(x, y, x, y, 50);
 
       default:
         return ActionResult(
