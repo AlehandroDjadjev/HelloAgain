@@ -2,6 +2,7 @@ import 'package:android_control_plugin/android_control_plugin.dart';
 import 'package:flutter/foundation.dart' show AsyncCallback;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 import '../api/agent_client.dart';
 import '../pipeline/orchestrator.dart';

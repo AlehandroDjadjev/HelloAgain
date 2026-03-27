@@ -1,99 +1,113 @@
-import logging
-from typing import Dict, Any
+from typing import Optional
 
 from voice_gateway.domain.contracts import (
-    VoiceGatewayRequest,
     BackendSpeakRequest,
+    VoiceConversationRequest,
+    VoiceConversationResponse,
+    VoiceGatewayRequest,
     VoiceGatewayResponse,
-    ConversationTurn,
 )
-from voice_gateway.services.routing import agent_dispatcher
-from voice_gateway.services.shaping import response_shaper
-from voice_gateway.services.memory import memory_service
-from voice_gateway.services.providers import MockSTTProvider, MockTTSProvider
+from voice_gateway.services.providers import (
+    GoogleCloudSpeechSTTProvider,
+    PiperTTSProvider,
+    PlaceholderQwenLLMProvider,
+)
 
-logger = logging.getLogger(__name__)
 
 class VoiceGatewayCore:
-    """
-    Central Communication Hub.
-    No decision-making. Just routes IO between the User, the Agents, and the Shape/TTS layers.
-    """
+    def __init__(self, stt_provider=None, llm_provider=None, tts_provider=None):
+        self.stt_provider = stt_provider or GoogleCloudSpeechSTTProvider()
+        self.llm_provider = llm_provider or PlaceholderQwenLLMProvider()
+        self.tts_provider = tts_provider or PiperTTSProvider()
 
-    def __init__(self):
-        self.stt_provider = MockSTTProvider()
-        self.tts_provider = MockTTSProvider()
+    def process_turn(
+        self,
+        request: VoiceConversationRequest,
+        audio_bytes: Optional[bytes] = None,
+    ) -> VoiceConversationResponse:
+        provider_status = {}
+        warnings = []
+
+        if audio_bytes:
+            transcription = self.stt_provider.transcribe(
+                audio_bytes,
+                language=request.language,
+            )
+            transcript = transcription.text
+            provider_status["stt"] = transcription.source
+            warnings.extend(transcription.warnings)
+        else:
+            transcript = request.message.strip()
+            provider_status["stt"] = "skipped_text_input"
+
+        if not transcript:
+            raise ValueError("No transcript was produced from the incoming request.")
+
+        llm_result = self.llm_provider.generate_reply(
+            prompt=transcript,
+            session_id=request.session_id,
+            user_id=request.user_id,
+        )
+        provider_status["llm"] = llm_result.source
+        warnings.extend(llm_result.warnings)
+
+        synthesis = self.tts_provider.synthesize(llm_result.text)
+        provider_status["tts"] = synthesis.source
+        warnings.extend(synthesis.warnings)
+
+        return VoiceConversationResponse(
+            transcript=transcript,
+            assistant_text=llm_result.text,
+            assistant_audio_bytes=synthesis.audio_bytes,
+            assistant_audio_mime_type=synthesis.mime_type,
+            provider_status=provider_status,
+            warnings=warnings,
+        )
 
     def process_user_request(self, request: VoiceGatewayRequest) -> VoiceGatewayResponse:
-        """
-        Flow 1: User says something. Gateway routes it to the backend system.
-        """
-        turn = ConversationTurn(source_message=request.message)
-
-        try:
-            # 1. Dispatch to the right backend system via simple triggers
-            agent_name = agent_dispatcher.dispatch_request(request)
-            turn.agent_name = agent_name
-
-            if not agent_name:
-                # No agent handles this, return a generic shape
-                return self._finalize_turn(turn, "FallbackAgent", {"status": "success", "message": "unrecognized_intent"})
-
-            # 2. Call the agent (In a real system this sends an HTTP request or event to the backend agent)
-            # For this MVP, we simulate a synchronous RPC call to the backend agent.
-            raw_response = self._mock_call_agent(agent_name, request.message)
-
-            # 3. Shape the response into speech
-            return self._finalize_turn(turn, agent_name, raw_response)
-
-        except Exception as e:
-            logger.exception(f"Error processing user request: {e}")
-            turn.error = str(e)
-            return self._error_response()
-
-    def process_agent_request(self, request: BackendSpeakRequest) -> VoiceGatewayResponse:
-        """
-        Flow 2: Backend system proactively wants to speak to the user.
-        """
-        turn = ConversationTurn(source_message="[AGENT_INITIATED]", agent_name=request.agent_name)
-        
-        try:
-            # Shape the raw data provided by the agent into spoken Bulgarian
-            return self._finalize_turn(turn, request.agent_name, request.raw_data)
-            
-        except Exception as e:
-            logger.exception(f"Error processing agent speak request: {e}")
-            turn.error = str(e)
-            return self._error_response()
-
-    def _finalize_turn(self, turn: ConversationTurn, agent_name: str, raw_data: Dict[str, Any]) -> VoiceGatewayResponse:
-        """
-        Passes data through the shaping layer and builds the final TTS response.
-        """
-        spoken_text = response_shaper.shape_response(agent_name, raw_data)
-        gateway_response = VoiceGatewayResponse(
-            spoken_text=spoken_text,
-            structured_data={"agent_used": agent_name}
+        response = self.process_turn(
+            VoiceConversationRequest(
+                user_id=request.user_id,
+                session_id=request.session_id,
+                message=request.message,
+            ),
         )
-        turn.shaped_response = gateway_response
-        return gateway_response
-        
-    def _error_response(self) -> VoiceGatewayResponse:
         return VoiceGatewayResponse(
-            status="error",
-            spoken_text="Извинете, има проблем със системата. Моля, опитайте по-късно.",
+            spoken_text=response.assistant_text,
+            structured_data={
+                "provider_status": response.provider_status,
+                "warnings": response.warnings,
+            },
         )
 
-    def _mock_call_agent(self, agent_name: str, message: str) -> Dict[str, Any]:
-        """
-        Simulates the backend system processing the forwarded request.
-        """
-        if agent_name == "AccountAgent":
-            return {"status": "success", "balance": "150.50"}
-        elif agent_name == "GreetingAgent":
-            return {"status": "success", "welcomed": True}
-        else:
-            return {"status": "success"}
+    def process_agent_request(
+        self,
+        request: BackendSpeakRequest,
+    ) -> VoiceGatewayResponse:
+        text = str(
+            request.raw_data.get("text")
+            or request.raw_data.get("message")
+            or request.raw_data,
+        ).strip()
+        if not text:
+            raise ValueError("No text was provided for agent_speak.")
 
-# Singleton instance
+        synthesis = self.tts_provider.synthesize(text)
+        return VoiceGatewayResponse(
+            spoken_text=text,
+            structured_data={
+                "provider_status": {"tts": synthesis.source},
+                "warnings": synthesis.warnings,
+                "audio_mime_type": synthesis.mime_type,
+            },
+        )
+
+    def health_status(self) -> dict[str, str]:
+        return {
+            "stt": self.stt_provider.status(),
+            "llm": self.llm_provider.status(),
+            "tts": self.tts_provider.status(),
+        }
+
+
 gateway_core = VoiceGatewayCore()

@@ -2,3 +2,4 @@ venv/
 __pycache__/
 db.sqlite3
 .env
+ticketwise-475207-fc09d05e513c.json
