@@ -13,6 +13,7 @@ data class SessionConfigDto(
     val maxStepCount: Int,
     val allowTextEntry: Boolean,
     val allowSendActions: Boolean,
+    val allowSensitiveNodes: Boolean,
 ) {
     companion object {
         @Suppress("UNCHECKED_CAST")
@@ -24,6 +25,7 @@ data class SessionConfigDto(
             maxStepCount = (map["maxStepCount"] as? Number)?.toInt() ?: 30,
             allowTextEntry = (map["allowTextEntry"] as? Boolean) ?: true,
             allowSendActions = (map["allowSendActions"] as? Boolean) ?: false,
+            allowSensitiveNodes = (map["allowSensitiveNodes"] as? Boolean) ?: false,
         )
     }
 }

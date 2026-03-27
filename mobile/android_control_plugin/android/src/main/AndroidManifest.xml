@@ -14,11 +14,10 @@
         DO NOT add QUERY_ALL_PACKAGES — only the supported app set is declared.
     -->
     <queries>
-        <package android:name="com.whatsapp" />
-        <package android:name="com.google.android.apps.maps" />
-        <package android:name="com.android.chrome" />
-        <package android:name="com.google.android.gm" />
-        <package android:name="com.supercell.brawlstars" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
 
     <application>

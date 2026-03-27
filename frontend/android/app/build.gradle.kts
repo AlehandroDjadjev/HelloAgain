@@ -1,4 +1,7 @@
 import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+import java.util.Properties
 
 plugins {
     id("com.android.application")
@@ -10,7 +13,7 @@ plugins {
 val localProperties = Properties().apply {
     val file = rootProject.file("local.properties")
     if (file.exists()) {
-        file.inputStream().use { load(it) }
+        file.inputStream().use { input -> this.load(input) }
     }
 }
 
@@ -28,10 +31,6 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
         isCoreLibraryDesugaringEnabled = true
-    }
-
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
     defaultConfig {
@@ -55,9 +54,14 @@ android {
     }
 }
 
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+    }
+}
+
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
-    implementation("com.google.android.gms:play-services-auth:21.3.0")
 }
 
 flutter {

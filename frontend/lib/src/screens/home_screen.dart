@@ -1,11 +1,16 @@
+import 'dart:async';
+
 import 'package:android_control_plugin/android_control_plugin.dart';
 import 'package:flutter/foundation.dart' show AsyncCallback;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../api/agent_client.dart';
+import '../api/voice_gateway_client.dart';
+import '../config/backend_base_url.dart';
 import '../pipeline/orchestrator.dart';
 import '../pipeline/pipeline_state.dart';
+import '../voice/agent_voice_controller.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -18,10 +23,14 @@ class _HomeScreenState extends State<HomeScreen> {
   late final TextEditingController _commandCtrl;
   late final TextEditingController _urlCtrl;
   late PipelineOrchestrator _orch;
+  late AgentVoiceController _voiceController;
   final _scrollCtrl = ScrollController();
   bool _showUrlField = false;
   bool _isLeavingApp = false;
   String _reasoningProvider = 'local';
+  String _lastSubmittedCommand = '';
+  PipelinePhase _lastObservedPhase = PipelinePhase.idle;
+  String? _activeConfirmationKey;
 
   @override
   void initState() {
@@ -29,9 +38,15 @@ class _HomeScreenState extends State<HomeScreen> {
     _commandCtrl = TextEditingController(
       text: 'Search up Jeffrey Epstien on Chrome',
     );
-    _urlCtrl = TextEditingController(text: 'http://127.0.0.1:8000');
+    _urlCtrl = TextEditingController(text: _resolveDefaultBaseUrl());
     _orch = PipelineOrchestrator(client: AgentClient(baseUrl: _urlCtrl.text));
     _orch.addListener(_onOrchestratorChange);
+    _voiceController = _buildVoiceController(_urlCtrl.text);
+    _voiceController.addListener(_onVoiceControllerChange);
+  }
+
+  String _resolveDefaultBaseUrl() {
+    return resolveBackendBaseUrl();
   }
 
   void _onOrchestratorChange() {
@@ -42,15 +57,42 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     if (_orch.pendingConfirmation != null &&
         _orch.phase == PipelinePhase.awaitingConfirmation) {
+      final conf = _orch.pendingConfirmation!;
+      final confirmationKey = conf.confirmationId.isNotEmpty
+          ? conf.confirmationId
+          : conf.stepId;
+      if (_activeConfirmationKey == confirmationKey) {
+        return;
+      }
+      _activeConfirmationKey = confirmationKey;
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _showConfirmationDialog(_orch.pendingConfirmation!);
+        _showConfirmationDialog(conf);
       });
+      if (_voiceController.enabled) {
+        unawaited(_voiceController.speakText(_buildConfirmationSpeech(conf)));
+      }
+    } else if (_orch.phase != PipelinePhase.awaitingConfirmation) {
+      _activeConfirmationKey = null;
+    }
+
+    if (_lastObservedPhase != _orch.phase) {
+      _lastObservedPhase = _orch.phase;
+      _handlePhaseTransition(_orch.phase);
+    }
+  }
+
+  void _onVoiceControllerChange() {
+    if (mounted) {
+      setState(() {});
     }
   }
 
   @override
   void dispose() {
     _orch.removeListener(_onOrchestratorChange);
+    _voiceController.removeListener(_onVoiceControllerChange);
+    unawaited(_voiceController.stop());
+    _voiceController.dispose();
     _commandCtrl.dispose();
     _urlCtrl.dispose();
     _scrollCtrl.dispose();
@@ -58,17 +100,143 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _rebuildOrchestrator() {
+    final shouldRestartVoice = _voiceController.enabled;
     _orch.removeListener(_onOrchestratorChange);
     _orch = PipelineOrchestrator(client: AgentClient(baseUrl: _urlCtrl.text));
     _orch.addListener(_onOrchestratorChange);
+    _lastObservedPhase = _orch.phase;
+
+    _voiceController.removeListener(_onVoiceControllerChange);
+    unawaited(_voiceController.stop());
+    _voiceController.dispose();
+    _voiceController = _buildVoiceController(_urlCtrl.text);
+    _voiceController.addListener(_onVoiceControllerChange);
+    if (shouldRestartVoice) {
+      unawaited(_voiceController.start());
+    }
     setState(() {});
   }
 
-  Future<void> _run() async {
-    final command = _commandCtrl.text.trim();
+  AgentVoiceController _buildVoiceController(String baseUrl) {
+    return AgentVoiceController(
+      client: VoiceGatewayClient(baseUrl: baseUrl),
+      onTranscript: _handleVoiceTranscript,
+    );
+  }
+
+  Future<void> _run({
+    String? commandOverride,
+    bool triggeredByVoice = false,
+  }) async {
+    final command = (commandOverride ?? _commandCtrl.text).trim();
     if (command.isEmpty) return;
+    _lastSubmittedCommand = command;
     FocusScope.of(context).unfocus();
+    if (_voiceController.enabled) {
+      await _voiceController.pauseForTask(
+        status: triggeredByVoice
+            ? 'Running your voice command in the background...'
+            : 'Running the agent command...',
+      );
+    }
     await _orch.run(command, reasoningProvider: _reasoningProvider);
+  }
+
+  Future<void> _handleVoiceTranscript(String transcript) async {
+    if (_orch.phase.isRunning) {
+      await _voiceController.speakText(
+        'I am still busy with the previous request.',
+        resumeWhenDone: true,
+      );
+      return;
+    }
+
+    _commandCtrl.value = TextEditingValue(
+      text: transcript,
+      selection: TextSelection.collapsed(offset: transcript.length),
+    );
+    _lastSubmittedCommand = transcript;
+
+    await _voiceController.pauseForTask(
+      status: 'Voice command captured. Starting the agent...',
+    );
+    await _voiceController.speakText('Working on it.');
+    unawaited(_run(commandOverride: transcript, triggeredByVoice: true));
+  }
+
+  void _handlePhaseTransition(PipelinePhase nextPhase) {
+    if (!_voiceController.enabled) {
+      return;
+    }
+    switch (nextPhase) {
+      case PipelinePhase.completed:
+        unawaited(
+          _voiceController.speakText(
+            _buildCompletionSpeech(),
+            resumeWhenDone: true,
+          ),
+        );
+        return;
+      case PipelinePhase.failed:
+        unawaited(
+          _voiceController.speakText(
+            _buildFailureSpeech(),
+            resumeWhenDone: true,
+          ),
+        );
+        return;
+      case PipelinePhase.cancelled:
+        unawaited(
+          _voiceController.speakText(
+            'The request was cancelled.',
+            resumeWhenDone: true,
+          ),
+        );
+        return;
+      default:
+        return;
+    }
+  }
+
+  String _buildCompletionSpeech() {
+    final command = _lastSubmittedCommand.trim();
+    if (command.isEmpty) {
+      return 'Done. The request is complete.';
+    }
+    return 'Done. I finished $command.';
+  }
+
+  String _buildFailureSpeech() {
+    final errorMessage = _orch.errorMessage?.trim() ?? '';
+    if (errorMessage.isEmpty) {
+      return 'I could not finish that request.';
+    }
+    return 'I ran into a problem. $errorMessage';
+  }
+
+  String _buildConfirmationSpeech(ConfirmationRequest conf) {
+    final summary = conf.actionSummary.trim();
+    if (summary.isEmpty) {
+      return 'I need your confirmation before I continue.';
+    }
+    return 'I need your confirmation before I continue. $summary';
+  }
+
+  Future<void> _toggleHandsFree() async {
+    try {
+      if (_voiceController.enabled) {
+        await _voiceController.stop();
+      } else {
+        await _voiceController.start();
+      }
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
   }
 
   Future<void> _leaveApp() async {
@@ -101,6 +269,9 @@ class _HomeScreenState extends State<HomeScreen> {
         conf: conf,
         onApprove: () {
           Navigator.of(ctx).pop();
+          if (_voiceController.enabled) {
+            unawaited(_voiceController.speakText('Continuing.'));
+          }
           _orch.approveConfirmation();
         },
         onReject: () {
@@ -243,10 +414,24 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                   ),
                   Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                    child: _HandsFreeVoiceCard(
+                      enabled: _voiceController.enabled,
+                      listening: _voiceController.listening,
+                      processing: _voiceController.processing,
+                      speaking: _voiceController.speaking,
+                      micLevel: _voiceController.micLevel,
+                      status: _voiceController.status,
+                      error: _voiceController.error,
+                      lastTranscript: _voiceController.lastTranscript,
+                      onToggle: _toggleHandsFree,
+                    ),
+                  ),
+                  Padding(
                     padding: const EdgeInsets.all(16),
                     child: _ControlBar(
                       phase: phase,
-                      onRun: isRunning ? null : _run,
+                      onRun: isRunning ? null : () => _run(),
                       onPause: _orch.canPause ? _orch.pause : null,
                       onCancel: _orch.canCancel ? _orch.cancel : null,
                     ),
@@ -514,6 +699,123 @@ class _ControlBar extends StatelessWidget {
           ),
         ],
       ],
+    );
+  }
+}
+
+class _HandsFreeVoiceCard extends StatelessWidget {
+  const _HandsFreeVoiceCard({
+    required this.enabled,
+    required this.listening,
+    required this.processing,
+    required this.speaking,
+    required this.micLevel,
+    required this.status,
+    required this.error,
+    required this.lastTranscript,
+    required this.onToggle,
+  });
+
+  final bool enabled;
+  final bool listening;
+  final bool processing;
+  final bool speaking;
+  final double micLevel;
+  final String status;
+  final String? error;
+  final String lastTranscript;
+  final VoidCallback onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final activityLabel = speaking
+        ? 'Speaking'
+        : processing
+        ? 'Processing'
+        : listening
+        ? 'Listening'
+        : enabled
+        ? 'Standing by'
+        : 'Disabled';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: cs.primaryContainer.withAlpha(60),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: cs.primary.withAlpha(70)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.keyboard_voice_rounded, color: cs.primary, size: 20),
+              const SizedBox(width: 8),
+              Text(
+                'Hands-Free Agent Voice',
+                style: TextStyle(
+                  color: cs.onSurface,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const Spacer(),
+              FilledButton.tonalIcon(
+                onPressed: onToggle,
+                icon: Icon(enabled ? Icons.stop : Icons.play_arrow_rounded),
+                label: Text(enabled ? 'Stop' : 'Start'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Uses /transcribe for live voice commands and /speak for spoken replies while the phone agent keeps running in the background.',
+            style: TextStyle(
+              fontSize: 13,
+              height: 1.35,
+              color: cs.onSurface.withAlpha(180),
+            ),
+          ),
+          const SizedBox(height: 12),
+          LinearProgressIndicator(
+            value: enabled ? (micLevel == 0 ? null : micLevel) : 0,
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              Chip(label: Text(activityLabel)),
+              Chip(
+                label: Text(enabled ? 'Background ready' : 'Background idle'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Text(status, style: TextStyle(fontSize: 13, color: cs.onSurface)),
+          if (lastTranscript.trim().isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Last transcript: $lastTranscript',
+              style: TextStyle(
+                fontSize: 12,
+                color: cs.onSurface.withAlpha(170),
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ],
+          if (error != null && error!.trim().isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              error!,
+              style: const TextStyle(color: Colors.redAccent, fontSize: 12),
+            ),
+          ],
+        ],
+      ),
     );
   }
 }

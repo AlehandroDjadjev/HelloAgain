@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
 from apps.agent_core.services.screen_formatter import (
     SENSITIVE_SENTINEL,
@@ -12,6 +12,8 @@ from apps.agent_core.services.screen_formatter import (
 from apps.agent_core.services.step_reasoning import (
     ReasonedStep,
     StepReasoningService,
+    _build_failure_context,
+    _align_step_to_visible_text_target,
     _extract_refs,
     _normalize_reasoned_step,
     _validate_response,
@@ -26,8 +28,15 @@ def _node(
     cdesc: str | None = None,
     view_id: str | None = None,
     clickable: bool = False,
+    long_clickable: bool = False,
+    scrollable: bool = False,
     editable: bool = False,
     focused: bool = False,
+    selected: bool = False,
+    checkable: bool = False,
+    checked: bool = False,
+    parent_ref: str | None = None,
+    index_in_parent: int = 0,
     bounds: dict | None = None,
     children: list[str] | None = None,
 ) -> dict:
@@ -38,10 +47,18 @@ def _node(
         "content_desc": cdesc,
         "view_id": view_id,
         "clickable": clickable,
+        "long_clickable": long_clickable,
+        "scrollable": scrollable,
         "editable": editable,
         "focused": focused,
+        "selected": selected,
+        "checkable": checkable,
+        "checked": checked,
         "enabled": True,
+        "parent_ref": parent_ref,
+        "index_in_parent": index_in_parent,
         "bounds": bounds or {"left": 0, "top": 0, "right": 100, "bottom": 50},
+        "child_count": len(children or []),
         "children": children or [],
     }
 
@@ -95,6 +112,7 @@ class ScreenFormatterTests(SimpleTestCase):
         self.assertIn("[n191]", text)
         self.assertNotIn("[n5]", text)
 
+    @override_settings(AGENT_UNSAFE_AUTOMATION_MODE=False)
     def test_format_screen_sensitive(self):
         text = format_screen_for_llm(_screen([_node("n1", "android.widget.TextView", text="Hidden")], sensitive=True))
         self.assertIn(SENSITIVE_SENTINEL, text)
@@ -131,7 +149,64 @@ class ScreenFormatterTests(SimpleTestCase):
         self.assertIn("Earlier steps:", text)
         self.assertLessEqual(text.count("Step "), 5)
 
+    def test_format_screen_prefers_contact_name_over_section_header_label(self):
+        text = format_screen_for_llm(_screen([
+            _node("n13", "android.widget.RelativeLayout", clickable=True),
+            _node("n14", "android.widget.TextView", text="CONTACTS"),
+            _node("n15", "android.widget.TextView", text="Кичо"),
+            _node("n16", "android.widget.ImageView", cdesc="Video call", clickable=True),
+        ]))
+        self.assertIn("label='Кичо'", text)
 
+    def test_format_screen_surfaces_kind_actions_and_parent_metadata(self):
+        text = format_screen_for_llm(_screen([
+            _node(
+                "n1",
+                "android.widget.RelativeLayout",
+                clickable=True,
+                children=["n2"],
+                bounds={"left": 0, "top": 200, "right": 300, "bottom": 320},
+            ),
+            _node(
+                "n2",
+                "android.widget.TextView",
+                text="Alex",
+                parent_ref="n1",
+                index_in_parent=0,
+                bounds={"left": 20, "top": 220, "right": 180, "bottom": 270},
+            ),
+            _node(
+                "n3",
+                "android.widget.EditText",
+                cdesc="Message",
+                clickable=True,
+                editable=True,
+                bounds={"left": 0, "top": 700, "right": 300, "bottom": 780},
+            ),
+        ]))
+        self.assertIn("kind=row", text)
+        self.assertIn("actions=tap", text)
+        self.assertIn("kind=input", text)
+        self.assertIn("actions=tap,focus,type", text)
+        self.assertIn("parent=n1", text)
+        self.assertIn("idx=0", text)
+
+    def test_format_screen_keeps_view_id_as_metadata_not_title(self):
+        text = format_screen_for_llm(_screen([
+            _node(
+                "n25",
+                "android.widget.ImageView",
+                view_id="com.nothing.camera:id/google_lens_btn",
+                cdesc="Take Photo",
+                clickable=True,
+            ),
+        ]))
+        self.assertNotIn("title='", text)
+        self.assertIn("id=com.nothing.camera:id/google_lens", text)
+        self.assertIn("contentDesc='Take Photo'", text)
+
+
+@override_settings(AGENT_UNSAFE_AUTOMATION_MODE=False)
 class ValidationTests(SimpleTestCase):
     def test_validate_response_valid(self):
         screen_state = _screen([_node("n1", "android.widget.EditText", editable=True, focused=True)], focused="n1")
@@ -143,6 +218,19 @@ class ValidationTests(SimpleTestCase):
             "is_goal_complete": False,
             "requires_confirmation": False,
             "sensitivity": "medium",
+        }
+        self.assertIsNone(_validate_response(raw, _extract_refs(screen_state), screen_state))
+
+    def test_validate_response_allows_get_screenshot(self):
+        screen_state = _screen([_node("n1", "android.widget.TextView", text="Sparse UI")])
+        raw = {
+            "action_type": "GET_SCREENSHOT",
+            "params": {"element_hint": "first search result row"},
+            "reasoning": "No reliable target node is exposed after scanning the tree.",
+            "confidence": 0.7,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
         }
         self.assertIsNone(_validate_response(raw, _extract_refs(screen_state), screen_state))
 
@@ -179,7 +267,72 @@ class ValidationTests(SimpleTestCase):
         error = _validate_response("not-json", _extract_refs(screen_state), screen_state)
         self.assertIn("JSON object", error or "")
 
+    def test_format_screen_includes_explicit_state_flags(self):
+        text = format_screen_for_llm(_screen([
+            _node(
+                "n12",
+                "androidx.recyclerview.widget.RecyclerView",
+                view_id="com.viber.voip:id/recycler_view",
+                clickable=False,
+                editable=False,
+                focused=False,
+            )
+        ]))
+        self.assertIn("clickable=false", text)
+        self.assertIn("editable=false", text)
+        self.assertIn("focused=false", text)
+        self.assertIn("enabled=true", text)
 
+    def test_format_screen_surfaces_descendant_label_for_clickable_row(self):
+        text = format_screen_for_llm(_screen([
+            _node("n0", "android.widget.FrameLayout", children=["n1"]),
+            _node("n1", "android.view.ViewGroup", clickable=True, children=["n2", "n3"]),
+            _node("n2", "android.widget.TextView", text="Кичо"),
+            _node("n3", "android.widget.ImageView", cdesc="Video call", clickable=True),
+        ]))
+        self.assertIn("[n1]", text)
+        self.assertIn("label='Кичо'", text)
+
+    def test_format_screen_surfaces_flat_sibling_label_for_clickable_row(self):
+        text = format_screen_for_llm(_screen([
+            _node("n8", "android.view.ViewGroup", clickable=True),
+            _node("n9", "android.widget.TextView", text="Майката"),
+            _node("n12", "android.view.ViewGroup", clickable=True),
+            _node("n13", "android.widget.TextView", text="Кичо"),
+        ]))
+        self.assertIn("label='Майката'", text)
+        self.assertIn("label='Кичо'", text)
+
+    @override_settings(AGENT_UNSAFE_AUTOMATION_MODE=True)
+    def test_validate_response_rejects_abort_in_unsafe_mode(self):
+        screen_state = _screen([_node("n1", "android.widget.Button", text="Go", clickable=True)])
+        raw = {
+            "action_type": "ABORT",
+            "params": {"reason": "sensitive_screen"},
+            "reasoning": "Unsafe mode should not accept abort here.",
+            "confidence": 0.5,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "high",
+        }
+
+        error = _validate_response(raw, _extract_refs(screen_state), screen_state)
+        self.assertIn("Unsafe automation mode is enabled", error or "")
+
+    def test_build_failure_context_surfaces_stale_screen_hint(self):
+        context = _build_failure_context([
+            {
+                "action_type": "TAP_ELEMENT",
+                "params": {"selector": {"element_ref": "n25"}},
+                "result_success": False,
+                "result_code": "NO_SCREEN_CHANGE",
+            }
+        ])
+        self.assertIn("Screen did not change after this action", context)
+        self.assertIn("n25", context)
+
+
+@override_settings(AGENT_UNSAFE_AUTOMATION_MODE=False)
 class StepReasoningServiceTests(SimpleTestCase):
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
     def test_reason_next_step_uses_mocked_llm(self, mock_from_settings):
@@ -226,3 +379,162 @@ class StepReasoningServiceTests(SimpleTestCase):
         )
         self.assertEqual(step.action_type, "FOCUS_ELEMENT")
         self.assertIn("visible but not focused", step.reasoning)
+
+    def test_align_step_to_visible_text_target_retargets_wrong_row(self):
+        screen_state = _screen([
+            _node("n8", "android.view.ViewGroup", clickable=True),
+            _node("n9", "android.widget.TextView", text="Майката"),
+            _node("n12", "android.view.ViewGroup", clickable=True),
+            _node("n13", "android.widget.TextView", text="Кичо"),
+        ])
+        step = _align_step_to_visible_text_target(
+            ReasonedStep(
+                action_type="TAP_ELEMENT",
+                params={"selector": {"element_ref": "n8"}},
+                reasoning="Tap the first result row.",
+                confidence=0.7,
+                is_goal_complete=False,
+                requires_confirmation=False,
+                sensitivity="low",
+            ),
+            screen_state=screen_state,
+            entities={"query": "Кичо"},
+            goal="Search for Кичо in Viber",
+        )
+        self.assertEqual(step.params["selector"]["element_ref"], "n12")
+        self.assertIn("matches the requested text", step.reasoning)
+
+    def test_align_step_to_visible_text_target_retargets_grouped_contact_to_text_node(self):
+        screen_state = _screen([
+            _node("n13", "android.widget.RelativeLayout", clickable=True),
+            _node("n14", "android.widget.TextView", text="CONTACTS"),
+            _node("n15", "android.widget.TextView", text="Кичо"),
+            _node("n16", "android.widget.ImageView", cdesc="Video call", clickable=True),
+        ])
+        step = _align_step_to_visible_text_target(
+            ReasonedStep(
+                action_type="TAP_ELEMENT",
+                params={"selector": {"element_ref": "n13"}},
+                reasoning="Tap the contacts row.",
+                confidence=0.7,
+                is_goal_complete=False,
+                requires_confirmation=False,
+                sensitivity="low",
+            ),
+            screen_state=screen_state,
+            entities={"query": "Кичо"},
+            goal="Search for Кичо in Viber",
+        )
+        self.assertEqual(step.params["selector"]["element_ref"], "n13")
+        self.assertIn("matches the requested text", step.reasoning)
+
+    def test_align_step_to_visible_text_target_keeps_exact_clickable_row(self):
+        screen_state = _screen([
+            _node("n36", "android.view.ViewGroup", clickable=True, children=["n37"]),
+            _node(
+                "n37",
+                "android.widget.TextView",
+                text="ÐšÐ¸Ñ‡Ð¾",
+                parent_ref="n36",
+                index_in_parent=0,
+            ),
+        ])
+        step = _align_step_to_visible_text_target(
+            ReasonedStep(
+                action_type="TAP_ELEMENT",
+                params={"selector": {"element_ref": "n36"}},
+                reasoning="Tap the Kicho row.",
+                confidence=0.7,
+                is_goal_complete=False,
+                requires_confirmation=False,
+                sensitivity="low",
+            ),
+            screen_state=screen_state,
+            entities={"query": "ÐšÐ¸Ñ‡Ð¾"},
+            goal="Search for ÐšÐ¸Ñ‡Ð¾ in Viber",
+        )
+        self.assertEqual(step.params["selector"]["element_ref"], "n36")
+
+    def test_align_step_to_visible_text_target_keeps_clickable_chrome_suggestion_row(self):
+        screen_state = _screen([
+            _node(
+                "n6",
+                "android.widget.EditText",
+                text="Jeffrey Epstiena",
+                clickable=True,
+                editable=True,
+                focused=True,
+                bounds={"left": 0, "top": 40, "right": 300, "bottom": 120},
+            ),
+            _node(
+                "n12",
+                "android.view.ViewGroup",
+                clickable=True,
+                bounds={"left": 0, "top": 160, "right": 300, "bottom": 240},
+            ),
+            _node(
+                "n13",
+                "android.widget.TextView",
+                text="jeffrey epstein",
+                bounds={"left": 24, "top": 178, "right": 240, "bottom": 220},
+            ),
+        ], focused="n6")
+        step = _align_step_to_visible_text_target(
+            ReasonedStep(
+                action_type="TAP_ELEMENT",
+                params={"selector": {"element_ref": "n12"}},
+                reasoning="Tap the matching suggestion row.",
+                confidence=0.7,
+                is_goal_complete=False,
+                requires_confirmation=False,
+                sensitivity="low",
+            ),
+            screen_state=screen_state,
+            entities={"query": "jeffrey epstein"},
+            goal="Search for jeffrey epstein in Chrome",
+        )
+        self.assertEqual(step.params["selector"]["element_ref"], "n12")
+
+    def test_align_step_to_visible_text_target_does_not_retarget_to_chat_title(self):
+        screen_state = _screen([
+            _node(
+                "n1",
+                "android.view.ViewGroup",
+                clickable=True,
+                view_id="com.viber.voip:id/toolbar",
+                bounds={"left": 0, "top": 0, "right": 300, "bottom": 120},
+                children=["n2"],
+            ),
+            _node(
+                "n2",
+                "android.widget.TextView",
+                text="Alex",
+                view_id="com.viber.voip:id/title",
+                parent_ref="n1",
+                index_in_parent=0,
+                bounds={"left": 90, "top": 30, "right": 220, "bottom": 80},
+            ),
+            _node(
+                "n3",
+                "android.widget.EditText",
+                cdesc="Message…",
+                clickable=True,
+                editable=True,
+                bounds={"left": 0, "top": 820, "right": 300, "bottom": 900},
+            ),
+        ])
+        step = _align_step_to_visible_text_target(
+            ReasonedStep(
+                action_type="TAP_ELEMENT",
+                params={"selector": {"element_ref": "n3"}},
+                reasoning="Focus the message composer.",
+                confidence=0.7,
+                is_goal_complete=False,
+                requires_confirmation=False,
+                sensitivity="low",
+            ),
+            screen_state=screen_state,
+            entities={"recipient": "Alex"},
+            goal="Text Alex in Viber",
+        )
+        self.assertEqual(step.params["selector"]["element_ref"], "n3")

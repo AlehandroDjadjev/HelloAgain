@@ -11,6 +11,7 @@ class SessionConfig {
   final int maxStepCount;
   final bool allowTextEntry;
   final bool allowSendActions;
+  final bool allowSensitiveNodes;
 
   const SessionConfig({
     required this.sessionId,
@@ -19,6 +20,7 @@ class SessionConfig {
     this.maxStepCount = 30,
     this.allowTextEntry = true,
     this.allowSendActions = false,
+    this.allowSensitiveNodes = false,
   });
 
   factory SessionConfig.fromMap(Map<Object?, Object?> map) {
@@ -31,6 +33,7 @@ class SessionConfig {
       maxStepCount: (map['maxStepCount'] as num?)?.toInt() ?? 30,
       allowTextEntry: (map['allowTextEntry'] as bool?) ?? true,
       allowSendActions: (map['allowSendActions'] as bool?) ?? false,
+      allowSensitiveNodes: (map['allowSensitiveNodes'] as bool?) ?? false,
     );
   }
 
@@ -41,5 +44,6 @@ class SessionConfig {
         'maxStepCount': maxStepCount,
         'allowTextEntry': allowTextEntry,
         'allowSendActions': allowSendActions,
+        'allowSensitiveNodes': allowSensitiveNodes,
       };
 }

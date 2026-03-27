@@ -9,11 +9,13 @@ Design rules (enforced here):
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional
 from uuid import UUID
 
 from django.http import Http404
+from django.db import OperationalError
 from rest_framework import status
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -33,7 +35,7 @@ from apps.agent_core.schemas import ActionPlan as ActionPlanSchema
 from apps.agent_policy.models import UserAutomationPolicy
 from apps.agent_policy.services import PolicyEnforcer
 from apps.device_bridge.serializers import ActionResultIngestSerializer, AgentActionEventSerializer
-from apps.device_bridge.services import DeviceBridgeService
+from apps.device_bridge.services import DeviceBridgeService, store_screenshot
 from apps.audit_log.services import AuditService
 from apps.audit_log.models import AuditEventType, AuditActor
 
@@ -57,16 +59,37 @@ from .services import SessionService
 
 logger = logging.getLogger(__name__)
 
+_SQLITE_LOCK_RETRY_ATTEMPTS = 4
+_SQLITE_LOCK_RETRY_DELAY_SECONDS = 0.05
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _get_session(session_id: UUID) -> AgentSession:
-    try:
-        return AgentSession.objects.get(pk=session_id)
-    except AgentSession.DoesNotExist:
-        raise Http404
+    last_error: OperationalError | None = None
+    for attempt in range(1, _SQLITE_LOCK_RETRY_ATTEMPTS + 1):
+        try:
+            return AgentSession.objects.get(pk=session_id)
+        except AgentSession.DoesNotExist:
+            raise Http404
+        except OperationalError as exc:
+            last_error = exc
+            if "database is locked" not in str(exc).lower():
+                raise
+            if attempt >= _SQLITE_LOCK_RETRY_ATTEMPTS:
+                raise
+            logger.warning(
+                "_get_session retrying after SQLite lock for session=%s (attempt %d/%d)",
+                session_id,
+                attempt,
+                _SQLITE_LOCK_RETRY_ATTEMPTS,
+            )
+            time.sleep(_SQLITE_LOCK_RETRY_DELAY_SECONDS * attempt)
+
+    assert last_error is not None
+    raise last_error
 
 
 def _get_plan(session: AgentSession) -> ActionPlanRecord:
@@ -528,9 +551,10 @@ class SessionActionResultView(APIView):
         ser.is_valid(raise_exception=True)
         d = ser.validated_data
 
-        result    = d["result"]
-        action_id = d["action_id"]
-        plan_id   = d.get("plan_id")
+        result        = d["result"]
+        action_id     = d["action_id"]
+        plan_id       = d.get("plan_id")
+        screenshot_b64 = request.data.get("screenshot_b64") or None
 
         # ── Persist screen state ────────────────────────────────────────────────
         screen_record = None
@@ -586,6 +610,10 @@ class SessionActionResultView(APIView):
             screen_state=screen_record,
             duration_ms=d.get("duration_ms", 0),
         )
+
+        # ── Cache screenshot for the next /next-step/ call ─────────────────────
+        if screenshot_b64:
+            store_screenshot(str(session.id), screenshot_b64)
 
         # ── Resolve plan (plan mode only) ───────────────────────────────────────
         session.refresh_from_db()

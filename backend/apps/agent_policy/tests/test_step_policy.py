@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from apps.agent_core.services.step_reasoning import ReasonedStep
 from apps.agent_policy.models import UserAutomationPolicy
 from apps.agent_policy.services import PolicyEnforcer
+from apps.agent_sessions.models import AgentSession, InputMode
 
 
 def _screen() -> dict:
@@ -51,6 +52,7 @@ def _step(action_type: str, params: dict, *, sensitivity: str = "low") -> Reason
     )
 
 
+@override_settings(AGENT_UNSAFE_AUTOMATION_MODE=False)
 class StepPolicyTests(TestCase):
     def test_allowed_action(self):
         result = PolicyEnforcer.check_step(
@@ -152,3 +154,38 @@ class StepPolicyTests(TestCase):
         )
         self.assertFalse(result.allowed)
         self.assertEqual(result.blocked_reason, "invalid_action_type")
+
+    def test_session_supported_packages_allow_dynamic_open_app(self):
+        session = AgentSession.objects.create(
+            user_id="u4",
+            input_mode=InputMode.TEXT,
+            supported_packages=["com.instagram.android"],
+        )
+
+        result = PolicyEnforcer.check_step(
+            step=_step("OPEN_APP", {"package_name": "com.instagram.android"}),
+            session_goal="open instagram",
+            target_package="com.instagram.android",
+            user_policy=None,
+            step_count=1,
+            screen_state=_screen(),
+            session=session,
+        )
+
+        self.assertTrue(result.allowed)
+        self.assertIsNone(result.blocked_reason)
+
+    @override_settings(AGENT_UNSAFE_AUTOMATION_MODE=True)
+    def test_unsafe_mode_bypasses_confirmation_and_blocks(self):
+        result = PolicyEnforcer.check_step(
+            step=_step("TAP_ELEMENT", {"selector": {"element_ref": "send_btn"}}),
+            session_goal="send a message",
+            target_package="com.whatsapp",
+            user_policy=UserAutomationPolicy(user_id="u1", allow_send_actions=False),
+            step_count=999,
+            screen_state=_screen(),
+        )
+
+        self.assertTrue(result.allowed)
+        self.assertFalse(result.requires_confirmation)
+        self.assertIsNone(result.blocked_reason)
