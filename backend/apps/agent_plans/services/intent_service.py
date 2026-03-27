@@ -42,6 +42,7 @@ SUPPORTED_GOAL_TYPES: list[str] = [
     "search",              # search inside an app or on the web
     "draft_email",         # compose and send an email
     "open_website",        # open a URL in the browser
+    "invalid_request",     # not a valid phone automation request
 ]
 
 # ── Intent result dataclass ───────────────────────────────────────────────────
@@ -79,6 +80,7 @@ def _build_system_prompt(supported_packages: list[str]) -> str:
     goal_types_section = "\n".join(f"  - {g}" for g in SUPPORTED_GOAL_TYPES)
 
     return f"""You are an intent parser for a mobile automation system.
+You are preparing commands for an action model that waits for clear phone automation requests.
 Your ONLY job is to read a user's voice or text command and return a JSON object.
 
 SUPPORTED APPS (package name: description):
@@ -101,12 +103,21 @@ OUTPUT RULES (non-negotiable):
    - "high"   → sending messages, composing emails, actions that cannot be undone
 7. "confidence" is 0.0–1.0. Use < 0.5 if the target app or goal is genuinely ambiguous.
 8. "ambiguity_flags" lists specific things you are uncertain about.
+9. If the user input is chit-chat, nonsense, a general knowledge question, not actionable on the phone,
+   or too unclear to execute safely, return:
+   - "goal_type": "invalid_request"
+   - "target_app": ""
+   - "risk_level": "low"
+   - "confidence": 0.0-0.35
+   - "ambiguity_flags": ["not_actionable_request"] or another specific reason
+10. Do NOT guess an app just to satisfy the schema. If the request is not clearly actionable,
+    use "invalid_request".
 
 REQUIRED OUTPUT SCHEMA:
 {{
   "goal": "string, max 100 chars",
   "goal_type": "one of the supported goal types",
-  "target_app": "exact package name",
+  "target_app": "exact package name, or empty string for invalid_request",
   "entities": {{
     "recipient": "optional string",
     "message": "optional string",
@@ -180,6 +191,9 @@ class IntentService:
                 raw_response,
                 allowed_packages=packages,
             )
+            if parsed.goal_type == "invalid_request":
+                return parsed
+
             if parsed.app_package and parsed.goal:
                 return parsed
 
@@ -229,12 +243,19 @@ class IntentService:
 
         # Validate goal_type
         if goal_type not in SUPPORTED_GOAL_TYPES:
-            ambiguity.append(f"Unknown goal_type '{goal_type}' — using 'open_app' as default")
-            goal_type = "open_app"
-            confidence = min(confidence, 0.4)
+            ambiguity.append(
+                f"Unknown goal_type '{goal_type}' — treating as invalid request"
+            )
+            goal_type = "invalid_request"
+            confidence = min(confidence, 0.2)
 
+        if goal_type == "invalid_request":
+            app_package = ""
+            if "not_actionable_request" not in ambiguity:
+                ambiguity.append("not_actionable_request")
+            confidence = min(confidence, 0.35)
         # Validate app_package
-        if app_package not in allowed_package_set:
+        elif app_package not in allowed_package_set:
             ambiguity.append(f"Unknown app package '{app_package}'")
             confidence = min(confidence, 0.4)
             app_package = ""
@@ -244,6 +265,8 @@ class IntentService:
         entities = {k: v for k, v in raw_entities.items() if v}
 
         goal = str(data.get("goal", transcript[:100])).strip()[:200]
+        if goal_type == "invalid_request" and not goal:
+            goal = "No actionable phone command"
 
         return IntentResult(
             goal=goal,
@@ -251,7 +274,7 @@ class IntentService:
             app_package=app_package,
             target_app=SUPPORTED_APPS.get(app_package, app_package),
             entities=entities,
-            risk_level=str(data.get("risk_level", "low")),
+            risk_level="low" if goal_type == "invalid_request" else str(data.get("risk_level", "low")),
             confidence=max(0.0, min(1.0, confidence)),
             ambiguity_flags=ambiguity,
             raw_llm_response=raw_response,
@@ -273,6 +296,11 @@ class _KeywordFallback:
 
         goal = self._build_goal(goal_type, app_package, entities, transcript)
 
+        ambiguity_flags = (
+            ["not_actionable_request"] if goal_type == "invalid_request" else []
+        )
+        confidence = 0.2 if goal_type == "invalid_request" else 0.6
+
         return IntentResult(
             goal=goal,
             goal_type=goal_type,
@@ -280,7 +308,8 @@ class _KeywordFallback:
             target_app=target_app,
             entities=entities,
             risk_level=risk,
-            confidence=0.6,
+            confidence=confidence,
+            ambiguity_flags=ambiguity_flags,
         )
 
     @staticmethod
@@ -305,7 +334,7 @@ class _KeywordFallback:
             return "com.supercell.brawlstars", "Brawl Stars", "open_app", "low"
         if any(w in lower for w in ("search", "google", "look up", "find")):
             return "com.android.chrome", "Chrome", "search", "low"
-        return "", "unknown", "open_app", "low"
+        return "", "unknown", "invalid_request", "low"
 
     @staticmethod
     def _extract_entities(lower: str, goal_type: str) -> dict:
@@ -394,4 +423,6 @@ class _KeywordFallback:
             return f"Search for '{q}'"
         if goal_type == "draft_email":
             return f"Draft email"
+        if goal_type == "invalid_request":
+            return "No actionable phone command"
         return transcript[:100]

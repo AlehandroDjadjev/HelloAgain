@@ -40,8 +40,20 @@ class PipelineOrchestrator extends ChangeNotifier {
   bool _cancelRequested = false;
 
   bool get _cancelled => _cancelRequested;
+  bool get hasPreparedCommand => sessionId != null && parsedIntent != null;
 
   Future<void> run(String command, {String reasoningProvider = 'local'}) async {
+    if (phase.isRunning) return;
+
+    await prepare(command, reasoningProvider: reasoningProvider);
+    if (_cancelled || !hasPreparedCommand) return;
+    await executePrepared();
+  }
+
+  Future<void> prepare(
+    String command, {
+    String reasoningProvider = 'local',
+  }) async {
     if (phase.isRunning) return;
 
     _reset();
@@ -55,6 +67,21 @@ class PipelineOrchestrator extends ChangeNotifier {
       await _parseIntent(command);
       if (_cancelled) return;
 
+      _setPhase(PipelinePhase.idle);
+    } on AgentApiException catch (e) {
+      _fail('API error ${e.statusCode}: ${e.shortMessage}');
+    } catch (e) {
+      _fail(e.toString());
+    }
+  }
+
+  Future<void> executePrepared() async {
+    if (phase.isRunning) return;
+    if (!hasPreparedCommand) {
+      _fail('No prepared command is ready to execute.');
+      return;
+    }
+    try {
       await _startAndroidSession();
       if (_cancelled) return;
 
@@ -119,6 +146,17 @@ class PipelineOrchestrator extends ChangeNotifier {
     _log('Confirmation rejected, aborting.', level: LogLevel.warning);
     pendingConfirmation = null;
     _setPhase(PipelinePhase.cancelled);
+  }
+
+  Future<void> discardPrepared() async {
+    _runner?.cancel();
+    if (sessionId != null) {
+      try {
+        await client.cancelSession(sessionId!);
+      } catch (_) {}
+    }
+    _reset();
+    notifyListeners();
   }
 
   Future<void> _createSession(String reasoningProvider) async {

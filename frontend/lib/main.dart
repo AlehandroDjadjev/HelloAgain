@@ -49,7 +49,6 @@ class HelloAgainShell extends StatefulWidget {
   State<HelloAgainShell> createState() => _HelloAgainShellState();
 }
 
-class _HelloAgainShellState extends State<HelloAgainShell> {
   static const _tokenKey = 'hello_again.account_token';
   static const _onboardingSessionKey = 'hello_again.onboarding_session_id';
 
@@ -599,6 +598,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
             _selectedIndex = value;
           });
         },
+        backgroundColor: const Color(0xFF162040),
+        indicatorColor: const Color(0xFF3B82F6).withValues(alpha: 0.25),
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
         destinations: const [
           NavigationDestination(
             icon: Icon(Icons.dashboard_outlined),
