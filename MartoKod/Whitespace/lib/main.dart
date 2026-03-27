@@ -565,9 +565,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                           Expanded(
                             child: Container(
                               decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.34),
+                                color: Colors.white.withValues(alpha: 0.34),
                                 border: Border.all(
-                                  color: Colors.black.withOpacity(0.18),
+                                  color: Colors.black.withValues(alpha: 0.18),
                                   width: 0.7,
                                 ),
                               ),
@@ -582,7 +582,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                       ? 'Voice mode is on. Speak your next request...'
                                       : 'Write prompt or use the mic...',
                                   hintStyle: TextStyle(
-                                    color: Colors.black.withOpacity(0.45),
+                                    color: Colors.black.withValues(alpha: 0.45),
                                   ),
                                   border: InputBorder.none,
                                   isDense: true,
@@ -607,7 +607,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                     ? const Color(0xFFD64444)
                                     : const Color(0xFFCB4A4A),
                                 border: Border.all(
-                                  color: Colors.black.withOpacity(0.18),
+                                  color: Colors.black.withValues(alpha: 0.18),
                                   width: 0.7,
                                 ),
                               ),
@@ -631,9 +631,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 vertical: 12,
                               ),
                               decoration: BoxDecoration(
-                                color: Colors.black.withOpacity(0.045),
+                                color: Colors.black.withValues(alpha: 0.045),
                                 border: Border.all(
-                                  color: Colors.black.withOpacity(0.16),
+                                  color: Colors.black.withValues(alpha: 0.16),
                                   width: 0.7,
                                 ),
                               ),
@@ -644,7 +644,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                     ? 'Listening'
                                     : 'Send',
                                 style: TextStyle(
-                                  color: Colors.black.withOpacity(0.70),
+                                  color: Colors.black.withValues(alpha: 0.70),
                                   fontSize: 13,
                                   fontWeight: FontWeight.w500,
                                 ),
@@ -684,11 +684,11 @@ class AgentResponseCard extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.88),
-          border: Border.all(color: Colors.black.withOpacity(0.12), width: 0.8),
+          color: Colors.white.withValues(alpha: 0.88),
+          border: Border.all(color: Colors.black.withValues(alpha: 0.12), width: 0.8),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.08),
+              color: Colors.black.withValues(alpha: 0.08),
               blurRadius: 18,
               offset: const Offset(0, 8),
             ),
@@ -709,7 +709,7 @@ class AgentResponseCard extends StatelessWidget {
             Text(
               speech,
               style: TextStyle(
-                color: Colors.black.withOpacity(0.82),
+                color: Colors.black.withValues(alpha: 0.82),
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
                 height: 1.22,
@@ -719,7 +719,7 @@ class AgentResponseCard extends StatelessWidget {
             Text(
               status,
               style: TextStyle(
-                color: Colors.black.withOpacity(0.58),
+                color: Colors.black.withValues(alpha: 0.58),
                 fontSize: 11.5,
                 height: 1.2,
               ),
@@ -757,7 +757,7 @@ class AgentResultDialog extends StatelessWidget {
                 child: Text(
                   summary,
                   style: TextStyle(
-                    color: Colors.black.withOpacity(0.72),
+                    color: Colors.black.withValues(alpha: 0.72),
                     height: 1.24,
                   ),
                 ),
@@ -1713,18 +1713,18 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                       decoration: BoxDecoration(
                         color: widget.data.color,
                         border: Border.all(
-                          color: Colors.black.withOpacity(0.08),
+                          color: Colors.black.withValues(alpha: 0.08),
                           width: 1,
                         ),
                         boxShadow: [
                           BoxShadow(
-                            color: widget.data.color.withOpacity(0.22),
+                            color: widget.data.color.withValues(alpha: 0.22),
                             blurRadius: 22,
                             spreadRadius: 2,
                             offset: const Offset(0, 6),
                           ),
                           BoxShadow(
-                            color: Colors.black.withOpacity(0.12),
+                            color: Colors.black.withValues(alpha: 0.12),
                             blurRadius: 24,
                             spreadRadius: 0.5,
                             offset: const Offset(0, 8),
@@ -1752,9 +1752,9 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                           vertical: 4,
                         ),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.10),
+                          color: Colors.black.withValues(alpha: 0.10),
                           border: Border.all(
-                            color: Colors.black.withOpacity(0.14),
+                            color: Colors.black.withValues(alpha: 0.14),
                             width: 0.7,
                           ),
                         ),
@@ -1779,9 +1779,9 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                             vertical: 4,
                           ),
                           decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.16),
+                            color: Colors.white.withValues(alpha: 0.16),
                             border: Border.all(
-                              color: Colors.black.withOpacity(0.18),
+                              color: Colors.black.withValues(alpha: 0.18),
                               width: 0.7,
                             ),
                           ),
@@ -1804,9 +1804,9 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                             vertical: 8,
                           ),
                           decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.10),
+                            color: Colors.white.withValues(alpha: 0.10),
                             border: Border.all(
-                              color: Colors.black.withOpacity(0.18),
+                              color: Colors.black.withValues(alpha: 0.18),
                               width: 0.7,
                             ),
                           ),
