@@ -28,13 +28,6 @@ class AgentBoardApp extends StatelessWidget {
       title: 'Hello Again',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        scaffoldBackgroundColor: _BoardPalette.appShell,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: _BoardPalette.accent,
-          brightness: Brightness.light,
-          surface: _BoardPalette.surface,
-          primary: _BoardPalette.ink,
-        ),
         textTheme: ThemeData.light().textTheme.apply(
           bodyColor: _BoardPalette.ink,
           displayColor: _BoardPalette.ink,
@@ -1656,10 +1649,6 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
           builder: (context, _) {
             return LayoutBuilder(
               builder: (context, constraints) {
-                final isCompact = constraints.maxWidth < 720;
-                final horizontalPadding = isCompact ? 14.0 : 18.0;
-                final topInset = isCompact ? 14.0 : 18.0;
-                final bottomInset = isCompact ? 14.0 : 18.0;
                 final isCompact = constraints.maxWidth < 1100;
                 final studioWidth = _debugPanelOpen
                     ? math.min(
@@ -2010,16 +1999,18 @@ class AgentResponseCard extends StatelessWidget {
     required this.speech,
     required this.status,
     required this.isBusy,
+    this.compact = false,
   });
 
   final String speech;
   final String status;
   final bool isBusy;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     return ConstrainedBox(
-      constraints: const BoxConstraints(maxWidth: 380),
+      constraints: BoxConstraints(maxWidth: compact ? 300 : 380),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 260),
         curve: Curves.easeOutCubic,
@@ -2656,11 +2647,13 @@ class _StudioLabel extends StatelessWidget {
 }
 
 class _StudioTextField extends StatelessWidget {
-  const _StudioTextField({required this.controller, this.onChanged});
+  const _StudioTextField({
+    required this.controller,
+    this.onChanged,
+  });
 
   final TextEditingController controller;
   final ValueChanged<String>? onChanged;
-  final bool compact;
 
   @override
   Widget build(BuildContext context) {
@@ -4407,7 +4400,6 @@ Color _darken(Color color, double amount) {
 }
 
 class _BoardPalette {
-  static const Color appShell = Color(0xFFF4F3FF);
   static const Color boardBase = Color(0xFFFCFCFF);
   static const Color surface = Color(0xFFEFF4FF);
   static const Color accentSoft = Color(0xFFD8E4FF);
