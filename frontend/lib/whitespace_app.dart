@@ -1998,6 +1998,44 @@ class AgentBackendClient {
     );
   }
 
+  Future<Map<String, dynamic>> startOnboarding({String? sessionId}) {
+    return _postJson('/api/accounts/onboarding/start/', {
+      if ((sessionId ?? '').trim().isNotEmpty) 'session_id': sessionId!.trim(),
+    });
+  }
+
+  Future<Map<String, dynamic>> sendOnboardingTurn({
+    required String sessionId,
+    required String message,
+  }) {
+    return _postJson('/api/accounts/onboarding/turn/', {
+      'session_id': sessionId,
+      'message': message,
+    });
+  }
+
+  Future<Map<String, dynamic>> confirmOnboardingLogin({
+    required String sessionId,
+    required bool phoneConfirmed,
+    required bool loginConfirmed,
+  }) {
+    return _postJson('/api/accounts/onboarding/confirm-login/', {
+      'session_id': sessionId,
+      'phone_confirmed': phoneConfirmed,
+      'login_confirmed': loginConfirmed,
+    });
+  }
+
+  Future<Map<String, dynamic>> completeOnboarding({
+    required String sessionId,
+  }) {
+    return _postJson('/api/accounts/onboarding/complete/', {
+      'session_id': sessionId,
+      'microphone_permission_granted': true,
+      'phone_permission_granted': true,
+    });
+  }
+
   Future<Map<String, dynamic>> fetchBoardMemory({String? token}) {
     return _getJson('/api/agent/board-memory/', token: token);
   }

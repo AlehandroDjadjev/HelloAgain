@@ -4,6 +4,18 @@ from . import views
 
 
 urlpatterns = [
+    path("onboarding/start/", views.onboarding_start_view, name="accounts_onboarding_start"),
+    path("onboarding/turn/", views.onboarding_turn_view, name="accounts_onboarding_turn"),
+    path(
+        "onboarding/confirm-login/",
+        views.onboarding_confirm_login_view,
+        name="accounts_onboarding_confirm_login",
+    ),
+    path(
+        "onboarding/complete/",
+        views.onboarding_complete_view,
+        name="accounts_onboarding_complete",
+    ),
     path("register/", views.register_view, name="accounts_register"),
     path("login/", views.login_view, name="accounts_login"),
     path("logout/", views.logout_view, name="accounts_logout"),

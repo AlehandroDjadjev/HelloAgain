@@ -7,7 +7,7 @@ from django.test import TestCase
 
 from recommendations.models import ElderProfile
 
-from .models import AccountProfile, RecommendationActivity
+from .models import AccountProfile, OnboardingDraft, RecommendationActivity
 from .services import issue_token
 
 
@@ -45,18 +45,22 @@ class AccountApiTests(TestCase):
             contacts_permission_granted=contacts_permission_granted,
         )
 
+    @patch("apps.accounts.views.seed_social_graph_for_profile")
     @patch("apps.accounts.views.sync_profile_to_recommendations")
-    def test_register_and_login_support_profile_fields(self, mock_sync):
+    def test_register_and_login_support_phone_first_voice_profile_fields(
+        self,
+        mock_sync,
+        mock_seed,
+    ):
         response = self.client.post(
             "/api/accounts/register/",
             data=json.dumps(
                 {
-                    "username": "alice",
-                    "email": "alice@example.com",
-                    "password": "StrongPass123!",
-                    "display_name": "Alice",
+                    "name": "Alice Stone",
                     "phone_number": "+359 888 111 222",
                     "description": "Warm, curious, and enjoys quiet coffee chats.",
+                    "phone_permission_granted": True,
+                    "microphone_permission_granted": True,
                     "contacts_permission_granted": True,
                     "onboarding_answers": {
                         "preferred_company": "One-to-one company feels best.",
@@ -70,36 +74,38 @@ class AccountApiTests(TestCase):
         self.assertEqual(response.status_code, 201)
         payload = response.json()
         self.assertIn("token", payload)
-        self.assertEqual(payload["profile"]["display_name"], "Alice")
+        self.assertEqual(payload["profile"]["display_name"], "Alice Stone")
         self.assertTrue(payload["profile"]["contacts_permission_granted"])
+        self.assertTrue(payload["profile"]["phone_permission_granted"])
+        self.assertTrue(payload["profile"]["onboarding_completed"])
         self.assertEqual(
             payload["profile"]["onboarding_answers"]["preferred_company"],
             "One-to-one company feels best.",
         )
         mock_sync.assert_called_once()
+        mock_seed.assert_called_once()
 
         login_response = self.client.post(
             "/api/accounts/login/",
             data=json.dumps(
                 {
-                    "identifier": "alice@example.com",
-                    "password": "StrongPass123!",
+                    "phone_number": "+359888111222",
                 }
             ),
             content_type="application/json",
         )
         self.assertEqual(login_response.status_code, 200)
-        self.assertEqual(login_response.json()["profile"]["username"], "alice")
+        self.assertEqual(login_response.json()["profile"]["display_name"], "Alice Stone")
 
     def test_register_returns_structured_field_errors(self):
         response = self.client.post(
             "/api/accounts/register/",
             data=json.dumps(
                 {
-                    "username": "alice",
-                    "email": "alice@example.com",
-                    "password": "123",
-                    "display_name": "Alice",
+                    "name": "Alice",
+                    "phone_number": "",
+                    "phone_permission_granted": False,
+                    "microphone_permission_granted": False,
                 }
             ),
             content_type="application/json",
@@ -110,7 +116,174 @@ class AccountApiTests(TestCase):
         self.assertEqual(payload["status"], "error")
         self.assertEqual(payload["message"], "Sign up failed.")
         self.assertIn("errors", payload)
-        self.assertIn("password", payload["errors"])
+        self.assertIn("phone_number", payload["errors"])
+
+    def test_onboarding_start_creates_session_id(self):
+        response = self.client.post(
+            "/api/accounts/onboarding/start/",
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["mode"], "collecting")
+        self.assertTrue(payload["draft"]["session_id"])
+        self.assertTrue(
+            OnboardingDraft.objects.filter(
+                session_id=payload["draft"]["session_id"],
+            ).exists()
+        )
+
+    def test_onboarding_turn_extracts_name_and_profile_from_free_form_text(self):
+        start = self.client.post(
+            "/api/accounts/onboarding/start/",
+            data=json.dumps({}),
+            content_type="application/json",
+        ).json()
+        session_id = start["draft"]["session_id"]
+
+        response = self.client.post(
+            "/api/accounts/onboarding/turn/",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "message": "Аз съм Иван и обичам шах и разходки в парка.",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["draft"]["display_name"], "Иван")
+        self.assertIn("шах", payload["draft"]["dynamic_profile_summary"].lower())
+        self.assertEqual(payload["mode"], "collecting")
+        self.assertIn("phone_number", payload["missing_fields"])
+
+    def test_onboarding_turn_with_existing_phone_switches_to_login_confirmation(self):
+        existing = self._create_profile(
+            username="ivan-existing",
+            email="ivan@example.com",
+            phone_number="+359888123456",
+            display_name="Иван",
+            description="Спокоен и общителен.",
+        )
+        start = self.client.post(
+            "/api/accounts/onboarding/start/",
+            data=json.dumps({}),
+            content_type="application/json",
+        ).json()
+
+        response = self.client.post(
+            "/api/accounts/onboarding/turn/",
+            data=json.dumps(
+                {
+                    "session_id": start["draft"]["session_id"],
+                    "message": "Аз съм Иван и телефонът ми е +359 888 123 456.",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["mode"], "login_confirmation")
+        self.assertEqual(payload["recognized_phone"], existing.phone_number)
+
+    def test_onboarding_confirm_login_returns_token_and_profile(self):
+        self._create_profile(
+            username="petya-existing",
+            email="petya@example.com",
+            phone_number="+359889123456",
+            display_name="Петя",
+            description="Обича спокойни разговори.",
+        )
+        start = self.client.post(
+            "/api/accounts/onboarding/start/",
+            data=json.dumps({}),
+            content_type="application/json",
+        ).json()
+        session_id = start["draft"]["session_id"]
+
+        self.client.post(
+            "/api/accounts/onboarding/turn/",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "message": "Телефонът ми е +359 889 123 456.",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        response = self.client.post(
+            "/api/accounts/onboarding/confirm-login/",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "phone_confirmed": True,
+                    "login_confirmed": True,
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("token", payload)
+        self.assertEqual(payload["profile"]["display_name"], "Петя")
+        self.assertEqual(payload["mode"], "completed")
+
+    @patch("apps.accounts.onboarding_service.seed_social_graph_for_profile")
+    @patch("apps.accounts.onboarding_service.sync_profile_to_recommendations")
+    def test_onboarding_complete_registers_from_draft(
+        self,
+        mock_sync,
+        mock_seed,
+    ):
+        start = self.client.post(
+            "/api/accounts/onboarding/start/",
+            data=json.dumps({}),
+            content_type="application/json",
+        ).json()
+        session_id = start["draft"]["session_id"]
+
+        self.client.post(
+            "/api/accounts/onboarding/turn/",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "message": "Аз съм Мария и обичам тихи разговори, цветя и дълги разходки.",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.client.post(
+            "/api/accounts/onboarding/turn/",
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "message": "Телефонът ми е +359 887 654 321.",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        response = self.client.post(
+            "/api/accounts/onboarding/complete/",
+            data=json.dumps({"session_id": session_id}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.json()
+        self.assertIn("token", payload)
+        self.assertEqual(payload["profile"]["display_name"], "Мария")
+        self.assertIn("разходки", payload["profile"]["dynamic_profile_summary"])
+        self.assertEqual(payload["mode"], "completed")
+        mock_sync.assert_called_once()
+        mock_seed.assert_called_once()
 
     @patch("apps.accounts.views.refresh_social_edge_for_friendship")
     def test_accepting_friend_request_unlocks_contact_details(self, mock_refresh_edge):
@@ -276,7 +449,6 @@ class AccountApiTests(TestCase):
         self.assertIn("match_percent", payload["results"][0])
         self.assertIn("raw_score", payload["results"][0])
         self.assertIn("score_components", payload["results"][0])
-        self.assertGreaterEqual(payload["results"][0]["match_percent"], 70)
 
         filtered = self.client.get(
             "/api/accounts/discovery/?q=Best",

@@ -1,12 +1,14 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
 import 'package:frontend/main.dart';
 
 void main() {
-  testWidgets('App smoke test renders the voice lab shell', (
-    WidgetTester tester,
-  ) async {
+  testWidgets('hello again intro renders', (WidgetTester tester) async {
+    SharedPreferences.setMockInitialValues({});
     await tester.pumpWidget(const HelloAgainApp());
     await tester.pump();
-    expect(find.text('Voice Lab'), findsWidgets);
+
+    expect(find.text('Hello Again'), findsOneWidget);
   });
 }

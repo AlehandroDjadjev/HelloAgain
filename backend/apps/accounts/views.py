@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 
-from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
@@ -18,7 +17,7 @@ from recommendations.services.intake_clarification import (
     select_clarification_questions,
 )
 
-from .models import AccountProfile, FriendRequest, ImportedContact, normalize_email
+from .models import AccountProfile, FriendRequest, ImportedContact, normalize_email, normalize_phone_number
 from .serializers import (
     AccountProfileUpdateSerializer,
     ContactsImportSerializer,
@@ -26,12 +25,19 @@ from .serializers import (
     FriendRequestCreateSerializer,
     FriendRequestResponseSerializer,
     LoginSerializer,
+    OnboardingCompleteSerializer,
+    OnboardingConfirmLoginSerializer,
+    OnboardingStartSerializer,
+    OnboardingTurnSerializer,
     RecommendationActivitySerializer,
     RegisterSerializer,
 )
 from .agent_service import ConnectionsAgentService
+from .onboarding_service import OnboardingService
 from .services import (
     build_match_summary,
+    build_dynamic_profile_summary,
+    build_voice_username,
     build_top_traits,
     can_view_email,
     can_view_phone,
@@ -47,11 +53,14 @@ from .services import (
     refresh_social_edge_for_friendship,
     recommend_profiles_for_description,
     recommend_profiles_for_viewer,
+    seed_social_graph_for_profile,
+    split_display_name,
     sync_profile_to_recommendations,
 )
 
 
 connections_agent_service = ConnectionsAgentService()
+onboarding_service = OnboardingService()
 
 
 def _json_ok(data: dict, status: int = 200) -> JsonResponse:
@@ -124,6 +133,7 @@ def _serialize_profile(
         "user_id": target.user_id,
         "elder_profile_id": target.elder_profile_id,
         "username": target.user.username,
+        "name": target.display_name,
         "display_name": target.display_name,
         "description": target.effective_description or target.description,
         "friend_status": friend_status,
@@ -156,6 +166,15 @@ def _serialize_profile(
                 "contacts_permission_granted_at": (
                     target.contacts_permission_granted_at.isoformat()
                     if target.contacts_permission_granted_at
+                    else None
+                ),
+                "onboarding_completed": target.onboarding_completed,
+                "voice_navigation_enabled": target.voice_navigation_enabled,
+                "microphone_permission_granted": target.microphone_permission_granted,
+                "phone_permission_granted": target.phone_permission_granted,
+                "phone_permission_granted_at": (
+                    target.phone_permission_granted_at.isoformat()
+                    if target.phone_permission_granted_at
                     else None
                 ),
                 "share_phone_with_friends": target.share_phone_with_friends,
@@ -264,6 +283,92 @@ def onboarding_questions_preview(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def onboarding_start_view(request):
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = OnboardingStartSerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Onboarding could not start.")
+
+    payload = onboarding_service.start(
+        session_id=(serializer.validated_data.get("session_id") or "").strip() or None,
+    )
+    return _json_ok(payload)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def onboarding_turn_view(request):
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = OnboardingTurnSerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Onboarding turn failed.")
+
+    try:
+        payload = onboarding_service.process_turn(
+            session_id=serializer.validated_data["session_id"],
+            user_message=serializer.validated_data["message"],
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+    return _json_ok(payload)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def onboarding_confirm_login_view(request):
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = OnboardingConfirmLoginSerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Login confirmation failed.")
+
+    try:
+        payload = onboarding_service.confirm_login(
+            serializer.validated_data["session_id"],
+            phone_confirmed=serializer.validated_data["phone_confirmed"],
+            login_confirmed=serializer.validated_data["login_confirmed"],
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+    return _json_ok(payload)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def onboarding_complete_view(request):
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = OnboardingCompleteSerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Onboarding completion failed.")
+
+    try:
+        payload = onboarding_service.complete_registration(
+            serializer.validated_data["session_id"],
+            microphone_permission_granted=serializer.validated_data["microphone_permission_granted"],
+            phone_permission_granted=serializer.validated_data["phone_permission_granted"],
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+    return _json_ok(payload, status=201)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
 def register_view(request):
     try:
         body = _parse_body(request)
@@ -275,25 +380,37 @@ def register_view(request):
         return _json_validation_error(serializer.errors, message="Sign up failed.")
 
     data = serializer.validated_data
+    first_name, last_name = split_display_name(data["name"])
+    username = build_voice_username(data["name"], data["phone_number"])
+    dynamic_profile_summary = data.get("dynamic_profile_summary") or build_dynamic_profile_summary(
+        display_name=data["name"],
+        description=data.get("description", ""),
+        onboarding_answers=data.get("onboarding_answers", {}),
+    )
     with transaction.atomic():
-        user = User.objects.create_user(
-            username=data["username"],
-            email=normalize_email(data["email"]),
-            password=data["password"],
-        )
+        user = User.objects.create_user(username=username, email="")
+        user.first_name = first_name
+        user.last_name = last_name
+        user.set_unusable_password()
+        user.save(update_fields=["first_name", "last_name", "password"])
         profile = AccountProfile.objects.create(
             user=user,
-            display_name=data.get("display_name") or data["username"],
-            phone_number=data.get("phone_number", ""),
+            display_name=data["name"],
+            phone_number=data["phone_number"],
             description=data.get("description", ""),
-            dynamic_profile_summary=data.get("dynamic_profile_summary", ""),
+            dynamic_profile_summary=dynamic_profile_summary,
             profile_notes=data.get("profile_notes", ""),
             onboarding_answers=data.get("onboarding_answers", {}),
+            onboarding_completed=data.get("onboarding_completed", True),
+            voice_navigation_enabled=data.get("voice_navigation_enabled", True),
+            microphone_permission_granted=data.get("microphone_permission_granted", True),
+            phone_permission_granted=data.get("phone_permission_granted", False),
             contacts_permission_granted=data.get("contacts_permission_granted", False),
-            share_phone_with_friends=data.get("share_phone_with_friends", True),
-            share_email_with_friends=data.get("share_email_with_friends", True),
+            share_phone_with_friends=data.get("share_phone_with_friends", False),
+            share_email_with_friends=data.get("share_email_with_friends", False),
         )
         sync_profile_to_recommendations(profile, preserve_adaptation=False)
+        seed_social_graph_for_profile(profile)
         token = issue_token(user)
 
     return _json_ok(
@@ -318,20 +435,19 @@ def login_view(request):
     if not serializer.is_valid():
         return _json_validation_error(serializer.errors, message="Login failed.")
 
-    identifier = serializer.validated_data["identifier"].strip()
-    password = serializer.validated_data["password"]
-    user = User.objects.filter(Q(username__iexact=identifier) | Q(email__iexact=identifier)).first()
-    if not user:
-        return _json_error("Invalid credentials.", status=401, code="INVALID_CREDENTIALS")
+    phone_number = normalize_phone_number(serializer.validated_data["phone_number"])
+    profile = (
+        AccountProfile.objects.select_related("user", "elder_profile")
+        .filter(normalized_phone_number=phone_number)
+        .first()
+    )
+    if profile is None:
+        return _json_error("No account found for that phone number.", status=401, code="INVALID_CREDENTIALS")
 
-    authenticated = authenticate(request, username=user.username, password=password)
-    if authenticated is None:
-        return _json_error("Invalid credentials.", status=401, code="INVALID_CREDENTIALS")
-
-    profile = ensure_account_profile(authenticated)
+    profile = ensure_account_profile(profile.user)
     if not profile.elder_profile_id:
         sync_profile_to_recommendations(profile, preserve_adaptation=False)
-    token = issue_token(authenticated)
+    token = issue_token(profile.user)
 
     return _json_ok(
         {
@@ -369,12 +485,21 @@ def me_view(request):
     except json.JSONDecodeError:
         return _json_error("Invalid JSON body.")
 
-    serializer = AccountProfileUpdateSerializer(data=body, partial=True)
+    serializer = AccountProfileUpdateSerializer(
+        data=body,
+        partial=True,
+        context={"profile": profile},
+    )
     if not serializer.is_valid():
         return _json_validation_error(serializer.errors, message="Profile update failed.")
 
     changed_profile_fields = False
     for field, value in serializer.validated_data.items():
+        if field == "display_name":
+            first_name, last_name = split_display_name(value)
+            profile.user.first_name = first_name
+            profile.user.last_name = last_name
+            profile.user.save(update_fields=["first_name", "last_name"])
         setattr(profile, field, value)
         if field in {
             "display_name",
@@ -388,6 +513,7 @@ def me_view(request):
 
     if changed_profile_fields or "phone_number" in serializer.validated_data:
         sync_profile_to_recommendations(profile, preserve_adaptation=True)
+        seed_social_graph_for_profile(profile)
 
     return _json_ok({"profile": _serialize_profile(profile, viewer=profile)})
 
