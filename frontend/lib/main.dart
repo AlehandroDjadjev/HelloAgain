@@ -85,12 +85,16 @@ class _MainShellState extends State<MainShell> {
   Position? _userPosition;
   bool _isRequestingLocation = false;
   String? _locationError;
+  bool _voiceLabVisited = false;
+  bool _pipelineVisited = false;
 
   @override
   void initState() {
     super.initState();
     _currentIndex = widget.initialIndex;
     _userPosition = widget.initialUserPosition;
+    _voiceLabVisited = _currentIndex == 2;
+    _pipelineVisited = _currentIndex == 3;
   }
 
   Future<void> _requestLocation() async {
@@ -166,8 +170,12 @@ class _MainShellState extends State<MainShell> {
               errorMessage: _locationError,
               onRequestLocation: _requestLocation,
             ),
-      const VoiceLabScreen(),
-      const HomeScreen(),
+      _voiceLabVisited || _currentIndex == 2
+          ? const VoiceLabScreen()
+          : const SizedBox.shrink(),
+      _pipelineVisited || _currentIndex == 3
+          ? const HomeScreen()
+          : const SizedBox.shrink(),
     ];
   }
 
@@ -177,7 +185,15 @@ class _MainShellState extends State<MainShell> {
       body: IndexedStack(index: _currentIndex, children: _buildPages()),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _currentIndex,
-        onDestinationSelected: (index) => setState(() => _currentIndex = index),
+        onDestinationSelected: (index) => setState(() {
+          _currentIndex = index;
+          if (index == 2) {
+            _voiceLabVisited = true;
+          }
+          if (index == 3) {
+            _pipelineVisited = true;
+          }
+        }),
         backgroundColor: const Color(0xFF162040),
         indicatorColor: const Color(0xFF3B82F6).withValues(alpha: 0.25),
         labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,

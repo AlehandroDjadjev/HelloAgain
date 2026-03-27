@@ -170,6 +170,56 @@ class AgentVoiceController extends ChangeNotifier {
     }
   }
 
+  Future<String> speakPrompt(
+    String prompt, {
+    bool resumeWhenDone = false,
+  }) async {
+    final cleanPrompt = prompt.trim();
+    if (cleanPrompt.isEmpty) {
+      if (resumeWhenDone) {
+        await resumeListening(
+          status: 'Hands-free mode is active. Listening for speech...',
+        );
+      }
+      return '';
+    }
+
+    await _stopRecorder();
+    _speaking = true;
+    _error = null;
+    _status = 'Generating a spoken reply...';
+    _emit();
+
+    try {
+      final response = await _client.getResponse(
+        prompt: cleanPrompt,
+        userId: _userId,
+        sessionId: _sessionId,
+      );
+      _status = 'Speaking...';
+      _emit();
+      await _playAudio(
+        response.assistantAudioBytes,
+        response.assistantAudioMimeType,
+      );
+      return response.assistantText;
+    } catch (error) {
+      _error = _describeError(error);
+      _status = 'Could not generate the spoken reply.';
+      _emit();
+      return '';
+    } finally {
+      _speaking = false;
+      if (resumeWhenDone) {
+        _suspended = false;
+      }
+      _emit();
+      if (_enabled && !_suspended && !_processing) {
+        await _startListeningLoop();
+      }
+    }
+  }
+
   Future<AudioRecorder> _ensureRecorder() async =>
       _recorder ??= AudioRecorder();
 

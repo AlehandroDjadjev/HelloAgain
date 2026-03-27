@@ -31,6 +31,8 @@ class _HomeScreenState extends State<HomeScreen> {
   String _lastSubmittedCommand = '';
   PipelinePhase _lastObservedPhase = PipelinePhase.idle;
   String? _activeConfirmationKey;
+  bool _awaitingIntentConfirmation = false;
+  String? _pendingIntentSummary;
 
   @override
   void initState() {
@@ -43,6 +45,11 @@ class _HomeScreenState extends State<HomeScreen> {
     _orch.addListener(_onOrchestratorChange);
     _voiceController = _buildVoiceController(_urlCtrl.text);
     _voiceController.addListener(_onVoiceControllerChange);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        unawaited(_ensureAlwaysListening());
+      }
+    });
   }
 
   String _resolveDefaultBaseUrl() {
@@ -65,11 +72,13 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
       _activeConfirmationKey = confirmationKey;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _showConfirmationDialog(conf);
-      });
       if (_voiceController.enabled) {
-        unawaited(_voiceController.speakText(_buildConfirmationSpeech(conf)));
+        unawaited(
+          _voiceController.speakText(
+            _buildConfirmationSpeech(conf),
+            resumeWhenDone: true,
+          ),
+        );
       }
     } else if (_orch.phase != PipelinePhase.awaitingConfirmation) {
       _activeConfirmationKey = null;
@@ -121,47 +130,69 @@ class _HomeScreenState extends State<HomeScreen> {
     return AgentVoiceController(
       client: VoiceGatewayClient(baseUrl: baseUrl),
       onTranscript: _handleVoiceTranscript,
+      language: 'bg-BG',
     );
   }
 
   Future<void> _run({
     String? commandOverride,
-    bool triggeredByVoice = false,
+    bool conversational = false,
   }) async {
     final command = (commandOverride ?? _commandCtrl.text).trim();
     if (command.isEmpty) return;
     _lastSubmittedCommand = command;
     FocusScope.of(context).unfocus();
-    if (_voiceController.enabled) {
-      await _voiceController.pauseForTask(
-        status: triggeredByVoice
-            ? 'Running your voice command in the background...'
-            : 'Running the agent command...',
-      );
+    await _orch.prepare(command, reasoningProvider: _reasoningProvider);
+    if (!mounted) {
+      return;
     }
-    await _orch.run(command, reasoningProvider: _reasoningProvider);
+    if (!_orch.hasPreparedCommand || _orch.errorMessage != null) {
+      return;
+    }
+    final intentIssue = _preparedIntentIssue();
+    if (intentIssue != null) {
+      await _handleInvalidPreparedIntent(
+        intentIssue,
+        conversational: conversational,
+      );
+      return;
+    }
+    await _orch.executePrepared();
   }
 
   Future<void> _handleVoiceTranscript(String transcript) async {
+    final spokenText = transcript.trim();
+    if (spokenText.isEmpty) {
+      return;
+    }
+
+    if (_awaitingIntentConfirmation) {
+      await _handleIntentConfirmation(spokenText);
+      return;
+    }
+
+    if (_orch.phase == PipelinePhase.awaitingConfirmation &&
+        _orch.pendingConfirmation != null) {
+      await _handleVoiceConfirmation(spokenText);
+      return;
+    }
+
     if (_orch.phase.isRunning) {
-      await _voiceController.speakText(
-        'I am still busy with the previous request.',
-        resumeWhenDone: true,
-      );
+      await _handleRunningVoiceInterrupt(spokenText);
+      return;
+    }
+
+    if (_shouldIgnoreIdleTranscript(spokenText)) {
       return;
     }
 
     _commandCtrl.value = TextEditingValue(
-      text: transcript,
-      selection: TextSelection.collapsed(offset: transcript.length),
+      text: spokenText,
+      selection: TextSelection.collapsed(offset: spokenText.length),
     );
-    _lastSubmittedCommand = transcript;
+    _lastSubmittedCommand = spokenText;
 
-    await _voiceController.pauseForTask(
-      status: 'Voice command captured. Starting the agent...',
-    );
-    await _voiceController.speakText('Working on it.');
-    unawaited(_run(commandOverride: transcript, triggeredByVoice: true));
+    await _prepareVoiceCommand(spokenText);
   }
 
   void _handlePhaseTransition(PipelinePhase nextPhase) {
@@ -171,16 +202,16 @@ class _HomeScreenState extends State<HomeScreen> {
     switch (nextPhase) {
       case PipelinePhase.completed:
         unawaited(
-          _voiceController.speakText(
-            _buildCompletionSpeech(),
+          _voiceController.speakPrompt(
+            _buildCompletionPrompt(),
             resumeWhenDone: true,
           ),
         );
         return;
       case PipelinePhase.failed:
         unawaited(
-          _voiceController.speakText(
-            _buildFailureSpeech(),
+          _voiceController.speakPrompt(
+            _buildFailurePrompt(),
             resumeWhenDone: true,
           ),
         );
@@ -188,7 +219,7 @@ class _HomeScreenState extends State<HomeScreen> {
       case PipelinePhase.cancelled:
         unawaited(
           _voiceController.speakText(
-            'The request was cancelled.',
+            'Заявката беше отменена.',
             resumeWhenDone: true,
           ),
         );
@@ -198,28 +229,20 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  String _buildCompletionSpeech() {
-    final command = _lastSubmittedCommand.trim();
-    if (command.isEmpty) {
-      return 'Done. The request is complete.';
-    }
-    return 'Done. I finished $command.';
-  }
-
-  String _buildFailureSpeech() {
-    final errorMessage = _orch.errorMessage?.trim() ?? '';
-    if (errorMessage.isEmpty) {
-      return 'I could not finish that request.';
-    }
-    return 'I ran into a problem. $errorMessage';
-  }
-
   String _buildConfirmationSpeech(ConfirmationRequest conf) {
     final summary = conf.actionSummary.trim();
     if (summary.isEmpty) {
-      return 'I need your confirmation before I continue.';
+      return 'Преди да продължа, искам потвърждение. Правилно ли разбирам, че мога да действам? Кажете да, за да продължа, или не, за да спра.';
     }
-    return 'I need your confirmation before I continue. $summary';
+    return 'Преди да продължа, искам потвърждение. Правилно ли разбирам, че трябва да направя следното: $summary? Кажете да, за да продължа, или не, за да спра.';
+  }
+
+  String _buildIntentConfirmationSpeech() {
+    final summary = (_pendingIntentSummary ?? _lastSubmittedCommand).trim();
+    if (summary.isEmpty) {
+      return 'Чух команда, но искам първо да потвърдя. Правилно ли разбрах какво искате да направя? Кажете да, ако съм разбрал правилно, или не, ако трябва да опитаме отново.';
+    }
+    return 'Правилно ли разбрах, че искате да направя следното: $summary? Кажете да, ако това е правилно, или не, ако трябва да коригирам командата.';
   }
 
   Future<void> _toggleHandsFree() async {
@@ -260,26 +283,404 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  void _showConfirmationDialog(ConfirmationRequest conf) {
-    if (!mounted) return;
-    showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => _ConfirmationDialog(
-        conf: conf,
-        onApprove: () {
-          Navigator.of(ctx).pop();
-          if (_voiceController.enabled) {
-            unawaited(_voiceController.speakText('Continuing.'));
-          }
-          _orch.approveConfirmation();
-        },
-        onReject: () {
-          Navigator.of(ctx).pop();
-          _orch.rejectConfirmation();
-        },
-      ),
+  Future<void> _ensureAlwaysListening() async {
+    if (_voiceController.enabled) {
+      return;
+    }
+    try {
+      await _voiceController.start();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.toString())));
+    }
+  }
+
+  Future<void> _handleVoiceConfirmation(String transcript) async {
+    final decision = _parseConfirmationDecision(transcript);
+    switch (decision) {
+      case _VoiceConfirmationDecision.approve:
+        await _approveConfirmationByVoice();
+        return;
+      case _VoiceConfirmationDecision.reject:
+        await _rejectConfirmationByVoice();
+        return;
+      case _VoiceConfirmationDecision.unknown:
+        await _voiceController.speakText(
+          'Моля, кажете да, за да продължа, или не, за да спра.',
+          resumeWhenDone: true,
+        );
+        return;
+    }
+  }
+
+  Future<void> _prepareVoiceCommand(String transcript) async {
+    if (!_looksLikePotentialActionCommand(transcript)) {
+      await _voiceController.speakText(
+        _invalidIntentSpeech(),
+        resumeWhenDone: true,
+      );
+      return;
+    }
+    await _voiceController.pauseForTask(
+      status: 'Проверявам какво искате да направя...',
     );
+    await _orch.prepare(transcript, reasoningProvider: _reasoningProvider);
+    if (!mounted) {
+      return;
+    }
+    if (!_orch.hasPreparedCommand || _orch.errorMessage != null) {
+      await _voiceController.speakPrompt(
+        _buildFailurePrompt(),
+        resumeWhenDone: true,
+      );
+      return;
+    }
+    final intentIssue = _preparedIntentIssue();
+    if (intentIssue != null) {
+      await _handleInvalidPreparedIntent(intentIssue, conversational: true);
+      return;
+    }
+
+    _pendingIntentSummary = _buildIntentSummary(transcript);
+    _awaitingIntentConfirmation = true;
+    await _voiceController.speakText(
+      _buildIntentConfirmationSpeech(),
+      resumeWhenDone: true,
+    );
+  }
+
+  Future<void> _handleIntentConfirmation(String transcript) async {
+    final decision = _parseConfirmationDecision(transcript);
+    switch (decision) {
+      case _VoiceConfirmationDecision.approve:
+        await _approveIntentConfirmation();
+        return;
+      case _VoiceConfirmationDecision.reject:
+        await _rejectIntentConfirmation();
+        return;
+      case _VoiceConfirmationDecision.unknown:
+        await _voiceController.speakText(
+          'Моля, кажете да, за да започна, или не, за да отменя.',
+          resumeWhenDone: true,
+        );
+        return;
+    }
+  }
+
+  Future<void> _approveConfirmationByVoice() async {
+    await _voiceController.pauseForTask(status: 'Продължавам със заявката...');
+    await _voiceController.speakText('Продължавам.');
+    await _orch.approveConfirmation();
+  }
+
+  Future<void> _rejectConfirmationByVoice() async {
+    await _voiceController.pauseForTask(status: 'Спирам заявката...');
+    await _orch.rejectConfirmation();
+  }
+
+  Future<void> _handleRunningVoiceInterrupt(String transcript) async {
+    final normalized = _normalizeVoiceText(transcript);
+    if (_matchesAny(normalized, const [
+      'cancel',
+      'stop',
+      'nevermind',
+      'откажи',
+      'спри',
+      'прекрати',
+    ])) {
+      await _voiceController.speakText('Отменям текущата заявка.');
+      await _orch.cancel();
+      return;
+    }
+    if (_matchesAny(normalized, const [
+      'pause',
+      'hold on',
+      'wait',
+      'пауза',
+      'изчакай',
+      'чакай',
+    ])) {
+      await _voiceController.speakText('Поставям текущата заявка на пауза.');
+      await _orch.pause();
+      return;
+    }
+    if (_matchesAny(normalized, const [
+      'status',
+      'what are you doing',
+      'статус',
+      'какво правиш',
+      'докъде стигна',
+    ])) {
+      final status = _orch.currentReasoning.trim();
+      await _voiceController.speakText(
+        status.isEmpty ? 'Още работя по заявката.' : status,
+      );
+    }
+  }
+
+  String _buildIntentSummary(String transcript) {
+    final intent = _orch.parsedIntent ?? const <String, dynamic>{};
+    final goal = (intent['goal'] ?? '').toString().trim();
+    final app = _friendlyAppName(
+      (intent['target_app'] ?? intent['app_package'] ?? '').toString(),
+    ).trim();
+
+    final parts = <String>[];
+    if (goal.isNotEmpty) {
+      parts.add(goal);
+    } else {
+      parts.add(transcript);
+    }
+    if (app.isNotEmpty && app != 'App') {
+      parts.add('в $app');
+    }
+    return parts.join(', ');
+  }
+
+  String _buildCompletionPrompt() {
+    final command = _lastSubmittedCommand.trim();
+    if (command.isEmpty) {
+      return 'Ти си гласът на телефонния агент HelloAgain. '
+          'Отговори с едно кратко изречение на български, че заявката е изпълнена.';
+    }
+    return 'Ти си гласът на телефонния агент HelloAgain. '
+        'Отговори с едно кратко изречение на български, че тази заявка е изпълнена: '
+        '"$command".';
+  }
+
+  String _buildFailurePrompt() {
+    final errorMessage = _orch.errorMessage?.trim() ?? '';
+    if (errorMessage.isEmpty) {
+      return 'Ти си гласът на телефонния агент HelloAgain. '
+          'Отговори с едно кратко и спокойно изречение на български, че заявката не можа да бъде изпълнена.';
+    }
+    return 'Ти си гласът на телефонния агент HelloAgain. '
+        'Отговори с едно кратко и спокойно изречение на български, че заявката не можа да бъде изпълнена. '
+        'Причина: "$errorMessage".';
+  }
+
+  _VoiceConfirmationDecision _parseConfirmationDecision(String transcript) {
+    final normalized = _normalizeVoiceText(transcript);
+    if (_matchesAny(normalized, const [
+      'yes',
+      'approve',
+      'confirm',
+      'continue',
+      'да',
+      'добре',
+      'потвърди',
+      'продължи',
+      'започвай',
+    ])) {
+      return _VoiceConfirmationDecision.approve;
+    }
+    if (_matchesAny(normalized, const [
+      'no',
+      'cancel',
+      'reject',
+      'stop',
+      'не',
+      'откажи',
+      'спри',
+      'не искам',
+    ])) {
+      return _VoiceConfirmationDecision.reject;
+    }
+    return _VoiceConfirmationDecision.unknown;
+  }
+
+  bool _shouldIgnoreIdleTranscript(String transcript) {
+    final normalized = _normalizeVoiceText(transcript);
+    if (normalized.isEmpty) {
+      return true;
+    }
+    return _matchesAny(normalized, const [
+      'thanks',
+      'thank you',
+      'okay',
+      'ok',
+      'cool',
+      'great',
+      'yes',
+      'no',
+      'благодаря',
+      'добре',
+      'окей',
+      'да',
+      'не',
+    ]);
+  }
+
+  String _normalizeVoiceText(String value) => value
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^0-9A-Za-z\u0400-\u04FF\s]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+
+  bool _matchesAny(String normalized, List<String> phrases) {
+    for (final phrase in phrases) {
+      if (normalized == phrase || normalized.contains(phrase)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _looksLikePotentialActionCommand(String transcript) {
+    final normalized = _normalizeVoiceText(transcript);
+    if (normalized.isEmpty || _shouldIgnoreIdleTranscript(transcript)) {
+      return false;
+    }
+    if (RegExp(r'\b(?:https?|www)\b').hasMatch(normalized) ||
+        RegExp(r'\b\S+\.(?:com|org|net|io|dev|bg)\b').hasMatch(normalized)) {
+      return true;
+    }
+    return _matchesAny(normalized, const [
+      'open',
+      'launch',
+      'start',
+      'search',
+      'find',
+      'look up',
+      'google',
+      'navigate',
+      'directions',
+      'route',
+      'send',
+      'message',
+      'email',
+      'gmail',
+      'chrome',
+      'maps',
+      'whatsapp',
+      'browser',
+      'website',
+      'отвори',
+      'пусни',
+      'стартирай',
+      'потърси',
+      'търси',
+      'намери',
+      'изпрати',
+      'съобщение',
+      'имейл',
+      'карти',
+      'маршрут',
+      'навигация',
+      'хром',
+      'браузър',
+      'сайт',
+      'линк',
+      'уотсап',
+    ]);
+  }
+
+  String? _preparedIntentIssue() {
+    final intent = _orch.parsedIntent ?? const <String, dynamic>{};
+    final goalType = (intent['goal_type'] ?? '').toString().trim();
+    final goal = (intent['goal'] ?? '').toString().trim();
+    final appPackage = (intent['app_package'] ?? '').toString().trim();
+    final confidence =
+        double.tryParse((intent['confidence'] ?? '').toString()) ?? 0.0;
+    final ambiguityFlags = _stringValues(
+      intent['ambiguity_flags'],
+    ).map((value) => value.toLowerCase()).toList();
+
+    if (goalType.isEmpty || goalType == 'invalid_request') {
+      return 'The request was not parsed as a phone action command.';
+    }
+    if (goal.isEmpty) {
+      return 'The parsed goal is too vague.';
+    }
+    if (appPackage.isEmpty) {
+      return 'The target app is still unknown.';
+    }
+    if (confidence < 0.55) {
+      return 'The parser is not confident enough yet.';
+    }
+    if (ambiguityFlags.any(
+      (flag) =>
+          flag.contains('not_actionable') ||
+          flag.contains('unknown') ||
+          flag.contains('ambiguous'),
+    )) {
+      return 'The parsed command is still ambiguous.';
+    }
+    return null;
+  }
+
+  List<String> _stringValues(Object? value) {
+    if (value is List) {
+      return value.map((entry) => entry.toString()).toList();
+    }
+    return const [];
+  }
+
+  String _invalidIntentSpeech() {
+    return 'Това не звучи като ясна команда за действие на телефона. '
+        'Кажете например: отвори Chrome, потърси нещо в Chrome или изпрати съобщение в WhatsApp.';
+  }
+
+  Future<void> _handleInvalidPreparedIntent(
+    String issue, {
+    required bool conversational,
+  }) async {
+    _awaitingIntentConfirmation = false;
+    _pendingIntentSummary = null;
+    await _orch.discardPrepared();
+    if (!mounted) {
+      return;
+    }
+    if (conversational) {
+      await _voiceController.speakText(
+        _invalidIntentSpeech(),
+        resumeWhenDone: true,
+      );
+      return;
+    }
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Command not accepted: $issue')));
+  }
+
+  Future<void> _approveIntentConfirmation() async {
+    _awaitingIntentConfirmation = false;
+    _pendingIntentSummary = null;
+    await _orch.discardPrepared();
+    await _voiceController.pauseForTask(status: 'Започвам заявката...');
+    await _voiceController.speakText('Започвам сега.');
+    await _run(commandOverride: _lastSubmittedCommand, conversational: true);
+  }
+
+  Future<void> _rejectIntentConfirmation() async {
+    _awaitingIntentConfirmation = false;
+    _pendingIntentSummary = null;
+    await _orch.discardPrepared();
+    await _voiceController.speakText(
+      'Добре, ще чакам нова команда.',
+      resumeWhenDone: true,
+    );
+  }
+
+  String _friendlyAppName(String packageName) {
+    switch (packageName) {
+      case 'com.android.chrome':
+        return 'Chrome';
+      case 'com.whatsapp':
+        return 'WhatsApp';
+      case 'com.google.android.apps.maps':
+        return 'Google Maps';
+      case 'com.google.android.gm':
+        return 'Gmail';
+      case 'com.supercell.brawlstars':
+        return 'Brawl Stars';
+      default:
+        return packageName.isEmpty ? 'App' : packageName;
+    }
   }
 
   @override
@@ -623,6 +1024,8 @@ class _ReasoningProviderCard extends StatelessWidget {
   }
 }
 
+enum _VoiceConfirmationDecision { approve, reject, unknown }
+
 class _ControlBar extends StatelessWidget {
   const _ControlBar({
     required this.phase,
@@ -772,7 +1175,7 @@ class _HandsFreeVoiceCard extends StatelessWidget {
           ),
           const SizedBox(height: 8),
           Text(
-            'Uses /transcribe for live voice commands and /speak for spoken replies while the phone agent keeps running in the background.',
+            'Uses /transcribe for live STT, /get-response for conversational spoken updates, and /speak for exact prompts like confirmations while the phone agent keeps listening.',
             style: TextStyle(
               fontSize: 13,
               height: 1.35,
@@ -1240,117 +1643,6 @@ class _LogView extends StatelessWidget {
           );
         },
       ),
-    );
-  }
-}
-
-class _ConfirmationDialog extends StatelessWidget {
-  const _ConfirmationDialog({
-    required this.conf,
-    required this.onApprove,
-    required this.onReject,
-  });
-
-  final ConfirmationRequest conf;
-  final VoidCallback onApprove;
-  final VoidCallback onReject;
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-
-    return AlertDialog(
-      icon: Icon(Icons.touch_app, color: cs.primary, size: 32),
-      title: const Text(
-        'Confirm Action',
-        textAlign: TextAlign.center,
-        style: TextStyle(fontWeight: FontWeight.w700),
-      ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          if (conf.appName.isNotEmpty) ...[
-            _Row(label: 'App', value: conf.appName),
-            const SizedBox(height: 8),
-          ],
-          if (conf.recipient.isNotEmpty) ...[
-            _Row(label: 'To', value: conf.recipient),
-            const SizedBox(height: 8),
-          ],
-          if (conf.contentPreview.isNotEmpty) ...[
-            _Row(label: 'Reason', value: conf.contentPreview),
-            const SizedBox(height: 8),
-          ],
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: cs.surfaceContainerHighest,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Text(
-              conf.actionSummary,
-              style: const TextStyle(fontSize: 14),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            decoration: BoxDecoration(
-              color: cs.errorContainer.withAlpha(60),
-              borderRadius: BorderRadius.circular(6),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.warning_amber_outlined, size: 14, color: cs.error),
-                const SizedBox(width: 6),
-                Expanded(
-                  child: Text(
-                    'This action may be irreversible. Only approve if it matches your intent.',
-                    style: TextStyle(fontSize: 11, color: cs.error),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-      actions: [
-        TextButton(onPressed: onReject, child: const Text('Cancel')),
-        FilledButton(
-          onPressed: onApprove,
-          child: const Text('Approve & Execute'),
-        ),
-      ],
-    );
-  }
-}
-
-class _Row extends StatelessWidget {
-  const _Row({required this.label, required this.value});
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        SizedBox(
-          width: 64,
-          child: Text(
-            label,
-            style: TextStyle(
-              fontSize: 12,
-              color: cs.onSurface.withAlpha(160),
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
-        Expanded(child: Text(value, style: const TextStyle(fontSize: 13))),
-      ],
     );
   }
 }

@@ -71,6 +71,33 @@ class BrawlStarsSupportTests(SimpleTestCase):
         self.assertEqual(result.app_package, "com.instagram.android")
         self.assertEqual(result.goal_type, "open_app")
 
+    def test_parse_intent_keeps_invalid_request_from_llm(self):
+        client = Mock()
+        client.generate.return_value = {
+            "goal": "No actionable phone command",
+            "goal_type": "invalid_request",
+            "target_app": "",
+            "entities": {},
+            "risk_level": "low",
+            "confidence": 0.15,
+            "ambiguity_flags": ["not_actionable_request"],
+        }
+
+        result = IntentService(client=client).parse_intent("How are you today?")
+
+        self.assertEqual(result.goal_type, "invalid_request")
+        self.assertEqual(result.app_package, "")
+        self.assertIn("not_actionable_request", result.ambiguity_flags)
+        self.assertLess(result.confidence, 0.5)
+
+    def test_keyword_fallback_marks_unknown_request_as_invalid(self):
+        result = IntentService()._fallback_service.parse("Tell me a joke")
+
+        self.assertEqual(result.goal_type, "invalid_request")
+        self.assertEqual(result.app_package, "")
+        self.assertIn("not_actionable_request", result.ambiguity_flags)
+        self.assertLess(result.confidence, 0.5)
+
 
 class PlanServiceStoreIntentTests(TestCase):
     def test_store_intent_retries_after_sqlite_lock(self):

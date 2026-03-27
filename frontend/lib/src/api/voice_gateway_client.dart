@@ -103,15 +103,20 @@ class VoiceGatewayClient {
       );
     }
 
-    return ConversationResponse(
-      transcript: (data['transcript'] ?? '').toString(),
-      assistantText: (data['assistant_text'] ?? '').toString(),
-      assistantAudioBytes: base64Decode(audioBase64),
-      assistantAudioMimeType: (data['assistant_audio_mime_type'] ?? 'audio/wav')
-          .toString(),
-      providerStatus: _stringMap(data['provider_status']),
-      warnings: _stringList(data['warnings']),
-    );
+    return _conversationResponseFromJson(data);
+  }
+
+  Future<ConversationResponse> getResponse({
+    required String prompt,
+    String userId = 'flutter-voice-lab',
+    String sessionId = 'voice-lab-session',
+  }) async {
+    final data = await _post('/api/voice/get-response/', {
+      'user_id': userId,
+      'session_id': sessionId,
+      'prompt': prompt.trim(),
+    });
+    return _conversationResponseFromJson(data);
   }
 
   Future<SpeechResponse> speak({
@@ -200,6 +205,27 @@ class VoiceGatewayClient {
       );
     }
     return const {};
+  }
+
+  static ConversationResponse _conversationResponseFromJson(
+    Map<String, dynamic> data,
+  ) {
+    final audioBase64 = (data['assistant_audio_base64'] ?? '').toString();
+    if (audioBase64.isEmpty) {
+      throw const VoiceGatewayException(
+        'Voice gateway returned no assistant audio.',
+      );
+    }
+
+    return ConversationResponse(
+      transcript: (data['transcript'] ?? '').toString(),
+      assistantText: (data['assistant_text'] ?? '').toString(),
+      assistantAudioBytes: base64Decode(audioBase64),
+      assistantAudioMimeType: (data['assistant_audio_mime_type'] ?? 'audio/wav')
+          .toString(),
+      providerStatus: _stringMap(data['provider_status']),
+      warnings: _stringList(data['warnings']),
+    );
   }
 }
 
