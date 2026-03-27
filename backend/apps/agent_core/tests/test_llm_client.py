@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from django.test import SimpleTestCase, override_settings
 
 from apps.agent_core.llm_client import (
+    _encode_transformers_inputs,
     LLMClient,
     LLMError,
     _find_complete_local_snapshot,
@@ -124,6 +125,21 @@ class LLMClientLocalSnapshotTests(SimpleTestCase):
         self.assertEqual(snapshot.revision, "222")
         self.assertTrue(snapshot.is_complete)
 
+    def test_inspect_local_model_path_accepts_single_file_safetensors_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text("{}")
+            (root / "tokenizer.json").write_text("{}")
+            (root / "tokenizer_config.json").write_text("{}")
+            (root / "model.safetensors").write_bytes(b"a" * 32)
+
+            snapshot = _inspect_local_model_path(root)
+
+        self.assertTrue(snapshot.is_complete)
+        self.assertEqual(snapshot.shard_count, 1)
+        self.assertEqual(snapshot.missing_shards, [])
+        self.assertEqual(snapshot.aux_missing, [])
+
     def test_placement_verdict_reports_full_gpu_without_device_map(self):
         class DummyModel:
             device = "cuda:0"
@@ -168,3 +184,30 @@ class LLMClientLocalSnapshotTests(SimpleTestCase):
             model_type = "qwen2_vl"
 
         self.assertTrue(_is_vl_model_config(DummyConfig()))
+
+    def test_is_vl_model_config_detects_qwen3_vl(self):
+        class DummyConfig:
+            model_type = "qwen3_vl"
+
+        self.assertTrue(_is_vl_model_config(DummyConfig()))
+
+    def test_encode_transformers_inputs_uses_text_keyword(self):
+        class DummyBatch(dict):
+            def to(self, device):
+                self["device"] = device
+                return self
+
+        class ProcessorLike:
+            def __init__(self):
+                self.called_kwargs = None
+
+            def __call__(self, *args, **kwargs):
+                self.called_kwargs = kwargs
+                return DummyBatch({"input_ids": [1, 2, 3]})
+
+        processor = ProcessorLike()
+        batch = _encode_transformers_inputs(processor, "hello", "cuda:0")
+
+        self.assertEqual(processor.called_kwargs["text"], "hello")
+        self.assertEqual(processor.called_kwargs["return_tensors"], "pt")
+        self.assertEqual(batch["device"], "cuda:0")

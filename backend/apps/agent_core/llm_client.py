@@ -306,7 +306,7 @@ class LLMClient:
             add_generation_prompt=True,
         )
         input_device = _infer_model_input_device(model_obj)
-        inputs = tokenizer(text, return_tensors="pt").to(input_device)
+        inputs = _encode_transformers_inputs(tokenizer, text, input_device)
         prompt_tokens = int(inputs["input_ids"].shape[1])
 
         self._log_transformers_inference_start(
@@ -704,6 +704,10 @@ def _transformers_max_new_tokens(json_mode: bool) -> int:
     return max(32, int(os.environ.get("LOCAL_LLM_MAX_NEW_TOKENS", "256")))
 
 
+def _encode_transformers_inputs(tokenizer_obj, text: str, input_device):
+    return tokenizer_obj(text=text, return_tensors="pt").to(input_device)
+
+
 def _tokenizer_attr(tokenizer_obj, attr: str, default: Any = None):
     value = getattr(tokenizer_obj, attr, None)
     if value is not None:
@@ -717,7 +721,11 @@ def _tokenizer_attr(tokenizer_obj, attr: str, default: Any = None):
 
 
 def _is_vl_model_config(config_obj) -> bool:
-    return str(getattr(config_obj, "model_type", "")).lower() in {"qwen2_vl", "qwen2_5_vl"}
+    return str(getattr(config_obj, "model_type", "")).lower() in {
+        "qwen2_vl",
+        "qwen2_5_vl",
+        "qwen3_vl",
+    }
 
 
 def _find_complete_local_snapshot(model_name: str) -> LocalModelSnapshot | None:
@@ -759,10 +767,15 @@ def _inspect_local_model_path(path: Path) -> LocalModelSnapshot:
         except Exception:
             missing_shards.append("unreadable_index")
     else:
-        shard_files = sorted(path.glob("*.safetensors"))
-        shard_count = len(shard_files)
-        total_bytes = sum(item.stat().st_size for item in shard_files if item.exists())
-        aux_missing.append("model.safetensors.index.json")
+        single_file = path / "model.safetensors"
+        if single_file.exists():
+            shard_count = 1
+            total_bytes = single_file.stat().st_size
+        else:
+            shard_files = sorted(path.glob("*.safetensors"))
+            shard_count = len(shard_files)
+            total_bytes = sum(item.stat().st_size for item in shard_files if item.exists())
+            aux_missing.append("model.safetensors.index.json")
 
     for aux_name in ("config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json"):
         aux_path = path / aux_name
