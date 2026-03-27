@@ -204,6 +204,7 @@ def agent_run_view(request: HttpRequest):
             else {},
             user_id=str(payload.get("user_id") or "anonymous"),
             session_id=str(payload.get("session_id") or "default_session"),
+            reasoning_provider=str(payload.get("reasoning_provider") or "qwen"),
         )
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)
@@ -236,6 +237,7 @@ def agent_run_start_view(request: HttpRequest):
             else {},
             user_id=str(payload.get("user_id") or "anonymous"),
             session_id=str(payload.get("session_id") or "default_session"),
+            reasoning_provider=str(payload.get("reasoning_provider") or "qwen"),
         )
     except ValueError as exc:
         print(f"[controller] semi-agent start rejected: {exc}", file=sys.stderr, flush=True)
