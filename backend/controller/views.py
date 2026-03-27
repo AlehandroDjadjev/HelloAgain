@@ -1,20 +1,23 @@
 import json
 import sys
+from functools import lru_cache
 
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 
-from engine.graph_service import GraphService
 from engine.qwen_worker_client import QwenWorkerClient
 from engine.semi_agent_service import SemiAgentService
 
-service = GraphService()
 qwen_client = QwenWorkerClient()
-semi_agent_service = SemiAgentService(
-    graph_service=service,
-    qwen_client=qwen_client,
-)
+semi_agent_service = SemiAgentService(qwen_client=qwen_client)
+
+
+@lru_cache(maxsize=1)
+def _graph_service():
+    from engine.graph_service import GraphService
+
+    return GraphService()
 
 
 def _parse_json_request(request: HttpRequest) -> dict:
@@ -44,7 +47,7 @@ def add_action_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = service.add_action_flow(prompt)
+        result = _graph_service().add_action_flow(prompt)
     except ValueError as exc:
         print(f"[controller] add-action rejected: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=400)
@@ -68,7 +71,7 @@ def fetch_action_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = service.fetch_action_flow(prompt)
+        result = _graph_service().fetch_action_flow(prompt)
     except Exception as exc:
         print(f"[controller] fetch-action failed: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=500)
@@ -89,7 +92,7 @@ def conversation_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = service.conversation_flow(prompt)
+        result = _graph_service().conversation_flow(prompt)
     except Exception as exc:
         print(f"[controller] conversation failed: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=500)
@@ -98,7 +101,7 @@ def conversation_view(request: HttpRequest):
 
 
 def state_view(request: HttpRequest):
-    return JsonResponse(service.export_state())
+    return JsonResponse(_graph_service().export_state())
 
 
 @csrf_exempt
@@ -106,7 +109,7 @@ def reset_state_view(request: HttpRequest):
     if request.method != "POST":
         return JsonResponse({"detail": "POST required"}, status=405)
     try:
-        result = service.reset_state()
+        result = _graph_service().reset_state()
     except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)
     return JsonResponse(result)
