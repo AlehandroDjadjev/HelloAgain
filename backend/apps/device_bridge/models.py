@@ -1,5 +1,6 @@
 import uuid
 from django.db import models
+from django.conf import settings
 
 from apps.agent_core.enums import ActionResultStatus, ActionErrorCode
 
@@ -50,7 +51,7 @@ class DeviceScreenState(models.Model):
         return f"ScreenState(session={self.session_id}, pkg={self.foreground_package}, hash={self.screen_hash[:8]})"
 
     def save(self, *args, **kwargs):
-        if self.is_sensitive:
+        if self.is_sensitive and not getattr(settings, "AGENT_UNSAFE_AUTOMATION_MODE", False):
             self.nodes = []
         super().save(*args, **kwargs)
 

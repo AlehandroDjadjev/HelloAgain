@@ -176,6 +176,7 @@ class PipelineOrchestrator extends ChangeNotifier {
         confirmationMode: 'always',
         allowTextEntry: true,
         allowSendActions: true,
+        allowSensitiveNodes: true,
       ),
     );
     if (result.code == 'SERVICE_NOT_ENABLED') {

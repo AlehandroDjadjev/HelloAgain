@@ -123,7 +123,14 @@ TEMPLATES = [
 WSGI_APPLICATION = "core.wsgi.application"
 
 # Database
-USE_SQLITE = os.environ.get("USE_SQLITE", "False") == "True"
+_USE_SQLITE_ENV = os.environ.get("USE_SQLITE")
+_POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD")
+
+if _USE_SQLITE_ENV is None:
+    # Local dev should default to SQLite unless Postgres was explicitly configured.
+    USE_SQLITE = not bool(_POSTGRES_PASSWORD)
+else:
+    USE_SQLITE = _USE_SQLITE_ENV.strip().lower() in {"1", "true", "yes", "on"}
 
 if USE_SQLITE:
     DATABASES = {

@@ -411,17 +411,14 @@ class StepRunner {
         );
 
       case 'GET_SCREENSHOT':
+        // SCREENSHOT_UNAVAILABLE is a soft, non-fatal outcome: the device
+        // doesn't support screenshots (API < 30) or the capture timed out.
+        // The backend treats it as "continue" so the LLM can fall back to
+        // accessibility-only reasoning instead of aborting.
         final screenshotB64 = await gateway.takeScreenshot();
-        final screenshotError = screenshotB64 == null
-            ? await gateway.getLastScreenshotError()
-            : null;
         return ActionResult(
           success: screenshotB64 != null,
-          code: screenshotB64 != null ? 'OK' : 'SCREENSHOT_FAILED',
-          message: screenshotB64 == null
-              ? (screenshotError ??
-                  'takeScreenshot returned null (API < 30 or capture failed)')
-              : null,
+          code: screenshotB64 != null ? 'OK' : 'SCREENSHOT_UNAVAILABLE',
           screenshotBase64: screenshotB64,
         );
 

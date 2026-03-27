@@ -2,7 +2,6 @@ package com.example.control.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.os.Build
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Path
@@ -131,7 +130,12 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
         val pkg = root?.packageName?.toString()
         val title = windows?.firstOrNull { it.isActive }?.title?.toString()
         return try {
-            ScreenTreeSerializer.serialize(root, pkg, title)
+            ScreenTreeSerializer.serialize(
+                root,
+                pkg,
+                title,
+                allowSensitiveNodes = activeSession?.allowSensitiveNodes ?: false,
+            )
         } finally {
             root?.recycle()
         }

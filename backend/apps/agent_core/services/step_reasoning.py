@@ -757,6 +757,13 @@ def _align_step_to_visible_text_target(
         return step
 
     chosen_node = _find_matching_node(screen_state, selector)
+
+    # If the LLM already picked a clickable node, its choice is deliberate.
+    # Alignment exists to redirect non-clickable text nodes to their clickable
+    # parent containers — it must not override a valid clickable choice.
+    if chosen_node and bool(chosen_node.get("clickable")):
+        return step
+
     candidates = _find_matching_tap_candidates(screen_state, target_terms)
     if not candidates:
         return step
@@ -878,6 +885,11 @@ def _find_matching_tap_candidates(screen_state: dict, target_terms: list[str]) -
     for index, node in enumerate(screen_state.get("nodes") or []):
         if not isinstance(node, dict):
             continue
+        # Editable fields (text inputs) may contain the target text as their
+        # current value, but they are not the element to tap — tapping them only
+        # re-focuses the input.  Skip them so they can't displace the real target.
+        if bool(node.get("editable")):
+            continue
         label = _node_effective_label(screen_state, node, index)
         matched_term = _match_term(label, target_terms)
         if not matched_term:
@@ -951,6 +963,11 @@ def _target_selector_for_node(
     index: int,
     matched_term: str,
 ) -> Optional[dict]:
+    if bool(node.get("clickable")) and node.get("ref") and not _looks_like_chrome_target(node, screen_state):
+        effective_label = _node_effective_label(screen_state, node, index)
+        if _match_term(effective_label, [matched_term]):
+            return {"element_ref": node.get("ref")}
+
     exact_text_selector = _exact_text_selector(node, matched_term)
     if exact_text_selector:
         if bool(node.get("clickable")) or _is_text_selection_target(screen_state, node, index):

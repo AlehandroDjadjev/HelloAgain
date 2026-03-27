@@ -119,17 +119,10 @@ class DeviceBridgeService:
                     "error_detail": error_detail,
                 },
             )
-            if status in (
-                ActionResultStatus.ABORTED.value,
-                ActionResultStatus.FAILURE.value,
-            ):
-                SessionService.transition(session, SessionStatus.FAILED)
-                AuditService.record(
-                    session=session,
-                    event_type=AuditEventType.SESSION_ABORTED,
-                    actor=AuditActor.SYSTEM,
-                    payload={"reason": status, "step_id": step_id},
-                )
+            # Session lifecycle decisions (abort, retry, continue) belong
+            # exclusively to ExecutionService.decide_after_result, which runs
+            # after this call and applies nuanced LLM-mode / plan-mode logic.
+            # record_action_result must not kill the session here.
 
         return event
 

@@ -112,6 +112,7 @@ class ScreenFormatterTests(SimpleTestCase):
         self.assertIn("[n191]", text)
         self.assertNotIn("[n5]", text)
 
+    @override_settings(AGENT_UNSAFE_AUTOMATION_MODE=False)
     def test_format_screen_sensitive(self):
         text = format_screen_for_llm(_screen([_node("n1", "android.widget.TextView", text="Hidden")], sensitive=True))
         self.assertIn(SENSITIVE_SENTINEL, text)
@@ -400,7 +401,7 @@ class StepReasoningServiceTests(SimpleTestCase):
             entities={"query": "Кичо"},
             goal="Search for Кичо in Viber",
         )
-        self.assertEqual(step.params["selector"]["element_ref"], "n13")
+        self.assertEqual(step.params["selector"]["element_ref"], "n12")
         self.assertIn("matches the requested text", step.reasoning)
 
     def test_align_step_to_visible_text_target_retargets_grouped_contact_to_text_node(self):
@@ -424,7 +425,7 @@ class StepReasoningServiceTests(SimpleTestCase):
             entities={"query": "Кичо"},
             goal="Search for Кичо in Viber",
         )
-        self.assertEqual(step.params["selector"]["element_ref"], "n15")
+        self.assertEqual(step.params["selector"]["element_ref"], "n13")
         self.assertIn("matches the requested text", step.reasoning)
 
     def test_align_step_to_visible_text_target_keeps_exact_clickable_row(self):
@@ -453,6 +454,46 @@ class StepReasoningServiceTests(SimpleTestCase):
             goal="Search for ÐšÐ¸Ñ‡Ð¾ in Viber",
         )
         self.assertEqual(step.params["selector"]["element_ref"], "n36")
+
+    def test_align_step_to_visible_text_target_keeps_clickable_chrome_suggestion_row(self):
+        screen_state = _screen([
+            _node(
+                "n6",
+                "android.widget.EditText",
+                text="Jeffrey Epstiena",
+                clickable=True,
+                editable=True,
+                focused=True,
+                bounds={"left": 0, "top": 40, "right": 300, "bottom": 120},
+            ),
+            _node(
+                "n12",
+                "android.view.ViewGroup",
+                clickable=True,
+                bounds={"left": 0, "top": 160, "right": 300, "bottom": 240},
+            ),
+            _node(
+                "n13",
+                "android.widget.TextView",
+                text="jeffrey epstein",
+                bounds={"left": 24, "top": 178, "right": 240, "bottom": 220},
+            ),
+        ], focused="n6")
+        step = _align_step_to_visible_text_target(
+            ReasonedStep(
+                action_type="TAP_ELEMENT",
+                params={"selector": {"element_ref": "n12"}},
+                reasoning="Tap the matching suggestion row.",
+                confidence=0.7,
+                is_goal_complete=False,
+                requires_confirmation=False,
+                sensitivity="low",
+            ),
+            screen_state=screen_state,
+            entities={"query": "jeffrey epstein"},
+            goal="Search for jeffrey epstein in Chrome",
+        )
+        self.assertEqual(step.params["selector"]["element_ref"], "n12")
 
     def test_align_step_to_visible_text_target_does_not_retarget_to_chat_title(self):
         screen_state = _screen([

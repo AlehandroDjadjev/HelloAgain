@@ -1,13 +1,13 @@
 import 'dart:async';
 
 import 'package:android_control_plugin/android_control_plugin.dart';
-import 'package:flutter/foundation.dart' show AsyncCallback, kIsWeb;
+import 'package:flutter/foundation.dart' show AsyncCallback;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 import '../api/agent_client.dart';
 import '../api/voice_gateway_client.dart';
+import '../config/backend_base_url.dart';
 import '../pipeline/orchestrator.dart';
 import '../pipeline/pipeline_state.dart';
 import '../voice/agent_voice_controller.dart';
@@ -46,13 +46,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _resolveDefaultBaseUrl() {
-    try {
-      final configured = dotenv.get('API_BASE_URL');
-      if (configured.trim().isNotEmpty) {
-        return configured.trim();
-      }
-    } catch (_) {}
-    return kIsWeb ? 'http://localhost:8000' : 'http://10.0.2.2:8000';
+    return resolveBackendBaseUrl();
   }
 
   void _onOrchestratorChange() {

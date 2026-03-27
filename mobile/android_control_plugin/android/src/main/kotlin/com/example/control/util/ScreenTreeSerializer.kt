@@ -33,6 +33,7 @@ object ScreenTreeSerializer {
         root: AccessibilityNodeInfo?,
         foregroundPackage: String?,
         windowTitle: String?,
+        allowSensitiveNodes: Boolean = false,
     ): ScreenStateDto {
         if (root == null) {
             return ScreenStateDto(
@@ -70,7 +71,7 @@ object ScreenTreeSerializer {
             focusedElementRef = focusedRef[0],
             isSensitive = isSensitive,
             // Redact node list for sensitive screens — hash is still stored for audit
-            nodes = if (isSensitive) emptyList() else nodes,
+            nodes = if (isSensitive && !allowSensitiveNodes) emptyList() else nodes,
         )
     }
 

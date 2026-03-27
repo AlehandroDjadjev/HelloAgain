@@ -49,7 +49,10 @@ def format_screen_for_llm(
     into ``screen_header`` and ``screen_tree``.
     """
     header = _build_header(screen_state)
-    if screen_state.get("is_sensitive"):
+    if (
+        screen_state.get("is_sensitive")
+        and not getattr(settings, "AGENT_UNSAFE_AUTOMATION_MODE", False)
+    ):
         return f"{header}\n{SENSITIVE_SENTINEL}"
 
     nodes = screen_state.get("nodes") or []
@@ -289,50 +292,11 @@ def _dedupe_child_refs(
     child_refs: tuple[str, ...],
     views: dict[str, _NodeView],
 ) -> list[str | tuple[str, str]]:
-    if len(child_refs) <= 5:
-        return list(child_refs)
+    # Return every child ref unconditionally.  List items (chat rows, contacts,
+    # search results, etc.) are never collapsed — the model must see all of them
+    # to pick the correct one.
+    return list(child_refs)
 
-    deduped: list[str | tuple[str, str]] = []
-    i = 0
-    while i < len(child_refs):
-        ref = child_refs[i]
-        view = views.get(ref)
-        if view is None:
-            deduped.append(ref)
-            i += 1
-            continue
-
-        signature = _sibling_signature(view)
-        run: list[str] = [ref]
-        j = i + 1
-        while j < len(child_refs):
-            next_ref = child_refs[j]
-            next_view = views.get(next_ref)
-            if next_view is None or _sibling_signature(next_view) != signature:
-                break
-            run.append(next_ref)
-            j += 1
-
-        if len(run) > 5:
-            deduped.extend(run[:3])
-            class_name = _short_class_name(_text_value(view.raw, "class_name") or "item")
-            deduped.append(("marker", f"[... {len(run) - 3} more {class_name} items]"))
-        else:
-            deduped.extend(run)
-        i = j
-    return deduped
-
-
-def _sibling_signature(view: _NodeView) -> tuple:
-    raw = view.raw
-    return (
-        _short_class_name(_text_value(raw, "class_name") or ""),
-        bool(_text_value(raw, "text")),
-        bool(_text_value(raw, "content_desc")),
-        _is_true(raw, "clickable"),
-        _is_true(raw, "editable"),
-        min(len(view.child_refs), 3),
-    )
 
 
 def _format_node_line(view: _NodeView, views: dict[str, _NodeView]) -> str:
