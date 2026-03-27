@@ -41,5 +41,8 @@ class Migration(migrations.Migration):
                 db_index=True,
                 max_length=64,
             ),
+            model_name='auditrecord',
+            name='event_type',
+            field=models.CharField(choices=[('session_created', 'Session Created'), ('intent_stored', 'Intent Stored'), ('plan_compiled', 'Plan Compiled'), ('plan_approved', 'Plan Approved'), ('plan_rejected', 'Plan Rejected'), ('step_dispatched', 'Step Dispatched'), ('step_succeeded', 'Step Succeeded'), ('step_failed', 'Step Failed'), ('confirmation_requested', 'Confirmation Requested'), ('confirmation_approved', 'Confirmation Approved'), ('confirmation_rejected', 'Confirmation Rejected'), ('sensitive_screen_detected', 'Sensitive Screen Detected'), ('session_paused', 'Session Paused'), ('session_resumed', 'Session Resumed'), ('session_cancelled', 'Session Cancelled'), ('session_aborted', 'Session Aborted'), ('session_completed', 'Session Completed'), ('policy_violation', 'Policy Violation'), ('policy_enforced', 'Policy Enforced'), ('plan_blocked', 'Plan Blocked by Policy')], db_index=True, max_length=64),
         ),
     ]

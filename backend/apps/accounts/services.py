@@ -66,24 +66,25 @@ def sync_profile_to_recommendations(
     preserve_adaptation: bool = True,
 ) -> ElderProfile:
     recommendation_username = build_recommendation_username(profile.user)
+    effective_description = profile.effective_description or profile.description or ""
     elder_profile = profile.elder_profile
     if elder_profile is None:
         elder_profile = ElderProfile.objects.create(
             username=recommendation_username,
             display_name=profile.display_name,
-            description=profile.description or "",
+            description=effective_description,
         )
         profile.elder_profile = elder_profile
         profile.save(update_fields=["elder_profile"])
     else:
         elder_profile.username = recommendation_username
         elder_profile.display_name = profile.display_name
-        elder_profile.description = profile.description or ""
+        elder_profile.description = effective_description
         elder_profile.save(update_fields=["username", "display_name", "description", "updated_at"])
 
     hydrate_profile_from_description(
         profile=elder_profile,
-        description=profile.description or "",
+        description=effective_description,
         clarification_answers=profile.onboarding_answers or {},
         vector_source="account_onboarding",
         preserve_adaptation=preserve_adaptation,
@@ -470,7 +471,7 @@ def _serialize_profile_for_recommendations(
         "elder_profile_id": target.elder_profile_id,
         "username": target.user.username,
         "display_name": target.display_name,
-        "description": target.description,
+        "description": target.effective_description or target.description,
         "friend_status": get_friendship_status(viewer, target),
         "top_traits": build_top_traits(target),
         "matched_from_contacts": bool(matched_contact_ids and target.id in matched_contact_ids),
@@ -572,7 +573,7 @@ def recommend_profiles_for_description(
         )
         requester_comparison = build_match_summary(viewer, target, graph_score=target_graph_score)
         semantic_query_fit = float(query_comparison.get("compatibility_score", 0.0))
-        keyword_fit = keyword_overlap_score(description, target.description)
+        keyword_fit = keyword_overlap_score(description, target.effective_description)
         query_fit = (0.72 * semantic_query_fit) + (0.28 * keyword_fit)
         requester_fit = float((requester_comparison or {}).get("compatibility_score", 0.0))
         activity_score = activity_affinity_for_pair(viewer, target)

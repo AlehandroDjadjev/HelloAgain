@@ -59,6 +59,8 @@ class AccountProfile(models.Model):
     phone_number = models.CharField(max_length=32, blank=True)
     normalized_phone_number = models.CharField(max_length=32, blank=True, db_index=True)
     description = models.TextField(blank=True)
+    dynamic_profile_summary = models.TextField(blank=True)
+    profile_notes = models.TextField(blank=True)
     onboarding_answers = models.JSONField(default=dict, blank=True)
     contacts_permission_granted = models.BooleanField(default=False)
     contacts_permission_granted_at = models.DateTimeField(null=True, blank=True)
@@ -72,6 +74,15 @@ class AccountProfile(models.Model):
 
     def __str__(self):
         return self.display_name or self.user.username
+
+    @property
+    def effective_description(self) -> str:
+        segments = [
+            str(self.description or "").strip(),
+            str(self.dynamic_profile_summary or "").strip(),
+            str(self.profile_notes or "").strip(),
+        ]
+        return "\n\n".join(segment for segment in segments if segment)
 
     def save(self, *args, **kwargs):
         self.normalized_phone_number = normalize_phone_number(self.phone_number)

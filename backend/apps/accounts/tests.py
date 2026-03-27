@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
@@ -367,3 +368,109 @@ class AccountApiTests(TestCase):
             ).count(),
             1,
         )
+
+    @patch("apps.accounts.agent_service.sync_profile_to_recommendations")
+    @patch("apps.accounts.agent_service.QwenWorkerClient.generate")
+    def test_agent_profile_update_endpoint_updates_profile(self, mock_generate, mock_sync):
+        viewer = self._create_profile(
+            username="viewer",
+            email="viewer@example.com",
+            display_name="Viewer",
+            description="Warm and curious.",
+        )
+        mock_generate.return_value = json.dumps(
+            {
+                "description": "Warm, curious, and loves thoughtful coffee chats.",
+                "dynamic_profile_summary": "Thoughtful and warm.",
+                "profile_notes": "Prefers calm one-to-one conversations.",
+                "reasoning_summary": "Merged new stable preferences into the profile.",
+            }
+        )
+        mock_sync.return_value = SimpleNamespace(
+            id=viewer.elder_profile_id,
+            feature_vector_version=7,
+            vector_source="account_onboarding",
+        )
+
+        response = self.client.post(
+            "/api/accounts/agent/profile/update/",
+            data=json.dumps(
+                {
+                    "user_id": str(viewer.user_id),
+                    "prompt": "I love thoughtful coffee chats and I open up more in calm one-to-one conversations.",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(
+            payload["profile"]["description"],
+            "Warm, curious, and loves thoughtful coffee chats.",
+        )
+        self.assertEqual(
+            payload["profile"]["dynamic_profile_summary"],
+            "Thoughtful and warm.",
+        )
+        self.assertEqual(
+            payload["vector_profile"]["feature_vector_version"],
+            7,
+        )
+
+        viewer.refresh_from_db()
+        self.assertEqual(
+            viewer.profile_notes,
+            "Prefers calm one-to-one conversations.",
+        )
+
+    @patch("apps.accounts.agent_service.record_recommendation_activity")
+    @patch("apps.accounts.agent_service.QwenWorkerClient.generate")
+    def test_agent_find_connection_endpoint_returns_board_ready_user(self, mock_generate, mock_activity):
+        viewer = self._create_profile(
+            username="viewer",
+            email="viewer@example.com",
+            display_name="Viewer",
+            description="Calm, thoughtful, prefers quiet coffee and reading.",
+        )
+        sporty = self._create_profile(
+            username="sporty",
+            email="sporty@example.com",
+            display_name="Sporty Friend",
+            description="Loves volleyball, active weekends, energetic team games.",
+        )
+        self._create_profile(
+            username="quiet",
+            email="quiet@example.com",
+            display_name="Quiet Friend",
+            description="Enjoys books, reflective talks, and peaceful afternoons.",
+        )
+
+        mock_generate.return_value = json.dumps(
+            {
+                "temporary_description": "Someone active who enjoys volleyball and energetic group activities.",
+                "reasoning_summary": "Turned the prompt into a social search description.",
+            }
+        )
+
+        response = self.client.post(
+            "/api/accounts/agent/connections/find/",
+            data=json.dumps(
+                {
+                    "user_id": str(viewer.user_id),
+                    "prompt": "Find me someone active who likes volleyball and energetic group activities.",
+                }
+            ),
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["user"]["user_id"], sporty.user_id)
+        self.assertEqual(payload["board_object"]["extra_data"]["kind"], "user")
+        self.assertIn("type:user", payload["board_object"]["tags"])
+        self.assertEqual(
+            payload["board_object"]["extra_data"]["description"],
+            sporty.description,
+        )
+        mock_activity.assert_called_once()

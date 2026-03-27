@@ -29,6 +29,7 @@ from .serializers import (
     RecommendationActivitySerializer,
     RegisterSerializer,
 )
+from .agent_service import ConnectionsAgentService
 from .services import (
     build_match_summary,
     build_top_traits,
@@ -48,6 +49,9 @@ from .services import (
     recommend_profiles_for_viewer,
     sync_profile_to_recommendations,
 )
+
+
+connections_agent_service = ConnectionsAgentService()
 
 
 def _json_ok(data: dict, status: int = 200) -> JsonResponse:
@@ -92,6 +96,14 @@ def _get_token_from_request(request) -> str | None:
     return None
 
 
+def _agent_user_id_from_request(request, body: dict | None = None) -> str:
+    profile = profile_for_token(_get_token_from_request(request))
+    if profile is not None:
+        return str(profile.user_id)
+    payload = body if isinstance(body, dict) else {}
+    return str(payload.get("user_id") or payload.get("viewer_user_id") or "anonymous")
+
+
 def _require_profile(request) -> AccountProfile | JsonResponse:
     profile = profile_for_token(_get_token_from_request(request))
     if profile is None:
@@ -113,7 +125,7 @@ def _serialize_profile(
         "elder_profile_id": target.elder_profile_id,
         "username": target.user.username,
         "display_name": target.display_name,
-        "description": target.description,
+        "description": target.effective_description or target.description,
         "friend_status": friend_status,
         "top_traits": build_top_traits(target),
         "matched_from_contacts": bool(matched_contact_ids and target.id in matched_contact_ids),
@@ -148,6 +160,9 @@ def _serialize_profile(
                 ),
                 "share_phone_with_friends": target.share_phone_with_friends,
                 "share_email_with_friends": target.share_email_with_friends,
+                "dynamic_profile_summary": target.dynamic_profile_summary,
+                "profile_notes": target.profile_notes,
+                "effective_description": target.effective_description,
                 "onboarding_answers": target.onboarding_answers,
             }
         )
@@ -271,6 +286,8 @@ def register_view(request):
             display_name=data.get("display_name") or data["username"],
             phone_number=data.get("phone_number", ""),
             description=data.get("description", ""),
+            dynamic_profile_summary=data.get("dynamic_profile_summary", ""),
+            profile_notes=data.get("profile_notes", ""),
             onboarding_answers=data.get("onboarding_answers", {}),
             contacts_permission_granted=data.get("contacts_permission_granted", False),
             share_phone_with_friends=data.get("share_phone_with_friends", True),
@@ -359,7 +376,13 @@ def me_view(request):
     changed_profile_fields = False
     for field, value in serializer.validated_data.items():
         setattr(profile, field, value)
-        if field in {"display_name", "description", "onboarding_answers"}:
+        if field in {
+            "display_name",
+            "description",
+            "dynamic_profile_summary",
+            "profile_notes",
+            "onboarding_answers",
+        }:
             changed_profile_fields = True
     profile.save()
 
@@ -391,6 +414,76 @@ def user_detail(request, user_id: int):
             )
         }
     )
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def agent_profile_update_view(request):
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return _json_error("prompt required.")
+
+    try:
+        payload = connections_agent_service.update_profile_from_prompt(
+            agent_user_id=_agent_user_id_from_request(request, body),
+            prompt=prompt,
+            profile_patch=body.get("profile_patch") if isinstance(body.get("profile_patch"), dict) else None,
+            profile_json=body.get("profile_json") if isinstance(body.get("profile_json"), dict) else None,
+            board_state=body.get("board_state") if isinstance(body.get("board_state"), dict) else None,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc))
+    except Exception as exc:
+        return _json_error(str(exc), status=500)
+    return _json_ok(payload)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def agent_find_connection_view(request):
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return _json_error("prompt required.")
+
+    try:
+        payload = connections_agent_service.find_connection_for_prompt(
+            agent_user_id=_agent_user_id_from_request(request, body),
+            prompt=prompt,
+            limit=int(body.get("limit") or 1),
+            board_state=body.get("board_state") if isinstance(body.get("board_state"), dict) else None,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc))
+    except Exception as exc:
+        return _json_error(str(exc), status=500)
+    return _json_ok(payload)
+
+
+@require_http_methods(["GET"])
+def agent_user_widget_view(request, user_id: int):
+    try:
+        payload = connections_agent_service.build_user_widget_payload(
+            agent_user_id=_agent_user_id_from_request(
+                request,
+                {"viewer_user_id": request.GET.get("viewer_user_id") or request.GET.get("user_id")},
+            ),
+            target_user_id=user_id,
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), status=404)
+    except Exception as exc:
+        return _json_error(str(exc), status=500)
+    return _json_ok(payload)
 
 
 @require_http_methods(["GET"])

@@ -1,0 +1,31 @@
+{
+  "protocol": "at_home_mcp",
+  "version": "1.0",
+  "description": "This doesnt use real mcps but an at home version of the protocol. Bassically we want an exposed endpoints json where we'll actually link the endpoints to real apis to other parts of the app later.",
+  "mcps": [
+    {
+      "id": "gnn_actions",
+      "name": "gnn_actions",
+      "description": "The already integrated gnn action memory and recommendation flow in the backend.",
+      "descriptor_file": "gnn_actions.json",
+      "descriptor_url": "/api/agent/mcps/gnn_actions/",
+      "notes": [
+        "The agent decides what mcps it needs IF IT needs them currently.",
+        "Use this when it actually relates to updating and working with their emotional profile or when the request is about action memory or what fits now.",
+        "Skip it for a more mechanical request."
+      ]
+    },
+    {
+      "id": "connections",
+      "name": "connections",
+      "description": "Wraps the account and recommendation system so the agent can update the current user profile and fetch the closest matching real user.",
+      "descriptor_file": "connections.json",
+      "descriptor_url": "/api/agent/mcps/connections/",
+      "notes": [
+        "Use this when the user reveals durable identity or preference details that should update their account profile.",
+        "Use this when the user may benefit from a real human connection and you should search for the closest user based on the current prompt or board object extra data.",
+        "The returned user objects can be placed on the whiteboard and reopened later for a richer user widget."
+      ]
+    }
+  ]
+}

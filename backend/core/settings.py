@@ -65,6 +65,44 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
+INSTALLED_APPS = [
+    'django.contrib.admin',
+    'django.contrib.auth',
+    'django.contrib.contenttypes',
+    'django.contrib.sessions',
+    'django.contrib.messages',
+    'django.contrib.staticfiles',
+    # Third-party
+    'rest_framework',
+    'corsheaders',
+    # Platform
+    'controller',
+    'meetup',
+    "apps.accounts",
+    # Agent apps
+    'apps.agent_core',
+    'apps.agent_sessions',
+    'apps.agent_plans',
+    'apps.agent_policy',
+    'apps.agent_executors',
+    'apps.device_bridge',
+    'apps.audit_log',
+    # GAT Engine
+    'recommendations',
+]
+
+MIDDLEWARE = [
+    'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
+    'core.middleware.ApiJsonErrorsMiddleware',
+    'django.contrib.sessions.middleware.SessionMiddleware',
+    'django.middleware.common.CommonMiddleware',
+    'django.middleware.csrf.CsrfViewMiddleware',
+    'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.messages.middleware.MessageMiddleware',
+    'django.middleware.clickjacking.XFrameOptionsMiddleware',
+]
+
 ROOT_URLCONF = "core.urls"
 
 TEMPLATES = [
@@ -84,15 +122,31 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "core.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-        "OPTIONS": {
-            "timeout": int(os.environ.get("SQLITE_TIMEOUT", "20")),
-        },
+# Database
+USE_SQLITE = os.environ.get("USE_SQLITE", "False") == "True"
+
+if USE_SQLITE:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+            "OPTIONS": {
+                "timeout": int(os.environ.get("SQLITE_TIMEOUT", "20")),
+            },
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.environ.get("POSTGRES_DB", "app_db"),
+            "USER": os.environ.get("POSTGRES_USER", "app_user"),
+            "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "set_in_env"),
+            "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
+            "PORT": int(os.environ.get("POSTGRES_PORT", "5432")),
+            "CONN_MAX_AGE": int(os.environ.get("POSTGRES_CONN_MAX_AGE", "60")),
+        }
+    }
 
 
 def _configure_sqlite_connection(sender, connection, **kwargs):
@@ -210,6 +264,14 @@ LLM_TOKEN_BUDGET_SCREEN_STATE = int(
 LLM_TOKEN_BUDGET_HISTORY = int(os.environ.get("LLM_TOKEN_BUDGET_HISTORY", "2000"))
 LLM_TOKEN_BUDGET_RESPONSE = int(os.environ.get("LLM_TOKEN_BUDGET_RESPONSE", "500"))
 LLM_MAX_CONTEXT = int(os.environ.get("LLM_MAX_CONTEXT", "12000"))
+# ── Logging ───────────────────────────────────────────────────────────────────
+CORS_ALLOW_ALL_ORIGINS = True
+
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "transformers")
+LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
 
 LOGGING = {
     "version": 1,

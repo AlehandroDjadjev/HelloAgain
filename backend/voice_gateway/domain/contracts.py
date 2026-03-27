@@ -4,44 +4,6 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class MemoryContext:
-    user_id: str
-    session_id: str
-    current_action: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class VoiceGatewayRequest:
-    user_id: str
-    session_id: str
-    message: str
-
-
-@dataclass
-class BackendSpeakRequest:
-    user_id: str
-    session_id: str
-    agent_name: str
-    raw_data: Dict[str, Any]
-
-
-@dataclass
-class VoiceGatewayResponse:
-    spoken_text: str
-    status: str = "success"
-    structured_data: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ConversationTurn:
-    source_message: Optional[str] = None
-    agent_name: Optional[str] = None
-    shaped_response: Optional[VoiceGatewayResponse] = None
-    error: Optional[str] = None
-
-
-@dataclass
 class VoiceConversationRequest:
     user_id: str = "anonymous"
     session_id: str = "default_session"

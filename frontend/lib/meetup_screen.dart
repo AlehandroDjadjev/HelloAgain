@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
@@ -8,10 +9,11 @@ import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 
-const _kBackground = Color(0xFFF9FAFB);
+const _kBackground = Color(0xFFF8FAFC);
 const _kCard = Colors.white;
 const _kAccent = Color(0xFF2563EB);
 const _kText = Color(0xFF111827);
+const _kMuted = Color(0xFF6B7280);
 const _kMapStyle = '''
 [
   {"elementType":"geometry","stylers":[{"color":"#f8f8f8"}]},
@@ -47,26 +49,32 @@ class _MeetupScreenState extends State<MeetupScreen> {
   final Set<Marker> _markers = {};
   final FlutterLocalNotificationsPlugin _notificationsPlugin =
       FlutterLocalNotificationsPlugin();
+  final FlutterLocalNotificationsPlugin _notificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+  final Set<Marker> _markers = {};
+
+  GoogleMapController? _mapController;
+  Map<String, dynamic>? _bestMatch;
+  bool _isLoading = false;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_initNotifications());
+  }
 
   String _backendBaseUrl() {
     final configured = dotenv.env['API_BASE_URL']?.trim();
     if (configured != null && configured.isNotEmpty) {
       return configured;
     }
-
     if (kIsWeb) {
       return 'http://localhost:8000';
     }
-
     return defaultTargetPlatform == TargetPlatform.android
         ? 'http://10.0.2.2:8000'
         : 'http://localhost:8000';
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _initNotifications();
   }
 
   Future<void> _initNotifications() async {
@@ -91,8 +99,8 @@ class _MeetupScreenState extends State<MeetupScreen> {
 
   Future<void> fetchRecommendation() async {
     setState(() {
-      isLoading = true;
-      errorMessage = null;
+      _isLoading = true;
+      _errorMessage = null;
     });
 
     try {
@@ -135,8 +143,31 @@ class _MeetupScreenState extends State<MeetupScreen> {
             ? body['error'] as String?
             : null;
         setState(() {
-          errorMessage = apiError ?? 'Не можахме да намерим подходящо място.';
+          _errorMessage =
+              apiError ?? 'Could not find a suitable meeting place.';
+          _isLoading = false;
         });
+        return;
+      }
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      final bestMatch = data['best_match'] as Map<String, dynamic>?;
+      setState(() {
+        _bestMatch = bestMatch;
+        _isLoading = false;
+        _updateMarkers();
+      });
+
+      if (_bestMatch != null && _mapController != null) {
+        await _mapController!.animateCamera(
+          CameraUpdate.newLatLngZoom(
+            LatLng(
+              (_bestMatch!['place_lat'] as num).toDouble(),
+              (_bestMatch!['place_lng'] as num).toDouble(),
+            ),
+            15.5,
+          ),
+        );
       }
     } catch (_) {
       setState(() {
@@ -156,17 +187,16 @@ class _MeetupScreenState extends State<MeetupScreen> {
       ..clear()
       ..add(
         Marker(
-          markerId: const MarkerId('me'),
+          markerId: const MarkerId('you'),
           position: LatLng(
             widget.userPosition.latitude,
             widget.userPosition.longitude,
           ),
-          infoWindow: const InfoWindow(title: 'Ти'),
+          infoWindow: const InfoWindow(title: 'You'),
         ),
       );
 
-    final match = bestMatch;
-    if (match == null) {
+    if (_bestMatch == null) {
       return;
     }
 
@@ -174,13 +204,13 @@ class _MeetupScreenState extends State<MeetupScreen> {
       Marker(
         markerId: const MarkerId('best_match'),
         position: LatLng(
-          (match['place_lat'] as num).toDouble(),
-          (match['place_lng'] as num).toDouble(),
+          (_bestMatch!['place_lat'] as num).toDouble(),
+          (_bestMatch!['place_lng'] as num).toDouble(),
         ),
         icon: BitmapDescriptor.defaultMarkerWithHue(220),
         infoWindow: InfoWindow(
-          title: match['place_name'] as String?,
-          snippet: 'Среща',
+          title: _bestMatch!['place_name'] as String?,
+          snippet: 'Suggested meetup',
         ),
       ),
     );
@@ -218,8 +248,12 @@ class _MeetupScreenState extends State<MeetupScreen> {
   }
 
   Future<void> _scheduleNotification(TimeOfDay time) async {
+    if (kIsWeb || _bestMatch == null) {
+      return;
+    }
+
     final now = DateTime.now();
-    var scheduledMeeting = DateTime(
+    var scheduled = DateTime(
       now.year,
       now.month,
       now.day,
@@ -238,7 +272,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
       importance: Importance.max,
       priority: Priority.high,
     );
-    const platformDetails = NotificationDetails(android: androidDetails);
 
     if (!kIsWeb && bestMatch != null) {
       final meetStartStr =
@@ -263,17 +296,10 @@ class _MeetupScreenState extends State<MeetupScreen> {
     return Scaffold(
       backgroundColor: _kBackground,
       appBar: AppBar(
-        title: const Text(
-          'Среща С Приятели',
-          style: TextStyle(
-            fontWeight: FontWeight.w700,
-            fontSize: 20,
-            color: _kText,
-          ),
-        ),
+        title: const Text('Meetup Planner'),
         backgroundColor: _kCard,
+        foregroundColor: _kText,
         elevation: 0,
-        centerTitle: true,
       ),
       body: Column(
         children: [
@@ -297,57 +323,52 @@ class _MeetupScreenState extends State<MeetupScreen> {
           ),
           Container(
             color: _kCard,
-            padding: const EdgeInsets.fromLTRB(28, 28, 28, 36),
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 32),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Center(
-                  child: Container(
-                    width: 40,
-                    height: 4,
-                    margin: const EdgeInsets.only(bottom: 24),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFE5E7EB),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
-                if (errorMessage != null)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 20),
-                    child: Text(
-                      errorMessage!,
-                      style: const TextStyle(
-                        color: Color(0xFFDC2626),
-                        fontSize: 15,
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                if (bestMatch == null && !isLoading && errorMessage == null)
-                  const Padding(
-                    padding: EdgeInsets.only(bottom: 24),
-                    child: Text(
-                      'Намерете идеалния момент за среща',
-                      style: TextStyle(
-                        fontSize: 22,
-                        fontWeight: FontWeight.w700,
-                        color: _kText,
-                      ),
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
-                if (bestMatch != null) ...[
+                if (_errorMessage != null) ...[
                   Text(
-                    bestMatch!['place_name'] as String,
+                    _errorMessage!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.redAccent),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+                if (_bestMatch == null &&
+                    !_isLoading &&
+                    _errorMessage == null) ...[
+                  const Text(
+                    'Find a good place and time for your meetup.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w700,
+                      color: _kText,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                ],
+                if (_bestMatch != null) ...[
+                  Text(
+                    _bestMatch!['place_name'] as String? ?? 'Suggested place',
+                    textAlign: TextAlign.center,
                     style: const TextStyle(
                       fontSize: 24,
                       fontWeight: FontWeight.w800,
                       color: _kText,
-                      height: 1.2,
                     ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    (_bestMatch!['recommended_time'] ?? '').toString(),
                     textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                      color: _kAccent,
+                    ),
                   ),
                   const SizedBox(height: 12),
                   Center(
@@ -389,16 +410,16 @@ class _MeetupScreenState extends State<MeetupScreen> {
                     onPressed: _showReminderDialog,
                     icon: const Icon(Icons.alarm_add, color: _kAccent),
                     label: const Text(
-                      'Задай Напомняне',
-                      style: TextStyle(color: _kAccent, fontSize: 16),
+                      'Set reminder',
+                      style: TextStyle(color: _kAccent),
                     ),
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 12),
                 ],
                 SizedBox(
-                  height: 58,
+                  height: 56,
                   child: ElevatedButton(
-                    onPressed: isLoading ? null : fetchRecommendation,
+                    onPressed: _isLoading ? null : fetchRecommendation,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: _kAccent,
                       foregroundColor: Colors.white,
@@ -407,7 +428,7 @@ class _MeetupScreenState extends State<MeetupScreen> {
                         borderRadius: BorderRadius.circular(14),
                       ),
                     ),
-                    child: isLoading
+                    child: _isLoading
                         ? const SizedBox(
                             width: 24,
                             height: 24,
@@ -417,13 +438,19 @@ class _MeetupScreenState extends State<MeetupScreen> {
                             ),
                           )
                         : const Text(
-                            'Намери Място',
+                            'Find meetup',
                             style: TextStyle(
                               fontSize: 17,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
                   ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'Your current location is used as the starting point.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: _kMuted, fontSize: 13),
                 ),
               ],
             ),

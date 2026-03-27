@@ -3,8 +3,9 @@ import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:geolocator/geolocator.dart';
 
-import 'src/screens/permission_screen.dart';
 import 'meetup_screen.dart';
+import 'src/screens/home_screen.dart';
+import 'src/screens/permission_screen.dart';
 import 'voice_lab_screen.dart';
 import 'weather_screen.dart';
 
@@ -32,7 +33,14 @@ class HelloAgainApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
-      home: const PermissionScreen(),
+      routes: {
+        '/': (_) => const MainShell(),
+        '/shell': (_) => const MainShell(),
+        '/voice': (_) => const VoiceLabScreen(),
+        '/agent': (_) => const HomeScreen(),
+        '/permissions': (_) => const PermissionScreen(),
+      },
+      initialRoute: '/',
     );
   }
 
@@ -63,7 +71,7 @@ class HelloAgainApp extends StatelessWidget {
 }
 
 class MainShell extends StatefulWidget {
-  const MainShell({super.key, this.initialUserPosition, this.initialIndex = 2});
+  const MainShell({super.key, this.initialUserPosition, this.initialIndex = 3});
 
   final Position? initialUserPosition;
   final int initialIndex;
@@ -159,6 +167,7 @@ class _MainShellState extends State<MainShell> {
               onRequestLocation: _requestLocation,
             ),
       const VoiceLabScreen(),
+      const HomeScreen(),
     ];
   }
 
@@ -190,6 +199,11 @@ class _MainShellState extends State<MainShell> {
               color: Colors.white,
             ),
             label: 'Voice Lab',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.hub_outlined, color: Colors.white70),
+            selectedIcon: Icon(Icons.hub_rounded, color: Colors.white),
+            label: 'Pipeline',
           ),
         ],
       ),
