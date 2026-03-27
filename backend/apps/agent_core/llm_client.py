@@ -336,7 +336,7 @@ class LLMClient:
                     do_sample=False,
                     temperature=None,
                     top_p=None,
-                    pad_token_id=tokenizer.eos_token_id,
+                    pad_token_id=_tokenizer_attr(tokenizer, "eos_token_id"),
                 )
                 new_ids = output_ids[0][prompt_tokens:]
                 output_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
@@ -373,7 +373,7 @@ class LLMClient:
                     do_sample=False,
                     temperature=None,
                     top_p=None,
-                    pad_token_id=tokenizer.eos_token_id,
+                    pad_token_id=_tokenizer_attr(tokenizer, "eos_token_id"),
                     streamer=streamer,
                 )
             except BaseException as exc:  # pragma: no cover
@@ -409,7 +409,13 @@ class LLMClient:
             return self._tf_pipeline
 
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore[import]
+            from transformers import (  # type: ignore[import]
+                AutoConfig,
+                AutoModelForCausalLM,
+                AutoModelForImageTextToText,
+                AutoProcessor,
+                AutoTokenizer,
+            )
             import torch  # type: ignore[import]
         except ImportError as exc:
             raise LLMError(
@@ -418,12 +424,27 @@ class LLMClient:
 
         source, local_snapshot, local_files_only = self._resolve_transformers_source()
         self._log_transformers_load_start(source, local_snapshot, local_files_only)
-
-        tokenizer = AutoTokenizer.from_pretrained(
+        model_config = AutoConfig.from_pretrained(
             source,
             trust_remote_code=True,
             local_files_only=local_files_only,
         )
+        uses_vl_processor = _is_vl_model_config(model_config)
+
+        if uses_vl_processor:
+            tokenizer = AutoProcessor.from_pretrained(
+                source,
+                trust_remote_code=True,
+                local_files_only=local_files_only,
+            )
+            model_loader = AutoModelForImageTextToText
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(
+                source,
+                trust_remote_code=True,
+                local_files_only=local_files_only,
+            )
+            model_loader = AutoModelForCausalLM
 
         load_started = time.perf_counter()
         try:
@@ -435,7 +456,7 @@ class LLMClient:
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=_quant_4bit_compute_dtype(torch),
             )
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_loader.from_pretrained(
                 source,
                 quantization_config=bnb_config,
                 device_map=_quantized_device_map(torch),
@@ -446,7 +467,7 @@ class LLMClient:
             logger.info("Loaded %s in 4-bit quantisation", self.model)
         except Exception as exc:
             logger.warning("4-bit quantisation load failed for %s: %s", self.model, exc)
-            model = AutoModelForCausalLM.from_pretrained(
+            model = model_loader.from_pretrained(
                 source,
                 torch_dtype="auto",
                 device_map="auto",
@@ -530,7 +551,7 @@ class LLMClient:
             "placement": _placement_verdict(model),
             "device_counts": device_counts,
             "device_map": device_map,
-            "vocab_size": getattr(tokenizer, "vocab_size", None),
+            "vocab_size": _tokenizer_attr(tokenizer, "vocab_size"),
             "snapshot_complete": bool(local_snapshot and local_snapshot.is_complete),
             "snapshot_revision": local_snapshot.revision if local_snapshot else "",
             "snapshot_size_gb": round(
@@ -681,6 +702,22 @@ def _transformers_max_new_tokens(json_mode: bool) -> int:
     if json_mode:
         return max(32, int(os.environ.get("LOCAL_LLM_JSON_MAX_NEW_TOKENS", "128")))
     return max(32, int(os.environ.get("LOCAL_LLM_MAX_NEW_TOKENS", "256")))
+
+
+def _tokenizer_attr(tokenizer_obj, attr: str, default: Any = None):
+    value = getattr(tokenizer_obj, attr, None)
+    if value is not None:
+        return value
+    nested = getattr(tokenizer_obj, "tokenizer", None)
+    if nested is not None:
+        nested_value = getattr(nested, attr, None)
+        if nested_value is not None:
+            return nested_value
+    return default
+
+
+def _is_vl_model_config(config_obj) -> bool:
+    return str(getattr(config_obj, "model_type", "")).lower() in {"qwen2_vl", "qwen2_5_vl"}
 
 
 def _find_complete_local_snapshot(model_name: str) -> LocalModelSnapshot | None:

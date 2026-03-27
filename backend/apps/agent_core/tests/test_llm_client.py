@@ -9,8 +9,10 @@ from apps.agent_core.llm_client import (
     LLMClient,
     LLMError,
     _find_complete_local_snapshot,
+    _is_vl_model_config,
     _inspect_local_model_path,
     _placement_verdict,
+    _tokenizer_attr,
     _transformers_max_new_tokens,
 )
 
@@ -151,3 +153,18 @@ class LLMClientLocalSnapshotTests(SimpleTestCase):
                 os.environ.pop("LOCAL_LLM_MAX_NEW_TOKENS", None)
             else:
                 os.environ["LOCAL_LLM_MAX_NEW_TOKENS"] = old_default
+
+    def test_tokenizer_attr_falls_back_to_nested_tokenizer(self):
+        class NestedTokenizer:
+            eos_token_id = 42
+
+        class ProcessorLike:
+            tokenizer = NestedTokenizer()
+
+        self.assertEqual(_tokenizer_attr(ProcessorLike(), "eos_token_id"), 42)
+
+    def test_is_vl_model_config_detects_qwen2_vl(self):
+        class DummyConfig:
+            model_type = "qwen2_vl"
+
+        self.assertTrue(_is_vl_model_config(DummyConfig()))
