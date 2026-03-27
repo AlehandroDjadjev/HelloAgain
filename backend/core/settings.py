@@ -42,7 +42,7 @@ INSTALLED_APPS = [
     "apps.audit_log",
 ]
 
-MIDDLEWARE = [s
+MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -50,12 +50,6 @@ MIDDLEWARE = [s
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    'django.contrib.admin',
-    'django.contrib.auth',
-    'django.contrib.contenttypes',
-    'django.contrib.sessions',
-    'django.contrib.messages',
-    'django.contrib.staticfiles',
 ]
 
 MIDDLEWARE = [
@@ -94,6 +88,9 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        "OPTIONS": {
+            "timeout": int(os.environ.get("SQLITE_TIMEOUT", "20")),
+        },
     }
 }
 
@@ -174,7 +171,7 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ── LLM configuration ─────────────────────────────────────────────────────────
 #
-# Default provider: transformers (Qwen/Qwen2.5-14B-Instruct loaded locally).
+# Default provider: transformers (Qwen/Qwen3-14B loaded locally).
 # Switch provider by setting LLM_PROVIDER env var — no code changes needed:
 #
 #   transformers  local HuggingFace model (default)
@@ -197,10 +194,30 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 #   LLM_PROVIDER=groq LLM_API_KEY=gsk_xxx python manage.py runserver
 
 LLM_PROVIDER  = os.environ.get("LLM_PROVIDER",  "transformers")
-LLM_MODEL     = os.environ.get("LLM_MODEL",     "Qwen/Qwen2.5-14B-Instruct")
+LLM_MODEL     = os.environ.get("LLM_MODEL",     "Qwen/Qwen3-14B")
 LLM_API_KEY   = os.environ.get("LLM_API_KEY",   "")
 LLM_BASE_URL  = os.environ.get("LLM_BASE_URL",  "")   # empty → use provider default
 LLM_TIMEOUT   = int(os.environ.get("LLM_TIMEOUT", "60"))  # 60s for local model generation
+LOCAL_LLM_PROVIDER = os.environ.get("LOCAL_LLM_PROVIDER", "transformers")
+LOCAL_LLM_MODEL = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen3-14B")
+LOCAL_LLM_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "")
+LOCAL_LLM_BASE_URL = os.environ.get("LOCAL_LLM_BASE_URL", "")
+LOCAL_LLM_TIMEOUT = int(os.environ.get("LOCAL_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+OPENAI_LLM_MODEL = os.environ.get("OPENAI_LLM_MODEL", "gpt-5-mini")
+OPENAI_LLM_API_KEY = os.environ.get(
+    "OPENAI_LLM_API_KEY",
+    os.environ.get("OPENAI_API_KEY", os.environ.get("LLM_API_KEY", "")),
+)
+OPENAI_LLM_BASE_URL = os.environ.get(
+    "OPENAI_LLM_BASE_URL",
+    os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+)
+OPENAI_LLM_TIMEOUT = int(os.environ.get("OPENAI_LLM_TIMEOUT", str(LLM_TIMEOUT)))
+LLM_TOKEN_BUDGET_SYSTEM_PROMPT = int(os.environ.get("LLM_TOKEN_BUDGET_SYSTEM_PROMPT", "2000"))
+LLM_TOKEN_BUDGET_SCREEN_STATE  = int(os.environ.get("LLM_TOKEN_BUDGET_SCREEN_STATE", "6000"))
+LLM_TOKEN_BUDGET_HISTORY       = int(os.environ.get("LLM_TOKEN_BUDGET_HISTORY", "2000"))
+LLM_TOKEN_BUDGET_RESPONSE      = int(os.environ.get("LLM_TOKEN_BUDGET_RESPONSE", "500"))
+LLM_MAX_CONTEXT                = int(os.environ.get("LLM_MAX_CONTEXT", "12000"))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 

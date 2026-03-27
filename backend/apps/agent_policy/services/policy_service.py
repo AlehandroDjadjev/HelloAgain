@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
-from uuid import uuid4
 
 from django.db import transaction
 
@@ -30,6 +29,7 @@ SYSTEM_ALLOWED_PACKAGES: frozenset[str] = frozenset({
     "com.google.android.apps.maps",
     "com.android.chrome",
     "com.google.android.gm",
+    "com.supercell.brawlstars",
 })
 
 SYSTEM_BLOCKED_GOALS: frozenset[str] = frozenset({
@@ -46,6 +46,7 @@ SYSTEM_BLOCKED_KEYWORDS: tuple[str, ...] = (
 )
 
 SYSTEM_MAX_PLAN_LENGTH: int = 20
+SYSTEM_MAX_STEP_COUNT: int = 50
 
 # Words in a selector that indicate an irreversible UI action
 _TAP_TRIGGER_WORDS: tuple[str, ...] = (
@@ -61,6 +62,7 @@ class PolicyDecision:
     decision: str          # "allow" | "confirm" | "block"
     reason: str
     action_id: str = ""    # empty for plan-level decisions
+    action_type: str = ""
 
 
 @dataclass
@@ -70,6 +72,15 @@ class PolicyResult:
     blocked_reason: Optional[str]
     policy_decisions: list[PolicyDecision] = field(default_factory=list)
     is_modified: bool = False            # True when confirmation steps were inserted
+
+
+@dataclass
+class StepPolicyResult:
+    allowed: bool
+    requires_confirmation: bool
+    blocked_reason: str | None
+    policy_decisions: list[PolicyDecision] = field(default_factory=list)
+    modified_sensitivity: str | None = None
 
 
 # ── PolicyEnforcer ────────────────────────────────────────────────────────────
@@ -356,6 +367,388 @@ class PolicyEnforcer:
             is_modified=is_modified,
         )
 
+    @staticmethod
+    @transaction.atomic
+    def check_step(
+        step: "ReasonedStep",
+        session_goal: str,
+        target_package: str,
+        user_policy=None,  # UserAutomationPolicy | None
+        step_count: int = 0,
+        screen_state: dict | None = None,
+        session=None,      # AgentSession | None
+    ) -> StepPolicyResult:
+        decisions: list[PolicyDecision] = []
+        action_type = str(getattr(step, "action_type", "") or "")
+        params = getattr(step, "params", {}) or {}
+        sensitivity = str(getattr(step, "sensitivity", "") or ActionSensitivity.LOW.value)
+        requires_confirmation = bool(getattr(step, "requires_confirmation", False))
+        modified_sensitivity: str | None = None
+
+        sys_cfg = _load_system_config()
+        allowed_packages = set(sys_cfg.get("allowed_packages") or SYSTEM_ALLOWED_PACKAGES)
+        system_keywords = list(sys_cfg.get("blocked_keywords") or SYSTEM_BLOCKED_KEYWORDS)
+        goal_lower = (session_goal or "").lower()
+        user_keywords = list(getattr(user_policy, "blocked_keywords", None) or [])
+        effective_user_allowlist = list(
+            getattr(user_policy, "allowlisted_packages", None)
+            or getattr(user_policy, "allowed_packages", None)
+            or []
+        )
+        selector_node = _resolve_step_target_node(params, screen_state)
+        selector_text = _extract_node_text(selector_node) or _selector_text(params)
+
+        valid_types = {t.value for t in ActionType}
+        if action_type not in valid_types:
+            decisions.append(PolicyDecision(
+                rule_name="sys.valid_action_type",
+                decision="block",
+                reason=f"Unknown action_type '{action_type}'.",
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=False,
+                blocked_reason="invalid_action_type",
+                modified_sensitivity=None,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="sys.valid_action_type",
+            decision="allow",
+            reason=f"Action type '{action_type}' is valid.",
+            action_type=action_type,
+        ))
+
+        if step_count >= SYSTEM_MAX_STEP_COUNT:
+            decisions.append(PolicyDecision(
+                rule_name="sys.max_steps",
+                decision="block",
+                reason=f"Step count {step_count} reached the maximum of {SYSTEM_MAX_STEP_COUNT}.",
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=requires_confirmation,
+                blocked_reason="max_steps_exceeded",
+                modified_sensitivity=modified_sensitivity,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="sys.max_steps",
+            decision="allow",
+            reason=f"Step count {step_count} is within the maximum of {SYSTEM_MAX_STEP_COUNT}.",
+            action_type=action_type,
+        ))
+
+        if action_type == ActionType.OPEN_APP.value:
+            package_name = str(params.get("package_name") or "")
+            if package_name not in allowed_packages:
+                decisions.append(PolicyDecision(
+                    rule_name="sys.allowed_packages",
+                    decision="block",
+                    reason=f"OPEN_APP package '{package_name}' is not in the system allowlist.",
+                    action_type=action_type,
+                ))
+                return _finalize_step_policy(
+                    decisions=decisions,
+                    session=session,
+                    allowed=False,
+                    requires_confirmation=requires_confirmation,
+                    blocked_reason="package_not_allowed",
+                    modified_sensitivity=modified_sensitivity,
+                )
+            decisions.append(PolicyDecision(
+                rule_name="sys.allowed_packages",
+                decision="allow",
+                reason=f"OPEN_APP package '{package_name}' is allowed.",
+                action_type=action_type,
+            ))
+        else:
+            decisions.append(PolicyDecision(
+                rule_name="sys.allowed_packages",
+                decision="allow",
+                reason="Rule not applicable for this action type.",
+                action_type=action_type,
+            ))
+
+        system_keyword_hit = _match_step_keyword(
+            action_type=action_type,
+            params=params,
+            selector_text=selector_text,
+            keywords=system_keywords,
+        )
+        if system_keyword_hit:
+            decisions.append(PolicyDecision(
+                rule_name="sys.sensitive_content",
+                decision="block",
+                reason=(
+                    f"Blocked keyword '{system_keyword_hit}' detected in the current step content."
+                ),
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=requires_confirmation,
+                blocked_reason="sensitive_content_detected",
+                modified_sensitivity=modified_sensitivity,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="sys.sensitive_content",
+            decision="allow",
+            reason="No system-blocked keywords detected for this step.",
+            action_type=action_type,
+        ))
+
+        if requires_confirmation:
+            decisions.append(PolicyDecision(
+                rule_name="llm.requires_confirmation",
+                decision="confirm",
+                reason="LLM requested confirmation and policy preserved it.",
+                action_type=action_type,
+            ))
+        else:
+            decisions.append(PolicyDecision(
+                rule_name="llm.requires_confirmation",
+                decision="allow",
+                reason="LLM did not request confirmation.",
+                action_type=action_type,
+            ))
+
+        tap_trigger = ""
+        if action_type == ActionType.TAP_ELEMENT.value:
+            tap_trigger = _match_trigger_word(selector_text)
+            if tap_trigger:
+                requires_confirmation = True
+                modified_sensitivity = _escalate_sensitivity(
+                    modified_sensitivity or sensitivity,
+                    ActionSensitivity.HIGH.value,
+                )
+                decisions.append(PolicyDecision(
+                    rule_name="sys.tap_confirmation",
+                    decision="confirm",
+                    reason=f"TAP_ELEMENT target matches trigger word '{tap_trigger}'.",
+                    action_type=action_type,
+                ))
+            else:
+                decisions.append(PolicyDecision(
+                    rule_name="sys.tap_confirmation",
+                    decision="allow",
+                    reason="TAP_ELEMENT target does not match a confirmation trigger.",
+                    action_type=action_type,
+                ))
+        else:
+            decisions.append(PolicyDecision(
+                rule_name="sys.tap_confirmation",
+                decision="allow",
+                reason="Rule not applicable for this action type.",
+                action_type=action_type,
+            ))
+
+        if action_type == ActionType.TYPE_TEXT.value:
+            if _sensitivity_rank(sensitivity) >= _sensitivity_rank(ActionSensitivity.MEDIUM.value):
+                requires_confirmation = True
+                decisions.append(PolicyDecision(
+                    rule_name="sys.type_text_confirmation",
+                    decision="confirm",
+                    reason=f"TYPE_TEXT sensitivity '{sensitivity}' requires confirmation.",
+                    action_type=action_type,
+                ))
+            else:
+                decisions.append(PolicyDecision(
+                    rule_name="sys.type_text_confirmation",
+                    decision="allow",
+                    reason=f"TYPE_TEXT sensitivity '{sensitivity}' does not require confirmation.",
+                    action_type=action_type,
+                ))
+        else:
+            decisions.append(PolicyDecision(
+                rule_name="sys.type_text_confirmation",
+                decision="allow",
+                reason="Rule not applicable for this action type.",
+                action_type=action_type,
+            ))
+
+        if user_policy and not user_policy.allow_text_entry and action_type == ActionType.TYPE_TEXT.value:
+            decisions.append(PolicyDecision(
+                rule_name="user.allow_text_entry",
+                decision="block",
+                reason="User policy disallows TYPE_TEXT actions.",
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=requires_confirmation,
+                blocked_reason="text_entry_not_allowed",
+                modified_sensitivity=modified_sensitivity,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="user.allow_text_entry",
+            decision="allow",
+            reason="Text entry is permitted by user policy.",
+            action_type=action_type,
+        ))
+
+        if user_policy and not user_policy.allow_send_actions and "send" in goal_lower:
+            decisions.append(PolicyDecision(
+                rule_name="user.allow_send_actions",
+                decision="block",
+                reason="User policy disallows actions for goals that contain 'send'.",
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=requires_confirmation,
+                blocked_reason="send_actions_not_allowed",
+                modified_sensitivity=modified_sensitivity,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="user.allow_send_actions",
+            decision="allow",
+            reason="Send-action policy allows this goal.",
+            action_type=action_type,
+        ))
+
+        if effective_user_allowlist and target_package not in set(effective_user_allowlist):
+            decisions.append(PolicyDecision(
+                rule_name="user.allowlisted_packages",
+                decision="block",
+                reason=f"Target package '{target_package}' is not in the user's allowlist.",
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=requires_confirmation,
+                blocked_reason="package_not_allowlisted",
+                modified_sensitivity=modified_sensitivity,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="user.allowlisted_packages",
+            decision="allow",
+            reason="Target package passes the user allowlist rule.",
+            action_type=action_type,
+        ))
+
+        blocked_action_types = set(getattr(user_policy, "blocked_action_types", None) or [])
+        if action_type in blocked_action_types:
+            decisions.append(PolicyDecision(
+                rule_name="user.blocked_action_types",
+                decision="block",
+                reason=f"User policy blocks action type '{action_type}'.",
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=requires_confirmation,
+                blocked_reason="action_type_blocked",
+                modified_sensitivity=modified_sensitivity,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="user.blocked_action_types",
+            decision="allow",
+            reason="Action type is not blocked by user policy.",
+            action_type=action_type,
+        ))
+
+        user_keyword_hit = _match_step_keyword(
+            action_type=action_type,
+            params=params,
+            selector_text=selector_text,
+            keywords=user_keywords,
+        )
+        if user_keyword_hit:
+            decisions.append(PolicyDecision(
+                rule_name="user.blocked_keywords",
+                decision="block",
+                reason=(
+                    f"User-blocked keyword '{user_keyword_hit}' detected in the current step content."
+                ),
+                action_type=action_type,
+            ))
+            return _finalize_step_policy(
+                decisions=decisions,
+                session=session,
+                allowed=False,
+                requires_confirmation=requires_confirmation,
+                blocked_reason="sensitive_content_detected",
+                modified_sensitivity=modified_sensitivity,
+            )
+        decisions.append(PolicyDecision(
+            rule_name="user.blocked_keywords",
+            decision="allow",
+            reason="No user-blocked keywords detected for this step.",
+            action_type=action_type,
+        ))
+
+        always_confirm_action_types = set(
+            getattr(user_policy, "always_confirm_action_types", None) or []
+        )
+        if action_type in always_confirm_action_types:
+            requires_confirmation = True
+            modified_sensitivity = _escalate_sensitivity(
+                modified_sensitivity or sensitivity,
+                ActionSensitivity.MEDIUM.value,
+            )
+            decisions.append(PolicyDecision(
+                rule_name="user.always_confirm_action_types",
+                decision="confirm",
+                reason=f"User policy always confirms action type '{action_type}'.",
+                action_type=action_type,
+            ))
+        else:
+            decisions.append(PolicyDecision(
+                rule_name="user.always_confirm_action_types",
+                decision="allow",
+                reason="No user confirmation override for this action type.",
+                action_type=action_type,
+            ))
+
+        if (
+            user_policy
+            and user_policy.require_hard_confirmation_for_send
+            and "send" in goal_lower
+            and action_type == ActionType.TAP_ELEMENT.value
+        ):
+            requires_confirmation = True
+            modified_sensitivity = _escalate_sensitivity(
+                modified_sensitivity or sensitivity,
+                ActionSensitivity.HIGH.value,
+            )
+            decisions.append(PolicyDecision(
+                rule_name="user.require_hard_confirmation_for_send",
+                decision="confirm",
+                reason="Goal contains 'send'; TAP_ELEMENT requires confirmation.",
+                action_type=action_type,
+            ))
+        else:
+            decisions.append(PolicyDecision(
+                rule_name="user.require_hard_confirmation_for_send",
+                decision="allow",
+                reason="Hard send confirmation rule not triggered.",
+                action_type=action_type,
+            ))
+
+        return _finalize_step_policy(
+            decisions=decisions,
+            session=session,
+            allowed=True,
+            requires_confirmation=requires_confirmation,
+            blocked_reason=None,
+            modified_sensitivity=modified_sensitivity,
+        )
+
 
 # ── Confirmation insertion ────────────────────────────────────────────────────
 
@@ -479,6 +872,99 @@ def _tap_trigger_word(params: dict) -> str:
     return ""
 
 
+def _finalize_step_policy(
+    decisions: list[PolicyDecision],
+    session,
+    allowed: bool,
+    requires_confirmation: bool,
+    blocked_reason: str | None,
+    modified_sensitivity: str | None,
+) -> StepPolicyResult:
+    _persist_step_decisions(decisions, session)
+    return StepPolicyResult(
+        allowed=allowed,
+        requires_confirmation=requires_confirmation,
+        blocked_reason=blocked_reason,
+        policy_decisions=decisions,
+        modified_sensitivity=modified_sensitivity,
+    )
+
+
+def _resolve_step_target_node(params: dict, screen_state: dict | None) -> dict | None:
+    if not screen_state:
+        return None
+    selector = params.get("selector") or {}
+    if not isinstance(selector, dict):
+        return None
+    element_ref = selector.get("element_ref")
+    if not element_ref:
+        return None
+    for node in (screen_state.get("nodes") or []):
+        if node.get("ref") == element_ref:
+            return node
+    return None
+
+
+def _extract_node_text(node: dict | None) -> str:
+    if not node:
+        return ""
+    return " ".join(
+        str(v).strip()
+        for v in (
+            node.get("text"),
+            node.get("content_desc"),
+            node.get("contentDesc"),
+        )
+        if isinstance(v, str) and v.strip()
+    )
+
+
+def _selector_text(params: dict) -> str:
+    selector = params.get("selector") or {}
+    if not isinstance(selector, dict):
+        return ""
+    return " ".join(
+        str(v).strip()
+        for key, v in selector.items()
+        if key != "element_ref" and isinstance(v, str) and v.strip()
+    )
+
+
+def _match_trigger_word(text: str) -> str:
+    combined = (text or "").lower()
+    for word in _TAP_TRIGGER_WORDS:
+        if word in combined:
+            return word
+    return ""
+
+
+def _match_step_keyword(
+    action_type: str,
+    params: dict,
+    selector_text: str,
+    keywords: list[str],
+) -> str:
+    if not keywords:
+        return ""
+    if action_type in {ActionType.TAP_ELEMENT.value, ActionType.LONG_PRESS_ELEMENT.value}:
+        return _find_blocked_keyword({"target_text": selector_text}, keywords)
+    if action_type == ActionType.TYPE_TEXT.value:
+        return _find_blocked_keyword({"text": params.get("text", "")}, keywords)
+    return ""
+
+
+def _sensitivity_rank(value: str) -> int:
+    return {
+        ActionSensitivity.LOW.value: 0,
+        ActionSensitivity.MEDIUM.value: 1,
+        ActionSensitivity.HIGH.value: 2,
+    }.get((value or "").lower(), 0)
+
+
+def _escalate_sensitivity(current: str, minimum: str) -> str:
+    return minimum if _sensitivity_rank(minimum) > _sensitivity_rank(current) else current
+
+
 def _find_blocked_keyword(params: dict, keywords: list[str]) -> str:
     """Recursively scan all string values in params for blocked keywords. Returns first hit."""
     combined = _extract_strings(params).lower()
@@ -532,6 +1018,7 @@ def _persist_decisions(
                 plan_id=plan.plan_id,
                 rule_name=d.rule_name,
                 action_id=d.action_id,
+                action_type=d.action_type,
                 decision=d.decision,
                 reason=d.reason,
             )
@@ -539,3 +1026,29 @@ def _persist_decisions(
         ])
     except Exception as exc:
         logger.warning("Failed to persist policy decisions: %s", exc)
+
+
+def _persist_step_decisions(
+    decisions: list[PolicyDecision],
+    session,
+) -> None:
+    """Persist step-level policy decisions for LLM-driven execution."""
+    if session is None:
+        return
+    try:
+        from apps.agent_policy.models import PolicyDecisionRecord
+
+        PolicyDecisionRecord.objects.bulk_create([
+            PolicyDecisionRecord(
+                session=session,
+                plan_id=str(session.id),
+                rule_name=d.rule_name,
+                action_id=d.action_id,
+                action_type=d.action_type,
+                decision=d.decision,
+                reason=d.reason,
+            )
+            for d in decisions
+        ])
+    except Exception as exc:
+        logger.warning("Failed to persist step policy decisions: %s", exc)

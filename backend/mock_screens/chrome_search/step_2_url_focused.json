@@ -1,0 +1,125 @@
+{
+  "name": "chrome_url_focused",
+  "screen_state": {
+    "foreground_package": "com.android.chrome",
+    "window_title": "Chrome",
+    "screen_hash": "chrome_focused_2",
+    "focused_element_ref": "url_bar",
+    "is_sensitive": false,
+    "nodes": [
+      {
+        "ref": "root",
+        "class_name": "android.widget.FrameLayout",
+        "text": null,
+        "content_desc": null,
+        "clickable": false,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 0, "top": 0, "right": 1080, "bottom": 2400 },
+        "children": ["url_bar", "clear_btn", "keyboard_row_1", "keyboard_row_2", "keyboard_row_3"]
+      },
+      {
+        "ref": "url_bar",
+        "class_name": "android.widget.EditText",
+        "text": "",
+        "content_desc": "Search or type web address",
+        "clickable": true,
+        "editable": true,
+        "focused": true,
+        "enabled": true,
+        "bounds": { "left": 90, "top": 120, "right": 920, "bottom": 220 },
+        "children": []
+      },
+      {
+        "ref": "clear_btn",
+        "class_name": "android.widget.ImageButton",
+        "text": null,
+        "content_desc": "Clear text",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 930, "top": 120, "right": 1010, "bottom": 220 },
+        "children": []
+      },
+      {
+        "ref": "keyboard_row_1",
+        "class_name": "android.widget.LinearLayout",
+        "text": null,
+        "content_desc": null,
+        "clickable": false,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 20, "top": 1700, "right": 1060, "bottom": 1840 },
+        "children": ["k_q", "k_w", "k_e", "k_r", "k_t"]
+      },
+      {
+        "ref": "k_q",
+        "class_name": "android.widget.TextView",
+        "text": "q",
+        "content_desc": "q",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 40, "top": 1710, "right": 120, "bottom": 1810 },
+        "children": []
+      },
+      {
+        "ref": "k_w",
+        "class_name": "android.widget.TextView",
+        "text": "w",
+        "content_desc": "w",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 140, "top": 1710, "right": 220, "bottom": 1810 },
+        "children": []
+      },
+      {
+        "ref": "k_e",
+        "class_name": "android.widget.TextView",
+        "text": "e",
+        "content_desc": "e",
+        "clickable": true,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 240, "top": 1710, "right": 320, "bottom": 1810 },
+        "children": []
+      },
+      {
+        "ref": "keyboard_row_2",
+        "class_name": "android.widget.LinearLayout",
+        "text": null,
+        "content_desc": null,
+        "clickable": false,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 40, "top": 1850, "right": 1040, "bottom": 1990 },
+        "children": ["k_a", "k_s", "k_d", "k_f", "k_g"]
+      },
+      {
+        "ref": "keyboard_row_3",
+        "class_name": "android.widget.LinearLayout",
+        "text": null,
+        "content_desc": null,
+        "clickable": false,
+        "editable": false,
+        "focused": false,
+        "enabled": true,
+        "bounds": { "left": 60, "top": 2000, "right": 1020, "bottom": 2140 },
+        "children": ["k_z", "k_x", "k_c", "k_v", "k_b"]
+      }
+    ]
+  },
+  "result": {
+    "success": true,
+    "code": "OK",
+    "screen_hash_after": "chrome_results_3"
+  }
+}

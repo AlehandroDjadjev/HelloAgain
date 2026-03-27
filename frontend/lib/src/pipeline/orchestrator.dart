@@ -5,54 +5,58 @@ import 'package:flutter/foundation.dart';
 
 import '../api/agent_client.dart';
 import 'pipeline_state.dart';
-import 'plan_builder.dart';
 import 'step_runner.dart';
 
-/// Drives the full text→gestures pipeline.
-///
-/// UI binds to this [ChangeNotifier] and rebuilds on every state update.
-/// The execution loop is delegated to [StepRunner], which keeps this class
-/// focused on pipeline orchestration (session, intent, plan, approval).
+/// Drives the text-to-execution pipeline for LLM-in-the-loop automation.
 class PipelineOrchestrator extends ChangeNotifier {
   PipelineOrchestrator({required this.client});
 
   final AgentClient client;
   final _gateway = const DeviceControlChannel();
 
-  // ── Observable state ──────────────────────────────────────────────────────
-
   PipelinePhase phase = PipelinePhase.idle;
   String? sessionId;
-  String? planId;
   Map<String, dynamic>? parsedIntent;
   List<StepEntry> steps = [];
-  int currentStepIndex = 0;
+  int currentStepIndex = -1;
+  String currentReasoning = '';
   ConfirmationRequest? pendingConfirmation;
   String? errorMessage;
   final List<LogEntry> log = [];
 
-  bool get canPause  => phase == PipelinePhase.executing ||
-                        phase == PipelinePhase.awaitingConfirmation;
+  bool get canPause =>
+      phase == PipelinePhase.executing ||
+      phase == PipelinePhase.awaitingConfirmation;
   bool get canResume => phase == PipelinePhase.idle && sessionId != null;
   bool get canCancel => phase.isRunning;
 
+  StepEntry? get currentStep =>
+      currentStepIndex >= 0 && currentStepIndex < steps.length
+      ? steps[currentStepIndex]
+      : null;
+
   StepRunner? _runner;
+  bool _cancelRequested = false;
 
-  // ── Control ───────────────────────────────────────────────────────────────
+  bool get _cancelled => _cancelRequested;
 
-  /// Full pipeline: session → intent → plan → approve → execute loop.
-  Future<void> run(String command, {Map<String, dynamic> extras = const {}}) async {
+  Future<void> run(String command, {String reasoningProvider = 'local'}) async {
     if (phase.isRunning) return;
 
     _reset();
     _log('Starting pipeline: "$command"');
+    _log('Reasoning provider: ${_reasoningProviderLabel(reasoningProvider)}');
 
     try {
-      await _createSession(command);       if (_cancelled) return;
-      await _parseIntent(command);         if (_cancelled) return;
-      await _buildAndSubmitPlan(command, extras); if (_cancelled) return;
-      await _approvePlan();                if (_cancelled) return;
-      await _startAndroidSession();        if (_cancelled) return;
+      await _createSession(reasoningProvider);
+      if (_cancelled) return;
+
+      await _parseIntent(command);
+      if (_cancelled) return;
+
+      await _startAndroidSession();
+      if (_cancelled) return;
+
       await _startExecutionLoop();
     } on AgentApiException catch (e) {
       _fail('API error ${e.statusCode}: ${e.shortMessage}');
@@ -77,7 +81,9 @@ class PipelineOrchestrator extends ChangeNotifier {
     _cancelRequested = true;
     _runner?.cancel();
     if (sessionId != null) {
-      try { await client.cancelSession(sessionId!); } catch (_) {}
+      try {
+        await client.cancelSession(sessionId!);
+      } catch (_) {}
     }
     _log('Session cancelled.', level: LogLevel.warning);
     _setPhase(PipelinePhase.cancelled);
@@ -94,7 +100,6 @@ class PipelineOrchestrator extends ChangeNotifier {
       pendingConfirmation = null;
       notifyListeners();
       _setPhase(PipelinePhase.executing);
-      // Resume runner loop — StepRunner picks up from where it left off
       await _runner?.runLoop();
     } catch (e) {
       _fail('Approve failed: $e');
@@ -110,23 +115,23 @@ class PipelineOrchestrator extends ChangeNotifier {
         await client.rejectConfirmation(conf.confirmationId);
       }
     } catch (_) {}
-    _log('Confirmation rejected — aborting.', level: LogLevel.warning);
+    _log('Confirmation rejected, aborting.', level: LogLevel.warning);
     pendingConfirmation = null;
     _setPhase(PipelinePhase.cancelled);
   }
 
-  // ── Pipeline stages ───────────────────────────────────────────────────────
-
-  Future<void> _createSession(String command) async {
+  Future<void> _createSession(String reasoningProvider) async {
     _setPhase(PipelinePhase.creatingSession);
-    _log('Creating agent session…');
+    _log('Creating agent session...');
     final resp = await client.createSession(
       inputMode: 'text',
+      reasoningProvider: reasoningProvider,
       supportedPackages: const [
         'com.whatsapp',
         'com.google.android.apps.maps',
         'com.android.chrome',
         'com.google.android.gm',
+        'com.supercell.brawlstars',
       ],
     );
     sessionId = resp['session_id'] as String;
@@ -139,71 +144,40 @@ class PipelineOrchestrator extends ChangeNotifier {
     _log('Parsing intent: "$command"');
     final resp = await client.submitIntent(sessionId!, command);
     parsedIntent = (resp['intent'] as Map?)?.cast<String, dynamic>() ?? {};
-    final app  = parsedIntent!['target_app'] ?? 'unknown';
-    final risk = parsedIntent!['risk_level']  ?? 'low';
-    _log('Intent: app=$app  risk=$risk', level: LogLevel.success);
+    final app =
+        parsedIntent!['target_app'] ??
+        parsedIntent!['app_package'] ??
+        'unknown';
+    final risk = parsedIntent!['risk_level'] ?? 'low';
+    _log('Intent ready: app=$app risk=$risk', level: LogLevel.success);
     notifyListeners();
-  }
-
-  Future<void> _buildAndSubmitPlan(
-    String command,
-    Map<String, dynamic> extras,
-  ) async {
-    _setPhase(PipelinePhase.buildingPlan);
-    _log('Building action plan…');
-
-    final plan = PlanBuilder.build(
-      sessionId: sessionId!,
-      intent: parsedIntent!,
-      extras: {'command': command, ...extras},
-    );
-
-    if (plan == null) {
-      throw Exception(
-        'No plan template for app "${parsedIntent!['target_app']}". '
-        'Try a command mentioning WhatsApp, Maps, Gmail, or Chrome.',
-      );
-    }
-
-    planId = plan['plan_id'] as String;
-    _log('Plan: ${(plan['steps'] as List).length} steps for ${plan['app_package']}');
-
-    steps = (plan['steps'] as List).map((s) {
-      final sm = s as Map<String, dynamic>;
-      return StepEntry(
-        id:    sm['id']   as String,
-        type:  sm['type'] as String,
-        label: _stepLabel(sm),
-      );
-    }).toList();
-    notifyListeners();
-
-    await client.submitPlan(sessionId!, plan);
-    _log('Plan submitted.', level: LogLevel.success);
-  }
-
-  Future<void> _approvePlan() async {
-    _setPhase(PipelinePhase.approvingPlan);
-    _log('Approving plan…');
-    await client.approvePlan(sessionId!, planId: planId);
-    _log('Plan approved — execution authorised.', level: LogLevel.success);
   }
 
   Future<void> _startAndroidSession() async {
-    _log('Starting Android accessibility session…');
-    final result = await _gateway.startSession(SessionConfig(
-      sessionId: sessionId!,
-      allowedPackages: [parsedIntent!['target_app'] as String? ?? ''],
-      confirmationMode: 'always',
-      allowTextEntry: true,
-      allowSendActions: true,
-    ));
+    _log('Starting Android accessibility session...');
+    final appPackage =
+        parsedIntent?['target_app'] as String? ??
+        parsedIntent?['app_package'] as String? ??
+        '';
+    final result = await _gateway.startSession(
+      SessionConfig(
+        sessionId: sessionId!,
+        allowedPackages: [appPackage],
+        confirmationMode: 'always',
+        allowTextEntry: true,
+        allowSendActions: true,
+      ),
+    );
     if (result.code == 'SERVICE_NOT_ENABLED') {
-      _log('Accessibility service not enabled — steps will simulate without device execution.',
-          level: LogLevel.warning);
+      _log(
+        'Accessibility service not enabled. Steps will simulate without device execution.',
+        level: LogLevel.warning,
+      );
     } else if (!result.success) {
-      _log('Android session start warning (${result.code}) — continuing.',
-          level: LogLevel.warning);
+      _log(
+        'Android session start warning (${result.code}). Continuing anyway.',
+        level: LogLevel.warning,
+      );
     } else {
       _log('Android session started.', level: LogLevel.success);
     }
@@ -213,63 +187,69 @@ class PipelineOrchestrator extends ChangeNotifier {
     _setPhase(PipelinePhase.executing);
 
     _runner = StepRunner(
-      client:          client,
-      gateway:         _gateway,
-      sessionId:       sessionId!,
-      planId:          planId!,
-      expectedPackage: parsedIntent?['target_app'] as String? ?? '',
-
-      onStepStarted: (id) {
-        _markStep(id, StepStatus.running);
+      client: client,
+      gateway: _gateway,
+      sessionId: sessionId!,
+      expectedPackage:
+          parsedIntent?['target_app'] as String? ??
+          parsedIntent?['app_package'] as String? ??
+          '',
+      onStepStarted: (step) {
+        _upsertStep(step, StepStatus.running);
+        currentReasoning = step.reasoning;
+        notifyListeners();
       },
-
-      onStepCompleted: (id, result) {
-        _markStep(id, result.success ? StepStatus.success : StepStatus.failed);
+      onStepCompleted: (stepId, result) {
+        _markStep(
+          stepId,
+          result.success ? StepStatus.success : StepStatus.failed,
+        );
         _log(
-          '${result.success ? '✓' : '✗'} $id  ${result.code.isEmpty ? 'OK' : result.code}',
+          '${result.success ? 'OK' : 'FAIL'} $stepId ${result.code.isEmpty ? 'OK' : result.code}',
           level: result.success ? LogLevel.success : LogLevel.error,
         );
       },
-
       onLog: (msg, lvl) => _log(msg, level: lvl),
-
       onConfirmation: (action) async {
         _setPhase(PipelinePhase.awaitingConfirmation);
         await _fetchAndShowConfirmation(action);
       },
-
       onComplete: () {
-        _log('Pipeline complete!', level: LogLevel.success);
+        _log('Pipeline complete.', level: LogLevel.success);
         _setPhase(PipelinePhase.completed);
         _gateway.stopSession(sessionId!).ignore();
       },
-
       onAbort: (reason) => _fail(reason),
-
       onManualTakeover: (reason) {
         errorMessage = reason;
         _log('Manual takeover required: $reason', level: LogLevel.warning);
         _setPhase(PipelinePhase.failed);
         notifyListeners();
       },
-
       onUnexpectedAppChange: (pkg) {
-        _log('App changed to $pkg — backend will decide retry/takeover.',
-            level: LogLevel.warning);
+        _log(
+          'App changed to ${pkg ?? '(unknown)'}; backend will decide retry or takeover.',
+          level: LogLevel.warning,
+        );
       },
     );
 
     await _runner!.runLoop();
   }
 
-  // ── Confirmation ──────────────────────────────────────────────────────────
+  Future<void> _fetchAndShowConfirmation(
+    Map<String, dynamic> confirmAction,
+  ) async {
+    final params =
+        (confirmAction['params'] as Map?)?.cast<String, dynamic>() ?? {};
+    currentReasoning = params['content_preview'] as String? ?? currentReasoning;
 
-  Future<void> _fetchAndShowConfirmation(Map<String, dynamic> confirmAction) async {
     try {
-      final resp  = await client.getPendingConfirmation(sessionId!);
+      final resp = await client.getPendingConfirmation(sessionId!);
       final hasPending = resp['has_pending'] as bool? ?? false;
       if (hasPending) {
-        final confData = (resp['confirmation'] as Map?)?.cast<String, dynamic>();
+        final confData = (resp['confirmation'] as Map?)
+            ?.cast<String, dynamic>();
         if (confData != null) {
           pendingConfirmation = ConfirmationRequest.fromJson(confData);
           notifyListeners();
@@ -278,31 +258,63 @@ class PipelineOrchestrator extends ChangeNotifier {
       }
     } catch (_) {}
 
-    // Fallback: synthesise from the action params when backend has no record yet
-    final params = (confirmAction['params'] as Map?)?.cast<String, dynamic>() ?? {};
     pendingConfirmation = ConfirmationRequest(
       confirmationId: '',
-      stepId:         confirmAction['id'] as String? ?? '',
-      appName:        parsedIntent?['target_app'] as String? ?? 'App',
-      actionSummary:  params['action_summary'] as String? ?? 'Confirm this action?',
-      recipient:      params['recipient']       as String? ?? '',
+      stepId: confirmAction['id'] as String? ?? '',
+      appName:
+          parsedIntent?['target_app'] as String? ??
+          parsedIntent?['app_package'] as String? ??
+          'App',
+      actionSummary:
+          params['action_summary'] as String? ?? 'Confirm this action?',
+      recipient: params['recipient'] as String? ?? '',
       contentPreview: params['content_preview'] as String? ?? '',
     );
     notifyListeners();
   }
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
-
-  void _markStep(String id, StepStatus s) {
-    final idx = steps.indexWhere((e) => e.id == id);
-    if (idx != -1) {
-      steps[idx].status = s;
-      currentStepIndex  = idx;
-      notifyListeners();
+  void _upsertStep(StepEntry step, StepStatus status) {
+    final idx = steps.indexWhere((entry) => entry.id == step.id);
+    final next = StepEntry(
+      id: step.id,
+      type: step.type,
+      label: step.label,
+      reasoning: step.reasoning,
+      status: status,
+    );
+    if (idx == -1) {
+      steps = [...steps, next];
+      currentStepIndex = steps.length - 1;
+    } else {
+      final updated = [...steps];
+      updated[idx] = next;
+      steps = updated;
+      currentStepIndex = idx;
     }
+    notifyListeners();
   }
 
-  void _setPhase(PipelinePhase p)  { phase = p; notifyListeners(); }
+  void _markStep(String id, StepStatus status) {
+    final idx = steps.indexWhere((entry) => entry.id == id);
+    if (idx == -1) return;
+    final current = steps[idx];
+    final updated = [...steps];
+    updated[idx] = StepEntry(
+      id: current.id,
+      type: current.type,
+      label: current.label,
+      reasoning: current.reasoning,
+      status: status,
+    );
+    steps = updated;
+    currentStepIndex = idx;
+    notifyListeners();
+  }
+
+  void _setPhase(PipelinePhase p) {
+    phase = p;
+    notifyListeners();
+  }
 
   void _log(String msg, {LogLevel level = LogLevel.info}) {
     log.add(LogEntry(msg, level: level));
@@ -316,36 +328,26 @@ class PipelineOrchestrator extends ChangeNotifier {
   }
 
   void _reset() {
-    phase             = PipelinePhase.idle;
-    sessionId         = null;
-    planId            = null;
-    parsedIntent      = null;
-    steps             = [];
-    currentStepIndex  = 0;
+    phase = PipelinePhase.idle;
+    sessionId = null;
+    parsedIntent = null;
+    steps = [];
+    currentStepIndex = -1;
+    currentReasoning = '';
     pendingConfirmation = null;
-    errorMessage      = null;
+    errorMessage = null;
     log.clear();
-    _cancelRequested  = false;
-    _runner           = null;
+    _cancelRequested = false;
+    _runner = null;
   }
 
-  bool _cancelRequested = false;
-  bool get _cancelled   => _cancelRequested;
-
-  static String _stepLabel(Map<String, dynamic> step) {
-    final type   = step['type'] as String;
-    final params = (step['params'] as Map?)?.cast<String, dynamic>() ?? {};
-    return switch (type) {
-      'OPEN_APP'             => 'Open ${params['package'] as String? ?? ''}',
-      'WAIT_FOR_APP'         => 'Wait for ${params['package'] as String? ?? ''}',
-      'WAIT_FOR_ELEMENT'     => 'Wait for element',
-      'TAP_ELEMENT'          => 'Tap element',
-      'TYPE_TEXT'            => 'Type "${params['text'] as String? ?? ''}"',
-      'REQUEST_CONFIRMATION' => 'Request confirmation',
-      'SCROLL'               => 'Scroll ${params['direction'] as String? ?? ''}',
-      'BACK'                 => 'Go back',
-      'HOME'                 => 'Go home',
-      _                      => type,
-    };
+  static String _reasoningProviderLabel(String provider) {
+    switch (provider) {
+      case 'openai':
+        return 'OpenAI API';
+      case 'local':
+      default:
+        return 'Local model';
+    }
   }
 }

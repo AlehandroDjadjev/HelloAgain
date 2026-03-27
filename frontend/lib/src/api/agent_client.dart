@@ -4,10 +4,12 @@ import 'package:http/http.dart' as http;
 /// All Django backend calls for the agent pipeline.
 /// Throws [AgentApiException] on non-2xx responses.
 class AgentClient {
+  static const _requestTimeout = Duration(seconds: 90);
+
   AgentClient({required String baseUrl})
-      : _base = baseUrl.endsWith('/')
-            ? baseUrl.substring(0, baseUrl.length - 1)
-            : baseUrl;
+    : _base = baseUrl.endsWith('/')
+          ? baseUrl.substring(0, baseUrl.length - 1)
+          : baseUrl;
 
   final String _base;
 
@@ -16,11 +18,13 @@ class AgentClient {
   Future<Map<String, dynamic>> createSession({
     String deviceId = 'flutter-test',
     String inputMode = 'text',
+    String reasoningProvider = 'local',
     List<String> supportedPackages = const [],
   }) async {
     return _post('/api/agent/sessions/', {
       'device_id': deviceId,
       'input_mode': inputMode,
+      'reasoning_provider': reasoningProvider,
       'supported_packages': supportedPackages,
     });
   }
@@ -42,61 +46,52 @@ class AgentClient {
   Future<Map<String, dynamic>> submitIntent(
     String sessionId,
     String transcript,
-  ) =>
-      _post('/api/agent/sessions/$sessionId/intent/', {
-        'transcript': transcript,
-      });
+  ) => _post('/api/agent/sessions/$sessionId/intent/', {
+    'transcript': transcript,
+  });
 
   Future<Map<String, dynamic>> submitPlan(
     String sessionId,
     Map<String, dynamic> plan,
-  ) =>
-      _post('/api/agent/sessions/$sessionId/plan/', {'plan': plan});
+  ) => _post('/api/agent/sessions/$sessionId/plan/', {'plan': plan});
 
   Future<Map<String, dynamic>> approvePlan(
     String sessionId, {
     String? planId,
     String confirmationMode = 'hard',
-  }) =>
-      _post('/api/agent/sessions/$sessionId/approve/', {
-        if (planId != null) 'plan_id': planId,
-        'user_confirmation_mode': confirmationMode,
-      });
+  }) => _post('/api/agent/sessions/$sessionId/approve/', {
+    if (planId != null) 'plan_id': planId,
+    'user_confirmation_mode': confirmationMode,
+  });
 
   // ── Execution loop ─────────────────────────────────────────────────────────
 
   Future<Map<String, dynamic>> getNextStep(
     String sessionId, {
-    required String planId,
     Map<String, dynamic>? screenState,
-    List<String> completedActionIds = const [],
-    Map<String, dynamic>? lastActionResult,
-  }) =>
-      _post('/api/agent/sessions/$sessionId/next-step/', {
-        'plan_id': planId,
-        if (screenState != null) 'screen_state': screenState,
-        'completed_action_ids': completedActionIds,
-        if (lastActionResult != null) 'last_action_result': lastActionResult,
-      });
+  }) => _post('/api/agent/sessions/$sessionId/next-step/', {
+    if (screenState != null) 'screen_state': screenState,
+  });
 
   Future<Map<String, dynamic>> postActionResult(
     String sessionId, {
-    required String planId,
     required String actionId,
     required bool success,
     String code = '',
     String message = '',
     Map<String, dynamic>? screenState,
     int durationMs = 0,
-  }) =>
-      _post('/api/agent/sessions/$sessionId/action-result/', {
-        'plan_id': planId,
-        'action_id': actionId,
-        'result': {'success': success, 'code': code, 'message': message},
-        if (screenState != null) 'screen_state': screenState,
-        'duration_ms': durationMs,
-        'executed_at': DateTime.now().toUtc().toIso8601String(),
-      });
+    String actionType = '',
+    String reasoning = '',
+  }) => _post('/api/agent/sessions/$sessionId/action-result/', {
+    'action_id': actionId,
+    'result': {'success': success, 'code': code, 'message': message},
+    if (screenState != null) 'screen_state': screenState,
+    'duration_ms': durationMs,
+    'executed_at': DateTime.now().toUtc().toIso8601String(),
+    if (actionType.isNotEmpty) 'action_type': actionType,
+    if (reasoning.isNotEmpty) 'reasoning': reasoning,
+  });
 
   // ── Confirmation ───────────────────────────────────────────────────────────
 
@@ -115,12 +110,11 @@ class AgentClient {
     String sessionId, {
     int currentStep = 0,
     String foregroundPackage = '',
-  }) =>
-      _post('/api/agent/device/heartbeat/', {
-        'session_id': sessionId,
-        'current_step': currentStep,
-        'foreground_package': foregroundPackage,
-      });
+  }) => _post('/api/agent/device/heartbeat/', {
+    'session_id': sessionId,
+    'current_step': currentStep,
+    'foreground_package': foregroundPackage,
+  });
 
   // ── Private helpers ────────────────────────────────────────────────────────
 
@@ -135,7 +129,7 @@ class AgentClient {
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode(body),
         )
-        .timeout(const Duration(seconds: 15));
+        .timeout(_requestTimeout);
     return _decode(resp);
   }
 
@@ -143,7 +137,7 @@ class AgentClient {
     final uri = Uri.parse('$_base$path');
     final resp = await http
         .get(uri, headers: {'Content-Type': 'application/json'})
-        .timeout(const Duration(seconds: 15));
+        .timeout(_requestTimeout);
     return _decode(resp);
   }
 
@@ -169,7 +163,8 @@ class AgentApiException implements Exception {
   String get shortMessage {
     try {
       final m = jsonDecode(body);
-      return m['detail']?.toString() ?? body.substring(0, body.length.clamp(0, 120));
+      return m['detail']?.toString() ??
+          body.substring(0, body.length.clamp(0, 120));
     } catch (_) {
       return body.substring(0, body.length.clamp(0, 120));
     }

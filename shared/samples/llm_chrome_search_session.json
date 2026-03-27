@@ -1,0 +1,58 @@
+{
+  "goal": "Search Jeffrey Epstein on Chrome",
+  "target_app": "com.android.chrome",
+  "mode": "llm_in_the_loop",
+  "screens": [
+    "backend/mock_screens/chrome_search/step_0_home.json",
+    "backend/mock_screens/chrome_search/step_1_chrome_newtab.json",
+    "backend/mock_screens/chrome_search/step_2_url_focused.json",
+    "backend/mock_screens/chrome_search/step_3_results.json"
+  ],
+  "llm_responses": [
+    {
+      "screen": "step_0_home.json",
+      "action_type": "OPEN_APP",
+      "params": { "package_name": "com.android.chrome" },
+      "reasoning": "Chrome is not in the foreground. Opening it first.",
+      "confidence": 0.97
+    },
+    {
+      "screen": "step_1_chrome_newtab.json",
+      "action_type": "TAP_ELEMENT",
+      "params": { "selector": { "element_ref": "url_bar" } },
+      "reasoning": "The URL bar is visible and clickable. Tapping it to start the search.",
+      "confidence": 0.95
+    },
+    {
+      "screen": "step_2_url_focused.json",
+      "action_type": "TYPE_TEXT",
+      "params": { "text": "Jeffrey Epstein" },
+      "reasoning": "The URL bar is focused, so typing the query is the next step.",
+      "confidence": 0.93
+    },
+    {
+      "screen": "step_3_results.json",
+      "action_type": "TAP_ELEMENT",
+      "params": { "selector": { "element_ref": "result_0" } },
+      "reasoning": "Search results are loaded, which confirms the goal is complete.",
+      "confidence": 0.9,
+      "is_goal_complete": true
+    }
+  ],
+  "results": [
+    { "screen": "step_0_home.json", "success": true, "code": "OK" },
+    { "screen": "step_1_chrome_newtab.json", "success": true, "code": "OK" },
+    { "screen": "step_2_url_focused.json", "success": true, "code": "OK" }
+  ],
+  "timeline": [
+    "session_created",
+    "intent_stored",
+    "step_dispatched:OPEN_APP",
+    "step_succeeded:OPEN_APP",
+    "step_dispatched:TAP_ELEMENT",
+    "step_succeeded:TAP_ELEMENT",
+    "step_dispatched:TYPE_TEXT",
+    "step_succeeded:TYPE_TEXT",
+    "session_completed"
+  ]
+}

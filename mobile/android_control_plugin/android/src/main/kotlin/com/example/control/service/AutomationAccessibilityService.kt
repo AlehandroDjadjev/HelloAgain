@@ -209,7 +209,7 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
 
     override fun tapElement(selector: SelectorDto): ActionResultDto =
         performOnNode(selector, "TAP") { node ->
-            node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            performClickWithAncestorFallback(node)
         }
 
     override fun longPressElement(selector: SelectorDto): ActionResultDto =
@@ -217,10 +217,51 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
             node.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK)
         }
 
-    override fun focusElement(selector: SelectorDto): ActionResultDto =
-        performOnNode(selector, "FOCUS") { node ->
-            node.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS)
+    override fun focusElement(selector: SelectorDto): ActionResultDto {
+        val root = rootInActiveWindow
+            ?: return ActionResultDto.failure("NO_ROOT", "rootInActiveWindow is null")
+        return try {
+            Log.d(TAG, "FOCUS requested selector=${selectorSummary(selector)}")
+            val node = NodeMatcher.findFirst(root, selector)
+                ?: return ActionResultDto.failure(
+                    "ELEMENT_NOT_FOUND", "No node matches selector for action FOCUS"
+                )
+            try {
+                Log.d(TAG, "FOCUS matched ${nodeSummary(node)}")
+                if (!node.isEnabled) {
+                    return ActionResultDto.failure(
+                        "ELEMENT_NOT_CLICKABLE", "Matched node is disabled"
+                    )
+                }
+
+                if (node.isFocused) {
+                    return ActionResultDto.success("FOCUS already satisfied", snapshotScreenState())
+                }
+
+                val focusOk = focusNode(node)
+                val screen = snapshotScreenState()
+                if (focusOk) {
+                    Log.d(TAG, "FOCUS succeeded for ${nodeSummary(node)}")
+                    ActionResultDto.success("FOCUS", screen)
+                } else {
+                    val focusSummary = currentInputFocusSummary(root)
+                    val message = (
+                        "FOCUS returned false for selector=${selectorSummary(selector)} " +
+                            "matched=${nodeSummary(node)} currentFocus=$focusSummary"
+                        )
+                    Log.w(TAG, message)
+                    ActionResultDto.failure(
+                        "ACTION_FAILED",
+                        message,
+                    )
+                }
+            } finally {
+                node.recycle()
+            }
+        } finally {
+            root.recycle()
         }
+    }
 
     override fun typeText(text: String): ActionResultDto {
         val root = rootInActiveWindow
@@ -365,11 +406,13 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
         val root = rootInActiveWindow
             ?: return ActionResultDto.failure("NO_ROOT", "rootInActiveWindow is null")
         return try {
+            Log.d(TAG, "$actionName requested selector=${selectorSummary(selector)}")
             val node = NodeMatcher.findFirst(root, selector)
                 ?: return ActionResultDto.failure(
                     "ELEMENT_NOT_FOUND", "No node matches selector for action $actionName"
                 )
             try {
+                Log.d(TAG, "$actionName matched ${nodeSummary(node)}")
                 if (!node.isEnabled) {
                     return ActionResultDto.failure(
                         "ELEMENT_NOT_CLICKABLE", "Matched node is disabled"
@@ -377,8 +420,17 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
                 }
                 val ok = action(node)
                 val screen = snapshotScreenState()
-                if (ok) ActionResultDto.success(actionName, screen)
-                else ActionResultDto.failure("ACTION_FAILED", "$actionName returned false")
+                if (ok) {
+                    Log.d(TAG, "$actionName succeeded for ${nodeSummary(node)}")
+                    ActionResultDto.success(actionName, screen)
+                } else {
+                    val message = (
+                        "$actionName returned false for selector=${selectorSummary(selector)} " +
+                            "matched=${nodeSummary(node)}"
+                        )
+                    Log.w(TAG, message)
+                    ActionResultDto.failure("ACTION_FAILED", message)
+                }
             } finally {
                 node.recycle()
             }
@@ -403,5 +455,85 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
             }
         }
         return null
+    }
+
+    private fun focusNode(node: AccessibilityNodeInfo): Boolean {
+        if (node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)) {
+            return true
+        }
+        if (node.isEditable) {
+            return performClickWithAncestorFallback(node)
+        }
+        return false
+    }
+
+    private fun performClickWithAncestorFallback(node: AccessibilityNodeInfo): Boolean {
+        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+            return true
+        }
+
+        var parent = node.parent
+        while (parent != null) {
+            try {
+                if (parent.isEnabled && parent.isClickable) {
+                    Log.d(TAG, "Trying clickable ancestor ${nodeSummary(parent)}")
+                    if (parent.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                        return true
+                    }
+                }
+
+                val nextParent = parent.parent
+                parent.recycle()
+                parent = nextParent
+            } catch (e: Exception) {
+                try {
+                    parent.recycle()
+                } catch (_: Exception) {
+                }
+                return false
+            }
+        }
+
+        return false
+    }
+
+    private fun selectorSummary(selector: SelectorDto): String = listOfNotNull(
+        selector.elementRef?.let { "elementRef=$it" },
+        selector.viewId?.let { "viewId=$it" },
+        selector.className?.let { "className=$it" },
+        selector.textEquals?.let { "textEquals=$it" },
+        selector.textContains?.let { "textContains=$it" },
+        selector.contentDescEquals?.let { "contentDescEquals=$it" },
+        selector.contentDescContains?.let { "contentDescContains=$it" },
+        selector.packageName?.let { "packageName=$it" },
+        selector.clickable?.let { "clickable=$it" },
+        selector.enabled?.let { "enabled=$it" },
+        selector.focused?.let { "focused=$it" },
+        selector.indexInParent?.let { "indexInParent=$it" },
+    ).joinToString(", ", prefix = "{", postfix = "}").ifEmpty { "{}" }
+
+    private fun nodeSummary(node: AccessibilityNodeInfo): String {
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
+        return listOfNotNull(
+            "class=${node.className}",
+            node.viewIdResourceName?.let { "viewId=$it" },
+            node.text?.toString()?.takeIf { it.isNotBlank() }?.let { "text=$it" },
+            node.contentDescription?.toString()?.takeIf { it.isNotBlank() }?.let { "contentDesc=$it" },
+            "clickable=${node.isClickable}",
+            "enabled=${node.isEnabled}",
+            "focused=${node.isFocused}",
+            "editable=${node.isEditable}",
+            "bounds=$bounds",
+        ).joinToString(", ", prefix = "{", postfix = "}")
+    }
+
+    private fun currentInputFocusSummary(root: AccessibilityNodeInfo): String {
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return "{none}"
+        return try {
+            nodeSummary(focused)
+        } finally {
+            focused.recycle()
+        }
     }
 }
