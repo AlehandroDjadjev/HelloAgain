@@ -1,11 +1,9 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:permission_handler/permission_handler.dart' as permission;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'src/theme/app_theme.dart';
@@ -50,6 +48,8 @@ class HelloAgainApp extends StatelessWidget {
 
 enum HelloAgainStage { booting, intro, onboarding, board }
 
+enum _PhoneAccessChoice { undecided, allowThisTime, allowAlways, denied }
+
 class HelloAgainShell extends StatefulWidget {
   const HelloAgainShell({super.key});
 
@@ -60,6 +60,7 @@ class HelloAgainShell extends StatefulWidget {
 class _HelloAgainShellState extends State<HelloAgainShell> {
   static const _tokenKey = 'hello_again.account_token';
   static const _onboardingSessionKey = 'hello_again.onboarding_session_id';
+  static const _phoneAccessModeKey = 'hello_again.phone_access_mode';
 
   late final AgentBackendClient _backendClient;
   late final BrowserVoiceBridge _voiceBridge;
@@ -78,6 +79,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   String _onboardingSessionId = '';
   String _draftPhoneNumber = '';
   String _recognizedPhone = '';
+  bool _phoneAccessGrantedThisSession = false;
+  _PhoneAccessChoice _phoneAccessChoice = _PhoneAccessChoice.undecided;
 
   @override
   void initState() {
@@ -157,11 +160,19 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       _recognizedPhone = '';
       _statusText = 'Подготвям разговора.';
       _isConfirming = false;
+      _phoneAccessGrantedThisSession =
+          _phoneAccessChoice == _PhoneAccessChoice.allowAlways;
+      if (_phoneAccessChoice != _PhoneAccessChoice.allowAlways) {
+        _phoneAccessChoice = _PhoneAccessChoice.undecided;
+      }
     });
     await _beginOrResumeOnboarding();
   }
 
   Future<bool> _ensurePhonePermissionForSetup() async {
+    return true;
+
+    /*
     if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
       return true;
     }
@@ -191,6 +202,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     }
 
     return false;
+    */
   }
 
   bool get _shouldUseAndroidPhoneHint =>
@@ -198,6 +210,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       _stage == HelloAgainStage.onboarding &&
       _conversationMode == 'collecting' &&
       _draftPhoneNumber.trim().isEmpty;
+
+  bool get _showPhoneAccessChoices =>
+      _phoneAccessGrantedThisSession ? false : false;
 
   Future<void> _beginOrResumeOnboarding() async {
     if (!mounted) return;
@@ -225,6 +240,10 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
 
   Future<void> _captureNextOnboardingTurn() async {
     if (_shouldUseAndroidPhoneHint) {
+      if (_showPhoneAccessChoices) {
+        _presentPhoneAccessChoices();
+        return;
+      }
       await _requestAndSubmitAndroidPhoneNumber();
       return;
     }
@@ -364,6 +383,57 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
             'Android не успя да покаже избора за телефонен номер. Натиснете веднъж и ще опитам пак.';
       });
     }
+  }
+
+  void _presentPhoneAccessChoices() {
+    if (!mounted) return;
+    setState(() {
+      _isWorking = false;
+      _isListening = false;
+      _isConfirming = false;
+      _assistantReply =
+          'Before we continue, you need to allow access to the phone number on this device.';
+      _statusText =
+          'Choose Allow this time, Allow always, or Don’t allow. Without this, onboarding cannot continue.';
+    });
+  }
+
+  Future<void> _allowPhoneAccessThisTime() async {
+    if (_isWorking) return;
+    if (!mounted) return;
+    setState(() {
+      _phoneAccessGrantedThisSession = true;
+      _phoneAccessChoice = _PhoneAccessChoice.allowThisTime;
+      _statusText = 'Phone number access allowed for this onboarding only.';
+    });
+    await _requestAndSubmitAndroidPhoneNumber();
+  }
+
+  Future<void> _allowPhoneAccessAlways() async {
+    if (_isWorking) return;
+    await _prefs?.setString(_phoneAccessModeKey, 'always');
+    if (!mounted) return;
+    setState(() {
+      _phoneAccessGrantedThisSession = true;
+      _phoneAccessChoice = _PhoneAccessChoice.allowAlways;
+      _statusText = 'Phone number access will stay allowed for future sessions.';
+    });
+    await _requestAndSubmitAndroidPhoneNumber();
+  }
+
+  Future<void> _denyPhoneAccess() async {
+    if (!mounted) return;
+    setState(() {
+      _phoneAccessGrantedThisSession = false;
+      _phoneAccessChoice = _PhoneAccessChoice.denied;
+      _isWorking = false;
+      _isListening = false;
+      _isConfirming = false;
+      _assistantReply =
+          'Phone number access was denied, so I cannot continue with registration.';
+      _statusText =
+          'This step is required. Choose Allow this time or Allow always to continue.';
+    });
   }
 
   Future<bool> _askYesNo(String prompt) async {
@@ -582,8 +652,12 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
           isWorking: _isWorking,
           isConfirming: _isConfirming,
           conversationMode: _conversationMode,
+          showPhoneAccessChoices: _showPhoneAccessChoices,
           retryLabel:
               _shouldUseAndroidPhoneHint ? 'Избери номера' : 'Повтори разговора',
+          onAllowPhoneThisTime: _allowPhoneAccessThisTime,
+          onAllowPhoneAlways: _allowPhoneAccessAlways,
+          onDenyPhoneAccess: _denyPhoneAccess,
           onRetry: _captureNextOnboardingTurn,
         );
       case HelloAgainStage.board:
@@ -933,7 +1007,11 @@ class RegistrationScreen extends StatelessWidget {
     required this.isWorking,
     required this.isConfirming,
     required this.conversationMode,
+    required this.showPhoneAccessChoices,
     required this.retryLabel,
+    required this.onAllowPhoneThisTime,
+    required this.onAllowPhoneAlways,
+    required this.onDenyPhoneAccess,
     required this.onRetry,
   });
 
@@ -944,7 +1022,11 @@ class RegistrationScreen extends StatelessWidget {
   final bool isWorking;
   final bool isConfirming;
   final String conversationMode;
+  final bool showPhoneAccessChoices;
   final String retryLabel;
+  final Future<void> Function() onAllowPhoneThisTime;
+  final Future<void> Function() onAllowPhoneAlways;
+  final Future<void> Function() onDenyPhoneAccess;
   final Future<void> Function() onRetry;
 
   @override
@@ -1061,7 +1143,9 @@ class RegistrationScreen extends StatelessWidget {
                         ),
                         const SizedBox(height: 18),
                         Text(
-                          transcript.isEmpty
+                          showPhoneAccessChoices
+                              ? 'This step needs access to the phone number stored on the device. Without it, onboarding cannot continue.'
+                              : transcript.isEmpty
                               ? 'Когато сте готови, говорете спокойно. Аз ще продължа разговора.'
                               : transcript,
                           style: const TextStyle(
@@ -1070,6 +1154,73 @@ class RegistrationScreen extends StatelessWidget {
                             color: Color(0xFF312620),
                           ),
                         ),
+                        if (showPhoneAccessChoices) ...[
+                          const SizedBox(height: 18),
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton(
+                              onPressed: isWorking ? null : onAllowPhoneThisTime,
+                              style: FilledButton.styleFrom(
+                                backgroundColor: const Color(0xFFB56B4D),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(18),
+                                ),
+                              ),
+                              child: const Text(
+                                'Allow this time',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: FilledButton.tonal(
+                              onPressed: isWorking ? null : onAllowPhoneAlways,
+                              style: FilledButton.styleFrom(
+                                foregroundColor: const Color(0xFF6B5444),
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(18),
+                                ),
+                              ),
+                              child: const Text(
+                                'Allow always',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          SizedBox(
+                            width: double.infinity,
+                            child: OutlinedButton(
+                              onPressed: isWorking ? null : onDenyPhoneAccess,
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: const Color(0xFF6B5444),
+                                side: const BorderSide(color: Color(0xFFD6C4B2)),
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(18),
+                                ),
+                              ),
+                              child: const Text(
+                                'Don’t allow',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
                         const Spacer(),
                         Container(
                           width: double.infinity,
@@ -1095,7 +1246,9 @@ class RegistrationScreen extends StatelessWidget {
                 SizedBox(
                   width: double.infinity,
                   child: OutlinedButton(
-                    onPressed: isListening ? null : onRetry,
+                    onPressed: isListening || showPhoneAccessChoices
+                        ? null
+                        : onRetry,
                     style: OutlinedButton.styleFrom(
                       foregroundColor: const Color(0xFF6B5444),
                       side: const BorderSide(color: Color(0xFFD6C4B2)),
