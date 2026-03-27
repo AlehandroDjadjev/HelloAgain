@@ -148,6 +148,8 @@ def _serialize_profile(
         },
         "email": target.user.email if can_view_email(viewer, target) else None,
         "phone_number": target.phone_number if can_view_phone(viewer, target) else None,
+        "home_lat": target.home_lat if friend_status == FriendRequest.Status.ACCEPTED else None,
+        "home_lng": target.home_lng if friend_status == FriendRequest.Status.ACCEPTED else None,
         "match_summary": None,
     }
     if match_summary:

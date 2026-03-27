@@ -11,6 +11,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'browser_voice_bridge.dart';
 import 'src/config/backend_base_url.dart';
+import 'src/theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -28,14 +29,10 @@ class AgentBoardApp extends StatelessWidget {
     return MaterialApp(
       title: 'Hello Again',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
+      theme: buildHelloAgainTheme(
         scaffoldBackgroundColor: const Color(0xFFF5EFE6),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFBB5A3C),
-          brightness: Brightness.light,
-          surface: const Color(0xFFFFFBF7),
-        ),
+        seedColor: const Color(0xFFBB5A3C),
+        surfaceColor: const Color(0xFFFFFBF7),
       ),
       home: const HelloAgainShell(),
     );

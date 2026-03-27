@@ -1,11 +1,14 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart' as permission;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'src/theme/app_theme.dart';
 import 'android_phone_number_hint.dart';
 import 'browser_voice_bridge.dart';
 import 'meetup_screen.dart';
@@ -35,14 +38,10 @@ class HelloAgainApp extends StatelessWidget {
     return MaterialApp(
       title: 'Hello Again',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
+      theme: buildHelloAgainTheme(
         scaffoldBackgroundColor: const Color(0xFFF4EDE3),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFB56B4D),
-          brightness: Brightness.light,
-          surface: const Color(0xFFFFFBF7),
-        ),
+        seedColor: const Color(0xFFB56B4D),
+        surfaceColor: const Color(0xFFFFFBF7),
       ),
       home: const HelloAgainShell(),
     );
@@ -136,6 +135,18 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
 
   Future<void> _startOnboarding() async {
     if (_isWorking) return;
+
+    final phonePermissionGranted = await _ensurePhonePermissionForSetup();
+    if (!phonePermissionGranted) {
+      if (!mounted) return;
+      setState(() {
+        _showContinue = true;
+        _statusText =
+            'Нужен е достъп до телефонния номер, за да продължим настройката.';
+      });
+      return;
+    }
+
     setState(() {
       _showContinue = false;
       _stage = HelloAgainStage.onboarding;
@@ -148,6 +159,38 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       _isConfirming = false;
     });
     await _beginOrResumeOnboarding();
+  }
+
+  Future<bool> _ensurePhonePermissionForSetup() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
+      return true;
+    }
+
+    final current = await permission.Permission.phone.status;
+    if (current.isGranted || current.isLimited) {
+      return true;
+    }
+
+    final requested = await permission.Permission.phone.request();
+    if (requested.isGranted || requested.isLimited) {
+      return true;
+    }
+
+    if (requested.isPermanentlyDenied && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text(
+            'Достъпът до телефонния номер е изключен. Разрешете го от настройките.',
+          ),
+          action: SnackBarAction(
+            label: 'Настройки',
+            onPressed: permission.openAppSettings,
+          ),
+        ),
+      );
+    }
+
+    return false;
   }
 
   bool get _shouldUseAndroidPhoneHint =>
@@ -593,11 +636,14 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                 'Location access is needed to show the local weather forecast.',
             childBuilder: _weatherBuilder,
           ),
-          const _LocationGate(
+          _LocationGate(
             title: 'Meetup',
             message:
                 'Location access is needed to suggest a good meetup place near you.',
-            childBuilder: _meetupBuilder,
+            childBuilder: (position) => _meetupBuilder(
+              position,
+              accountToken: widget.accountToken,
+            ),
           ),
         ],
       ),
@@ -742,8 +788,11 @@ class _LocationGateState extends State<_LocationGate> {
 Widget _weatherBuilder(Position position) =>
     WeatherScreen(userPosition: position);
 
-Widget _meetupBuilder(Position position) =>
-    MeetupScreen(userPosition: position);
+Widget _meetupBuilder(
+  Position position, {
+  String? accountToken,
+}) =>
+    MeetupScreen(userPosition: position, accountToken: accountToken);
 
 class IntroOnboardingScreen extends StatefulWidget {
   const IntroOnboardingScreen({

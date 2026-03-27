@@ -1,5 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
+from django.db.models import Q
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -16,7 +17,7 @@ from apps.accounts.services import (
     record_recommendation_activity,
 )
 
-from .models import MeetupInvite
+from .models import MeetupInvite, MeetupNotification
 from .services import get_best_meetup_spot, get_central_point, get_ranked_meetup_spots
 
 
@@ -54,6 +55,20 @@ def _require_profile(request):
 
 
 def _invite_payload(invite: MeetupInvite, viewer_profile_id: int) -> dict:
+    local_time = timezone.localtime(invite.proposed_time)
+    weekday_map = {
+        0: "понеделник",
+        1: "вторник",
+        2: "сряда",
+        3: "четвъртък",
+        4: "петък",
+        5: "събота",
+        6: "неделя",
+    }
+    meeting_day = weekday_map.get(local_time.weekday(), "")
+    meeting_date = local_time.strftime("%d.%m.%Y")
+    meeting_time = local_time.strftime("%H:%M")
+
     direction = "outgoing" if invite.requester_profile_id == viewer_profile_id else "incoming"
     return {
         "id": invite.id,
@@ -72,11 +87,61 @@ def _invite_payload(invite: MeetupInvite, viewer_profile_id: int) -> dict:
         "weather": invite.weather,
         "temperature": invite.temperature,
         "score": invite.score,
+        "meeting_day_bg": meeting_day,
+        "meeting_date_bg": meeting_date,
+        "meeting_time_bg": meeting_time,
+        "meeting_when_bg": f"{meeting_day}, {meeting_date} в {meeting_time}",
         "payload": invite.payload,
         "responded_at": invite.responded_at.isoformat() if invite.responded_at else None,
         "created_at": invite.created_at.isoformat(),
         "updated_at": invite.updated_at.isoformat(),
     }
+
+
+def _notification_payload(notification: MeetupNotification) -> dict:
+    return {
+        "id": notification.id,
+        "type": notification.notification_type,
+        "title": notification.title,
+        "body": notification.body,
+        "payload": notification.payload,
+        "scheduled_for": notification.scheduled_for.isoformat() if notification.scheduled_for else None,
+        "created_at": notification.created_at.isoformat(),
+        "read_at": notification.read_at.isoformat() if notification.read_at else None,
+        "invite_id": notification.invite_id,
+    }
+
+
+def _create_meetup_notification(
+    *,
+    recipient,
+    notification_type: str,
+    title: str,
+    body: str,
+    invite: MeetupInvite | None = None,
+    scheduled_for=None,
+    payload: dict | None = None,
+) -> MeetupNotification:
+    return MeetupNotification.objects.create(
+        recipient_profile=recipient,
+        invite=invite,
+        notification_type=notification_type,
+        title=title,
+        body=body,
+        scheduled_for=scheduled_for,
+        payload=payload or {},
+    )
+
+
+def _next_accepted_meeting(profile, exclude_invite_id: int | None = None) -> MeetupInvite | None:
+    qs = MeetupInvite.objects.select_related("requester_profile", "invited_profile").filter(
+        Q(requester_profile=profile) | Q(invited_profile=profile),
+        status=MeetupInvite.Status.ACCEPTED,
+        proposed_time__gte=timezone.now(),
+    )
+    if exclude_invite_id is not None:
+        qs = qs.exclude(pk=exclude_invite_id)
+    return qs.order_by("proposed_time", "id").first()
 
 class RecommendMeetupView(APIView):
     def post(self, request):
@@ -189,6 +254,22 @@ def propose_friend_meetup(request):
     if get_friendship_status(viewer, friend_profile) != FriendRequest.Status.ACCEPTED:
         return _json_error("Meetups can be proposed only to accepted friends.", status_code=403, code="FRIEND_REQUIRED")
 
+    viewer_meeting = _next_accepted_meeting(viewer)
+    if viewer_meeting is not None:
+        return _json_error(
+            "You already have an accepted upcoming meetup and cannot create another one.",
+            status_code=409,
+            code="MEETING_ALREADY_SCHEDULED",
+        )
+
+    friend_meeting = _next_accepted_meeting(friend_profile)
+    if friend_meeting is not None:
+        return _json_error(
+            "Your friend already has an accepted upcoming meetup.",
+            status_code=409,
+            code="FRIEND_ALREADY_SCHEDULED",
+        )
+
     requester_location = body.get("requester_location") or {}
     friend_location = body.get("friend_location") or {}
 
@@ -276,11 +357,30 @@ def propose_friend_meetup(request):
         metadata={"surface": "meetup_invite", "invite_id": invite.id},
     )
 
+    local_time = timezone.localtime(proposed_time)
+    invite_notification = _create_meetup_notification(
+        recipient=friend_profile,
+        notification_type=MeetupNotification.Type.INVITE_REQUEST,
+        title="Нова покана за среща",
+        body=(
+            f"{viewer.display_name} предлага среща в {invite.place_name} на "
+            f"{local_time.strftime('%d.%m.%Y')} в {local_time.strftime('%H:%M')} ч. Приемаш ли?"
+        ),
+        invite=invite,
+        payload={
+            "requires_response": True,
+            "actions": ["accept", "decline"],
+            "meeting_place": invite.place_name,
+            "meeting_time": invite.proposed_time.isoformat(),
+        },
+    )
+
     return _json_ok(
         {
             "status": "success",
             "message": "Meetup proposal created and notification queued for friend confirmation.",
             "invite": _invite_payload(invite, viewer.id),
+            "notification": _notification_payload(invite_notification),
         },
         status_code=201,
     )
@@ -298,6 +398,66 @@ def meetup_invites_collection(request):
         {
             "incoming": [_invite_payload(item, viewer.id) for item in incoming_qs],
             "outgoing": [_invite_payload(item, viewer.id) for item in outgoing_qs],
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def meetup_notifications_collection(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    if request.method == "POST":
+        try:
+            body = _parse_body(request)
+        except Exception:
+            return _json_error("Invalid JSON body.")
+
+        mark_ids = body.get("notification_ids") or []
+        if not isinstance(mark_ids, list):
+            return _json_error("notification_ids must be a list.", code="INVALID_NOTIFICATION_IDS")
+        now = timezone.now()
+        updated = MeetupNotification.objects.filter(
+            recipient_profile=viewer,
+            id__in=mark_ids,
+            read_at__isnull=True,
+        ).update(read_at=now)
+        return _json_ok({"status": "success", "updated": updated})
+
+    notifications = MeetupNotification.objects.filter(recipient_profile=viewer)[:100]
+    due_reminders = [
+        item
+        for item in notifications
+        if item.notification_type == MeetupNotification.Type.REMINDER_20M
+        and item.read_at is None
+        and item.scheduled_for is not None
+        and item.scheduled_for <= timezone.now()
+    ]
+
+    return _json_ok(
+        {
+            "notifications": [_notification_payload(item) for item in notifications],
+            "due_reminders": [_notification_payload(item) for item in due_reminders],
+        }
+    )
+
+
+@require_http_methods(["GET"])
+def meetup_next_meeting(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    next_meeting = _next_accepted_meeting(viewer)
+    if next_meeting is None:
+        return _json_ok({"has_meeting": False, "meeting": None})
+
+    return _json_ok(
+        {
+            "has_meeting": True,
+            "meeting": _invite_payload(next_meeting, viewer.id),
         }
     )
 
@@ -330,6 +490,23 @@ def respond_meetup_invite(request, invite_id: int):
     if action == "cancel" and invite.requester_profile_id != viewer.id:
         return _json_error("Only the requester can cancel this meetup.", status_code=403)
 
+    if action == "accept":
+        viewer_busy = _next_accepted_meeting(viewer, exclude_invite_id=invite.id)
+        if viewer_busy is not None:
+            return _json_error(
+                "You already have an accepted upcoming meetup and cannot accept another one.",
+                status_code=409,
+                code="MEETING_ALREADY_SCHEDULED",
+            )
+
+        requester_busy = _next_accepted_meeting(invite.requester_profile, exclude_invite_id=invite.id)
+        if requester_busy is not None:
+            return _json_error(
+                "Requester already has an accepted upcoming meetup.",
+                status_code=409,
+                code="REQUESTER_ALREADY_SCHEDULED",
+            )
+
     status_map = {
         "accept": MeetupInvite.Status.ACCEPTED,
         "decline": MeetupInvite.Status.DECLINED,
@@ -339,10 +516,70 @@ def respond_meetup_invite(request, invite_id: int):
     invite.responded_at = timezone.now()
     invite.save(update_fields=["status", "responded_at", "updated_at"])
 
+    generated_notifications = []
+    if action == "accept":
+        accepted_note = _create_meetup_notification(
+            recipient=invite.requester_profile,
+            notification_type=MeetupNotification.Type.INVITE_ACCEPTED,
+            title="Поканата е приета",
+            body=(
+                f"{invite.invited_profile.display_name} прие поканата за среща в {invite.place_name}."
+            ),
+            invite=invite,
+            payload={"action": "accepted", "invite_id": invite.id},
+        )
+        generated_notifications.append(_notification_payload(accepted_note))
+
+        reminder_time = invite.proposed_time - timedelta(minutes=20)
+        for recipient in [invite.requester_profile, invite.invited_profile]:
+            reminder_note = _create_meetup_notification(
+                recipient=recipient,
+                notification_type=MeetupNotification.Type.REMINDER_20M,
+                title="Напомняне за среща след 20 минути",
+                body=(
+                    f"Срещата в {invite.place_name} започва след 20 минути."
+                ),
+                invite=invite,
+                scheduled_for=reminder_time,
+                payload={
+                    "invite_id": invite.id,
+                    "meeting_time": invite.proposed_time.isoformat(),
+                    "meeting_place": invite.place_name,
+                },
+            )
+            generated_notifications.append(_notification_payload(reminder_note))
+
+    elif action == "decline":
+        declined_note = _create_meetup_notification(
+            recipient=invite.requester_profile,
+            notification_type=MeetupNotification.Type.INVITE_DECLINED,
+            title="Поканата е отказана",
+            body=(
+                f"{invite.invited_profile.display_name} отказа поканата. Никой не потвърди срещата."
+            ),
+            invite=invite,
+            payload={"action": "declined", "invite_id": invite.id, "all_declined": True},
+        )
+        generated_notifications.append(_notification_payload(declined_note))
+
+    elif action == "cancel":
+        canceled_note = _create_meetup_notification(
+            recipient=invite.invited_profile,
+            notification_type=MeetupNotification.Type.INVITE_CANCELED,
+            title="Поканата е отменена",
+            body=(
+                f"{invite.requester_profile.display_name} отмени поканата за среща."
+            ),
+            invite=invite,
+            payload={"action": "canceled", "invite_id": invite.id},
+        )
+        generated_notifications.append(_notification_payload(canceled_note))
+
     return _json_ok(
         {
             "status": "success",
             "message": f"Meetup invite {action}ed.",
             "invite": _invite_payload(invite, viewer.id),
+            "notifications": generated_notifications,
         }
     )
