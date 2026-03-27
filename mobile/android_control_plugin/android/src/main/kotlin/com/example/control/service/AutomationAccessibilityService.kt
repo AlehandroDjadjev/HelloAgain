@@ -2,6 +2,7 @@ package com.example.control.service
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.os.Build
 import android.content.Intent
 import android.graphics.Path
 import android.os.Bundle
@@ -138,6 +139,14 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
 
     override fun startSession(config: SessionConfigDto): ActionResultDto {
         activeSession = config
+        val serviceIntent = Intent(this, AutomationForegroundService::class.java).apply {
+            putExtra(AutomationForegroundService.EXTRA_SESSION_ID, config.sessionId)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
         Log.i(TAG, "Session started: ${config.sessionId}")
         val screen = snapshotScreenState()
         return ActionResultDto.success("Session started: ${config.sessionId}", screen)
@@ -146,6 +155,7 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
     override fun stopSession(sessionId: String): ActionResultDto {
         activeSession = null
         eventCallback = null
+        stopService(Intent(this, AutomationForegroundService::class.java))
         Log.i(TAG, "Session stopped: $sessionId")
         return ActionResultDto.success("Session stopped: $sessionId")
     }

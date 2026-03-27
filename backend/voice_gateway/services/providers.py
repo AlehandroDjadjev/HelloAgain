@@ -24,7 +24,7 @@ DEFAULT_GOOGLE_SPEECH_API_VERSION = "v1"
 DEFAULT_GOOGLE_SPEECH_MODEL = "latest_long"
 DEFAULT_GOOGLE_SPEECH_LOCATION = "global"
 DEFAULT_GOOGLE_SPEECH_RECOGNIZER = "_"
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "You are HelloAgain, a warm real-time voice assistant. "
