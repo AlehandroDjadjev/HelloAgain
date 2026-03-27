@@ -51,6 +51,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   bool _isListening = false;
   bool _speechReady = false;
   bool _whitespaceReady = false;
+  bool _voiceLoopEnabled = false;
+  int _voiceLoopToken = 0;
+  Future<void>? _activeSpeechPlayback;
 
   @override
   void initState() {
@@ -64,6 +67,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
 
   @override
   void dispose() {
+    _voiceLoopEnabled = false;
+    _voiceLoopToken += 1;
+    _voiceBridge.stopRecognition();
     _voiceBridge.stopAudio();
     _sceneController.dispose();
     _promptController.dispose();
@@ -92,7 +98,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _statusText = 'Backend board memory unavailable. Working locally.';
+        _statusText =
+            'Backend board memory unavailable. Working locally. ${_formatError(error)}';
       });
     }
   }
@@ -127,7 +134,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _statusText = 'Could not open the board object right now.';
+        _statusText =
+            'Could not open the board object right now. ${_formatError(error)}';
       });
     } finally {
       if (mounted) {
@@ -144,9 +152,17 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     await _submitPrompt(message: message, triggeredBySpeech: false);
   }
 
-  Future<void> _startSpeechInput() async {
-    if (_isBusy || _isListening) return;
+  void _toggleVoiceLoop() {
+    if (_voiceLoopEnabled) {
+      _stopVoiceLoop(
+        statusText: _isBusy
+            ? 'Voice conversation mode will stop after the current turn.'
+            : 'Voice conversation mode stopped.',
+      );
+      return;
+    }
 
+    if (_isBusy) return;
     if (!_voiceBridge.isSpeechRecognitionSupported) {
       setState(() {
         _statusText =
@@ -155,33 +171,87 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       return;
     }
 
+    final token = _voiceLoopToken + 1;
     setState(() {
-      _isListening = true;
-      _statusText = 'Listening in Chrome conversation mode...';
+      _voiceLoopEnabled = true;
+      _voiceLoopToken = token;
+      _statusText = 'Voice conversation mode is on. Listening...';
     });
+    unawaited(_runVoiceLoop(token));
+  }
 
-    try {
-      final transcript = await _voiceBridge.startRecognition(language: 'bg-BG');
-      if (!mounted) return;
-      _promptController.text = transcript;
-      _promptController.selection = TextSelection.collapsed(
-        offset: transcript.length,
-      );
+  void _stopVoiceLoop({String? statusText}) {
+    _voiceLoopEnabled = false;
+    _voiceLoopToken += 1;
+    _voiceBridge.stopRecognition();
+    if (!mounted) return;
+    setState(() {
+      _isListening = false;
+      if (statusText != null && statusText.isNotEmpty) {
+        _statusText = statusText;
+      }
+    });
+  }
+
+  Future<void> _runVoiceLoop(int token) async {
+    while (mounted && _voiceLoopEnabled && token == _voiceLoopToken) {
+      if (_isBusy) {
+        await Future<void>.delayed(const Duration(milliseconds: 180));
+        continue;
+      }
+
+      if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
+        return;
+      }
+
       setState(() {
-        _isListening = false;
+        _isListening = true;
+        _statusText = 'Voice conversation mode is on. Listening...';
       });
-      await _submitPrompt(message: transcript, triggeredBySpeech: true);
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _statusText = 'Speech capture failed before the request could start.';
-      });
-    } finally {
-      if (mounted) {
+
+      String transcript;
+      try {
+        transcript = await _voiceBridge.captureSpeechTurn(language: 'bg-BG');
+      } catch (error) {
+        if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
+          return;
+        }
+        setState(() {
+          _statusText = _isRecoverableListeningError(error)
+              ? 'Voice conversation mode is on. Still listening...'
+              : 'Speech capture failed. ${_formatError(error)}';
+        });
         setState(() {
           _isListening = false;
         });
+        await Future<void>.delayed(
+          Duration(
+            milliseconds: _isRecoverableListeningError(error) ? 250 : 900,
+          ),
+        );
+        continue;
       }
+
+      if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
+        return;
+      }
+
+      setState(() {
+        _isListening = false;
+      });
+      _fillPromptFromTranscript(transcript);
+      await _submitPrompt(message: transcript, triggeredBySpeech: true);
+      await _waitForActiveSpeechPlayback();
+
+      if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
+        return;
+      }
+
+      setState(() {
+        _statusText =
+            'Voice conversation mode is on. Listening for the next turn...';
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 220));
     }
   }
 
@@ -228,8 +298,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _statusText =
-            'The whitespace request failed before the full response could finish.';
+        _statusText = 'The whitespace request failed. ${_formatError(error)}';
       });
     } finally {
       if (mounted) {
@@ -271,7 +340,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       });
 
       if (audioBase64.isNotEmpty) {
-        unawaited(
+        _trackSpeechPlayback(
           _voiceBridge
               .playBase64Audio(
                 audioBase64: audioBase64,
@@ -320,6 +389,45 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     }
   }
 
+  void _fillPromptFromTranscript(String transcript) {
+    _promptController.text = transcript;
+    _promptController.selection = TextSelection.collapsed(
+      offset: transcript.length,
+    );
+  }
+
+  void _trackSpeechPlayback(Future<void> playback) {
+    _activeSpeechPlayback = playback;
+    unawaited(
+      playback.whenComplete(() {
+        if (identical(_activeSpeechPlayback, playback)) {
+          _activeSpeechPlayback = null;
+        }
+      }),
+    );
+  }
+
+  Future<void> _waitForActiveSpeechPlayback() async {
+    final playback = _activeSpeechPlayback;
+    if (playback == null) {
+      return;
+    }
+    try {
+      await playback;
+    } catch (_) {}
+    if (identical(_activeSpeechPlayback, playback)) {
+      _activeSpeechPlayback = null;
+    }
+  }
+
+  bool _isRecoverableListeningError(Object error) {
+    final lowered = error.toString().toLowerCase();
+    return lowered.contains('no speech') ||
+        lowered.contains('no-speech') ||
+        lowered.contains('aborted') ||
+        lowered.contains('audio capture aborted');
+  }
+
   String _readStatusText(Map<String, dynamic> payload) {
     final stepOne = Map<String, dynamic>.from(
       payload['step_one'] as Map? ?? const {},
@@ -342,6 +450,14 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     final mcpResults = (payload['mcp_results'] as List?) ?? const [];
     final requestKind = (stepOne['request_kind'] ?? 'mixed').toString();
     return 'Stage 1 finished as $requestKind. MCP calls: ${mcpResults.length}. Waiting for speech and whitespace...';
+  }
+
+  String _formatError(Object error) {
+    final text = error.toString().trim();
+    if (text.isEmpty) {
+      return 'Unknown error.';
+    }
+    return text;
   }
 
   @override
@@ -420,6 +536,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 decoration: InputDecoration(
                                   hintText: _isListening
                                       ? 'Listening in Chrome...'
+                                      : _voiceLoopEnabled
+                                      ? 'Voice mode is on. Speak your next request...'
                                       : 'Write prompt or use the mic...',
                                   hintStyle: TextStyle(
                                     color: Colors.black.withOpacity(0.45),
@@ -436,14 +554,14 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                           ),
                           const SizedBox(width: 10),
                           GestureDetector(
-                            onTap: (_isBusy || _isListening)
+                            onTap: (_isBusy && !_voiceLoopEnabled)
                                 ? null
-                                : _startSpeechInput,
+                                : _toggleVoiceLoop,
                             child: Container(
                               width: 44,
                               height: 44,
                               decoration: BoxDecoration(
-                                color: _isListening
+                                color: (_isListening || _voiceLoopEnabled)
                                     ? const Color(0xFFD64444)
                                     : const Color(0xFFCB4A4A),
                                 border: Border.all(
@@ -452,7 +570,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 ),
                               ),
                               child: Icon(
-                                _isListening ? Icons.mic : Icons.mic_none,
+                                (_isListening || _voiceLoopEnabled)
+                                    ? Icons.hearing
+                                    : Icons.mic_none,
                                 color: Colors.white,
                                 size: 18,
                               ),
@@ -633,14 +753,44 @@ class AgentBackendClient {
     if (configuredBaseUrl.isNotEmpty) {
       return configuredBaseUrl;
     }
-    if (kIsWeb) {
-      return Uri.base.origin;
+    const localHosts = {'localhost', '127.0.0.1', '::1', '[::1]'};
+    if (!kIsWeb) {
+      return 'http://127.0.0.1:8000';
     }
-    return 'http://127.0.0.1:8000';
+
+    final browserUri = Uri.base;
+    if (localHosts.contains(browserUri.host.toLowerCase()) &&
+        browserUri.port != 8000) {
+      // `flutter run -d chrome` serves the app on a random port, while Django
+      // listens on 8000 by default.
+      return Uri(
+        scheme: browserUri.scheme.isEmpty ? 'http' : browserUri.scheme,
+        host: browserUri.host,
+        port: 8000,
+      ).toString();
+    }
+
+    return browserUri.origin;
   }
 
   Future<Map<String, dynamic>> fetchBoardMemory() {
     return _getJson('/api/agent/board-memory/');
+  }
+
+  Future<Map<String, dynamic>> transcribeSpeechTurn({
+    required String audioBase64,
+    required String audioMimeType,
+    required String userId,
+    required String sessionId,
+    required String language,
+  }) {
+    return _postJson('/api/voice/transcribe/', {
+      'audio_base64': audioBase64,
+      'audio_mime_type': audioMimeType,
+      'user_id': userId,
+      'session_id': sessionId,
+      'language': language,
+    });
   }
 
   Future<Map<String, dynamic>> startAgentRun({

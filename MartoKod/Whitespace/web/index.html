@@ -42,70 +42,137 @@
         return window.SpeechRecognition || window.webkitSpeechRecognition || null;
       }
 
-      function isSpeechRecognitionSupported() {
+      function isSpeechCaptureSupported() {
         return !!getRecognitionConstructor();
       }
 
-      function startRecognition(language) {
+      function stopRecognition() {
+        if (!activeRecognition) {
+          return;
+        }
+        try {
+          activeRecognition.abort();
+        } catch (_) {}
+        activeRecognition = null;
+      }
+
+      function captureSpeechTurn(language) {
         return new Promise((resolve, reject) => {
-          const Recognition = getRecognitionConstructor();
-          if (!Recognition) {
+          if (!isSpeechCaptureSupported()) {
             reject(new Error('Speech recognition is not supported in this browser.'));
             return;
           }
 
-          if (activeRecognition) {
-            try {
-              activeRecognition.abort();
-            } catch (_) {}
-          }
-
+          stopRecognition();
+          const Recognition = getRecognitionConstructor();
           const recognition = new Recognition();
           activeRecognition = recognition;
           recognition.lang = language || 'bg-BG';
-          recognition.continuous = false;
+          recognition.continuous = true;
           recognition.interimResults = true;
           recognition.maxAlternatives = 1;
 
-          let finalTranscript = '';
+          let done = false;
+          let transcript = '';
+          let silenceTimer = null;
+          let startupTimer = null;
+
+          const cleanup = () => {
+            if (silenceTimer !== null) {
+              clearTimeout(silenceTimer);
+              silenceTimer = null;
+            }
+            if (startupTimer !== null) {
+              clearTimeout(startupTimer);
+              startupTimer = null;
+            }
+            if (activeRecognition === recognition) {
+              activeRecognition = null;
+            }
+          };
+
+          const fail = (message) => {
+            if (done) {
+              return;
+            }
+            done = true;
+            cleanup();
+            reject(new Error(message));
+          };
+
+          const finish = () => {
+            if (done) {
+              return;
+            }
+            const finalTranscript = transcript.trim();
+            if (!finalTranscript) {
+              fail('No speech was captured.');
+              return;
+            }
+            done = true;
+            cleanup();
+            resolve(finalTranscript);
+          };
+
+          const armSilenceTimer = () => {
+            if (silenceTimer !== null) {
+              clearTimeout(silenceTimer);
+            }
+            silenceTimer = setTimeout(() => {
+              try {
+                recognition.stop();
+              } catch (_) {
+                finish();
+              }
+            }, 900);
+          };
 
           recognition.onresult = (event) => {
-            let combinedTranscript = '';
-            for (let index = event.resultIndex; index < event.results.length; index += 1) {
+            let latest = '';
+            for (let index = 0; index < event.results.length; index += 1) {
               const result = event.results[index];
               if (!result || !result[0]) {
                 continue;
               }
-              const transcript = (result[0].transcript || '').trim();
-              if (!transcript) {
+              const piece = (result[0].transcript || '').trim();
+              if (!piece) {
                 continue;
               }
-              combinedTranscript += `${transcript} `;
-              if (result.isFinal) {
-                finalTranscript += `${transcript} `;
-              }
+              latest = piece;
             }
-            if (!finalTranscript.trim()) {
-              finalTranscript = combinedTranscript;
+            if (!latest) {
+              return;
             }
+            transcript = latest;
+            armSilenceTimer();
           };
 
           recognition.onerror = (event) => {
-            activeRecognition = null;
-            reject(new Error(event.error || 'Speech recognition failed.'));
+            fail(event.error || 'Speech recognition failed.');
           };
 
           recognition.onend = () => {
-            const transcript = (finalTranscript || '').trim();
-            activeRecognition = null;
-            if (!transcript) {
-              reject(new Error('No speech was captured.'));
+            if (done) {
               return;
             }
-            resolve(transcript);
+            finish();
           };
 
-          recognition.start();
+          startupTimer = setTimeout(() => {
+            if (!transcript.trim()) {
+              try {
+                recognition.stop();
+              } catch (_) {
+                fail('No speech was captured.');
+              }
+            }
+          }, 10000);
+
+          try {
+            recognition.start();
+          } catch (error) {
+            fail(error && error.message ? error.message : 'Microphone access failed.');
+          }
         });
       }
 
@@ -164,8 +231,9 @@
       }
 
       return {
-        isSpeechRecognitionSupported,
-        startRecognition,
+        isSpeechCaptureSupported,
+        captureSpeechTurn,
+        stopRecognition,
         playBase64Audio,
         stopAudio,
       };

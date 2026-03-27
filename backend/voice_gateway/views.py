@@ -11,7 +11,15 @@ from voice_gateway.services.providers import ProviderNotReadyError
 
 def _parse_request_payload(request):
     if request.content_type and request.content_type.startswith("application/json"):
-        return json.loads(request.body or "{}"), None
+        data = json.loads(request.body or "{}")
+        audio_bytes = None
+        audio_base64 = str(data.get("audio_base64") or "").strip()
+        if audio_base64:
+            try:
+                audio_bytes = base64.b64decode(audio_base64, validate=True)
+            except Exception as exc:
+                raise ValueError(f"Invalid audio_base64 payload: {exc}") from exc
+        return data, audio_bytes
 
     data = {
         "user_id": request.POST.get("user_id", "anonymous"),
@@ -66,6 +74,7 @@ def transcribe_view(request):
         return JsonResponse({"error": "Method not allowed"}, status=405)
 
     try:
+        print("[voice_gateway] transcribe request received", flush=True)
         data, audio_bytes = _parse_request_payload(request)
         if not audio_bytes:
             return JsonResponse({"error": "Audio is required."}, status=400)

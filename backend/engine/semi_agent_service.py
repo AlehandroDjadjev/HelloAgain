@@ -28,6 +28,9 @@ class SemiAgentService:
     BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS = 256
     BOARD_PIPELINE_JSON_CONTINUATION_BUDGET = 0
     RUN_JOB_TTL_SECONDS = 900
+    FOCUS_TITLE_MAX_WORDS = 6
+    FOCUS_TITLE_MAX_CHARS = 42
+    FOCUS_OBJECT_NAME_MAX_CHARS = 64
 
     def __init__(
         self,
@@ -311,18 +314,30 @@ class SemiAgentService:
             warnings.append(f"llm_fallback={exc}")
             llm_source = "fallback"
 
-        synthesis = self.tts_provider.synthesize(assistant_text)
-        warnings.extend(synthesis.warnings)
+        assistant_audio_base64 = ""
+        assistant_audio_mime_type = ""
+        tts_source = self.tts_provider.status()
+        try:
+            synthesis = self.tts_provider.synthesize(assistant_text)
+        except Exception as exc:
+            warnings.append(f"tts_unavailable={exc}")
+        else:
+            warnings.extend(synthesis.warnings)
+            assistant_audio_base64 = base64.b64encode(synthesis.audio_bytes).decode(
+                "ascii",
+            )
+            assistant_audio_mime_type = synthesis.mime_type
+            tts_source = synthesis.source
         return {
             "ok": True,
             "status": "completed",
             "speech_response": assistant_text,
             "assistant_text": assistant_text,
-            "assistant_audio_base64": base64.b64encode(synthesis.audio_bytes).decode("ascii"),
-            "assistant_audio_mime_type": synthesis.mime_type,
+            "assistant_audio_base64": assistant_audio_base64,
+            "assistant_audio_mime_type": assistant_audio_mime_type,
             "provider_status": {
                 "llm": llm_source,
-                "tts": synthesis.source,
+                "tts": tts_source,
             },
             "warnings": warnings,
         }
@@ -788,8 +803,15 @@ class SemiAgentService:
         )
 
         focus_object = raw.get("focus_object") if isinstance(raw.get("focus_object"), dict) else {}
-        focus_name = self._clean_text(focus_object.get("name")) or self._generate_focus_object_name(prompt, current_results)
-        focus_text = self._clean_text(focus_object.get("text")) or self._default_focus_text(prompt, current_results)
+        focus_text = self._coerce_focus_title(
+            focus_object.get("text"),
+            prompt=prompt,
+            current_results=current_results,
+        )
+        focus_name = self._coerce_focus_object_name(
+            focus_object.get("name"),
+            focus_text=focus_text,
+        )
         focus_width = max(220.0, self._to_float(focus_object.get("width"), 320.0))
         focus_height = max(160.0, self._to_float(focus_object.get("height"), 220.0))
         focus_memory_type = self._normalize_memory_type(focus_object.get("memory_type") or default_memory_type)
@@ -798,6 +820,10 @@ class SemiAgentService:
             default=focus_memory_type == "instant",
         )
         focus_linked_call_ids = self._normalize_linked_call_ids(focus_object.get("linked_call_ids"), current_results)
+        focus_result_title = (
+            self._sanitize_focus_title_candidate(focus_object.get("result_title"))
+            or focus_text
+        )
 
         board_commands = self._normalize_board_commands(
             raw.get("board_commands"),
@@ -813,7 +839,7 @@ class SemiAgentService:
             focus_memory_type=focus_memory_type,
             focus_delete_after_click=focus_delete_after_click,
             focus_linked_call_ids=focus_linked_call_ids,
-            focus_title=self._clean_text(focus_object.get("result_title") or focus_text),
+            focus_title=focus_result_title,
             focus_summary=self._clean_text(focus_object.get("result_summary")),
         )
 
@@ -845,7 +871,7 @@ class SemiAgentService:
                 "memory_type": focus_memory_type,
                 "delete_after_click": focus_delete_after_click,
                 "linked_call_ids": focus_linked_call_ids,
-                "result_title": self._clean_text(focus_object.get("result_title") or focus_text),
+                "result_title": focus_result_title,
                 "result_summary": self._clean_text(focus_object.get("result_summary")),
             },
             "additional_mcp_calls": additional_mcp_calls,
@@ -1156,7 +1182,9 @@ class SemiAgentService:
                         item.get("delete_after_click", item.get("deleteAfterClick")),
                         default=focus_delete_after_click,
                     ),
-                    "result_title": self._clean_text(item.get("result_title") or item.get("resultTitle") or focus_title),
+                    "result_title": self._sanitize_focus_title_candidate(
+                        item.get("result_title") or item.get("resultTitle") or focus_title
+                    ) or focus_title,
                     "result_summary": self._clean_text(item.get("result_summary") or item.get("resultSummary") or focus_summary),
                 }
             )
@@ -1317,8 +1345,8 @@ class SemiAgentService:
             compact_title = self._summarize_focus_title(first)
             if compact_title:
                 return compact_title
-        words = re.findall(r"[A-Za-z0-9]+", prompt)[:4]
-        return " ".join(words) or "Agent result"
+        words = re.findall(r"[0-9A-Za-zÐ-Ð¯Ð°-Ñ]+", prompt)[:4]
+        return self._clip_focus_title(" ".join(words) or "Agent result")
 
     def _summarize_focus_title(self, payload: Dict[str, Any]) -> str:
         if not isinstance(payload, dict):
@@ -1356,10 +1384,74 @@ class SemiAgentService:
         if not clean:
             return ""
         words = clean.split()
-        compact = " ".join(words[:6])
-        if len(compact) > 42:
-            compact = compact[:42].rstrip()
+        compact = " ".join(words[: self.FOCUS_TITLE_MAX_WORDS])
+        if len(compact) > self.FOCUS_TITLE_MAX_CHARS:
+            compact = compact[: self.FOCUS_TITLE_MAX_CHARS].rstrip()
         return compact.rstrip(".:;,- ")
+
+    def _coerce_focus_title(
+        self,
+        value: Any,
+        *,
+        prompt: str,
+        current_results: List[Dict[str, Any]],
+    ) -> str:
+        sanitized = self._sanitize_focus_title_candidate(value)
+        if sanitized:
+            return sanitized
+        return self._default_focus_text(prompt, current_results)
+
+    def _coerce_focus_object_name(self, value: Any, *, focus_text: str) -> str:
+        clean_value = self._clean_text(value)
+        candidate = ""
+        if clean_value and not self._looks_like_structured_title(clean_value):
+            candidate = self._slugify(clean_value)
+        if not candidate:
+            candidate = self._slugify(focus_text)
+        if not candidate:
+            candidate = f"agent_object_{uuid.uuid4().hex[:8]}"
+        return candidate[: self.FOCUS_OBJECT_NAME_MAX_CHARS].strip("_")
+
+    def _sanitize_focus_title_candidate(self, value: Any) -> str:
+        clean = self._clean_text(value).strip("\"'`")
+        if not clean:
+            return ""
+        if self._looks_like_structured_title(clean):
+            return ""
+        normalized = clean.replace("_", " ")
+        normalized = re.sub(r"[\"'`]+", "", normalized)
+        normalized = re.sub(r"[^0-9A-Za-zÐ-Ð¯Ð°-Ñ ]+", " ", normalized)
+        normalized = " ".join(normalized.split())
+        if not normalized:
+            return ""
+        return self._clip_focus_title(normalized)
+
+    def _looks_like_structured_title(self, value: str) -> bool:
+        lowered = value.lower()
+        structured_markers = (
+            "{",
+            "}",
+            "[",
+            "]",
+            "linked_results",
+            "result_summary",
+            "result_title",
+            "\"payload\"",
+            "\"result\"",
+            "\"arguments\"",
+            "\"detail\"",
+            "\"name\"",
+            "\"text\"",
+        )
+        if any(marker in lowered for marker in structured_markers):
+            return True
+        if len(value) > 120:
+            return True
+        if value.count(":") >= 2:
+            return True
+        if value.count(",") >= 3 and len(value.split()) >= 6:
+            return True
+        return False
 
     def _fallback_speech_response(self, prompt: str, mcp_results: List[Dict[str, Any]], step_two: Dict[str, Any]) -> str:
         focus = step_two.get("focus_object", {})
@@ -1438,3 +1530,4 @@ class SemiAgentService:
         if clean in {"instant", "ram", "memory"}:
             return clean
         return "ram"
+
