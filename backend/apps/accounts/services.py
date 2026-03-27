@@ -471,7 +471,7 @@ def _serialize_profile_for_recommendations(
         "elder_profile_id": target.elder_profile_id,
         "username": target.user.username,
         "display_name": target.display_name,
-        "description": target.description,
+        "description": target.effective_description or target.description,
         "friend_status": get_friendship_status(viewer, target),
         "top_traits": build_top_traits(target),
         "matched_from_contacts": bool(matched_contact_ids and target.id in matched_contact_ids),

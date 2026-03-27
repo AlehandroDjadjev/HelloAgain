@@ -102,6 +102,10 @@ class WhiteboardMemoryStore:
                 if clean:
                     tags.append(clean)
 
+            extra_data = raw.get("extraData", raw.get("extra_data"))
+            if not isinstance(extra_data, dict):
+                extra_data = {}
+
             objects.append(
                 {
                     "name": name,
@@ -120,6 +124,7 @@ class WhiteboardMemoryStore:
                         default=memory_type == "instant",
                     ),
                     "tags": tags,
+                    "extraData": deepcopy(extra_data),
                     "bbox": {
                         "x": x,
                         "y": y,
