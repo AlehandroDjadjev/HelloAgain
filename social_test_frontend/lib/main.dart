@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
-import 'package:permission_handler/permission_handler.dart' show openAppSettings;
+import 'package:permission_handler/permission_handler.dart' as ph;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -181,6 +181,7 @@ class _AuthPageState extends State<AuthPage> {
           phoneNumber: _phoneController.text.trim(),
           description: _descriptionController.text.trim(),
         );
+        await _requestLocationPermissionAfterSignUp();
       }
     } on ApiException catch (error) {
       if (!mounted) {
@@ -205,6 +206,41 @@ class _AuthPageState extends State<AuthPage> {
         });
       }
     }
+  }
+
+  Future<void> _requestLocationPermissionAfterSignUp() async {
+    final status = await ph.Permission.location.request();
+    if (!mounted) {
+      return;
+    }
+
+    final messenger = ScaffoldMessenger.of(context);
+    if (status == ph.PermissionStatus.granted || status == ph.PermissionStatus.limited) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Location permission granted.')),
+      );
+      return;
+    }
+
+    if (status == ph.PermissionStatus.permanentlyDenied ||
+        status == ph.PermissionStatus.restricted) {
+      messenger.showSnackBar(
+        SnackBar(
+          content: const Text('Location permission is blocked. Enable it in app settings.'),
+          action: SnackBarAction(
+            label: 'Settings',
+            onPressed: ph.openAppSettings,
+          ),
+        ),
+      );
+      return;
+    }
+
+    messenger.showSnackBar(
+      const SnackBar(
+        content: Text('Location permission not granted. You can enable it later from settings.'),
+      ),
+    );
   }
 
   String? _errorFor(String field) {
@@ -553,7 +589,7 @@ class _ContactsOnboardingPageState extends State<ContactsOnboardingPage> {
                         if (_showSettings) ...[
                           const SizedBox(height: 12),
                           TextButton.icon(
-                            onPressed: openAppSettings,
+                            onPressed: ph.openAppSettings,
                             icon: const Icon(Icons.settings_rounded),
                             label: const Text('Open device settings'),
                           ),
@@ -666,6 +702,7 @@ class _AppShellState extends State<AppShell> {
               session: widget.session,
               refreshToken: _refreshToken,
               onOpenProfile: _openUserProfile,
+              onSocialChange: _refreshAll,
             ),
             ProfileTab(
               session: widget.session,
@@ -1048,6 +1085,8 @@ class _RequestsTabState extends State<RequestsTab> {
   String? _error;
   FriendRequestBucket _bucket =
       const FriendRequestBucket(incoming: <FriendRequestRow>[], outgoing: <FriendRequestRow>[]);
+  MeetupInviteBucket _meetupBucket =
+      const MeetupInviteBucket(incoming: <MeetupInviteRow>[], outgoing: <MeetupInviteRow>[]);
 
   @override
   void initState() {
@@ -1069,12 +1108,18 @@ class _RequestsTabState extends State<RequestsTab> {
       _error = null;
     });
     try {
-      final bucket = await widget.session.api.fetchFriendRequests();
+      final results = await Future.wait<dynamic>([
+        widget.session.api.fetchFriendRequests(),
+        widget.session.api.fetchMeetupInvites(),
+      ]);
+      final bucket = results[0] as FriendRequestBucket;
+      final meetupBucket = results[1] as MeetupInviteBucket;
       if (!mounted) {
         return;
       }
       setState(() {
         _bucket = bucket;
+        _meetupBucket = meetupBucket;
       });
     } on ApiException catch (error) {
       if (!mounted) {
@@ -1090,6 +1135,39 @@ class _RequestsTabState extends State<RequestsTab> {
         });
       }
     }
+  }
+
+  Future<void> _respondMeetup(MeetupInviteRow row, String action) async {
+    try {
+      await widget.session.api.respondMeetupInvite(inviteId: row.id, action: action);
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Meetup invite ${action}ed.')),
+      );
+      widget.onSocialChange();
+      await _load();
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    }
+  }
+
+  String _formatInviteTime(DateTime? value) {
+    if (value == null) {
+      return 'time not set';
+    }
+    final local = value.toLocal();
+    final month = local.month.toString().padLeft(2, '0');
+    final day = local.day.toString().padLeft(2, '0');
+    final hour = local.hour.toString().padLeft(2, '0');
+    final minute = local.minute.toString().padLeft(2, '0');
+    return '$day.$month $hour:$minute';
   }
 
   Future<void> _respond(FriendRequestRow row, String action) async {
@@ -1123,16 +1201,27 @@ class _RequestsTabState extends State<RequestsTab> {
       child: ListView(
         padding: const EdgeInsets.fromLTRB(16, 4, 16, 20),
         children: [
-          if (_loading && _bucket.incoming.isEmpty && _bucket.outgoing.isEmpty)
+          if (_loading &&
+              _bucket.incoming.isEmpty &&
+              _bucket.outgoing.isEmpty &&
+              _meetupBucket.incoming.isEmpty &&
+              _meetupBucket.outgoing.isEmpty)
             const Center(
               child: Padding(
                 padding: EdgeInsets.only(top: 48),
                 child: CircularProgressIndicator(),
               ),
             )
-          else if (_error != null && _bucket.incoming.isEmpty && _bucket.outgoing.isEmpty)
+          else if (_error != null &&
+              _bucket.incoming.isEmpty &&
+              _bucket.outgoing.isEmpty &&
+              _meetupBucket.incoming.isEmpty &&
+              _meetupBucket.outgoing.isEmpty)
             ErrorCard(message: _error!)
-          else if (_bucket.incoming.isEmpty && _bucket.outgoing.isEmpty)
+          else if (_bucket.incoming.isEmpty &&
+              _bucket.outgoing.isEmpty &&
+              _meetupBucket.incoming.isEmpty &&
+              _meetupBucket.outgoing.isEmpty)
             const EmptyCard(
               title: 'No requests yet',
               message:
@@ -1184,6 +1273,86 @@ class _RequestsTabState extends State<RequestsTab> {
                 ),
               ),
             ],
+            if (_meetupBucket.incoming.isNotEmpty) ...[
+              const SectionHeader(title: 'Meetup Invites (Incoming)'),
+              ..._meetupBucket.incoming.map(
+                (row) => Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '${row.requesterDisplayName} invited you',
+                            style: Theme.of(context)
+                                .textTheme
+                                .titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w700),
+                          ),
+                          const SizedBox(height: 8),
+                          Text('Place: ${row.placeName}'),
+                          Text('When: ${_formatInviteTime(row.proposedTime)}'),
+                          if (row.weather.isNotEmpty) Text('Weather: ${row.weather}'),
+                          const SizedBox(height: 10),
+                          row.status == 'pending'
+                              ? Wrap(
+                                  spacing: 8,
+                                  children: [
+                                    FilledButton(
+                                      onPressed: () => _respondMeetup(row, 'accept'),
+                                      child: const Text('Accept'),
+                                    ),
+                                    OutlinedButton(
+                                      onPressed: () => _respondMeetup(row, 'decline'),
+                                      child: const Text('Decline'),
+                                    ),
+                                  ],
+                                )
+                              : StatusChip(label: row.status),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+            if (_meetupBucket.outgoing.isNotEmpty) ...[
+              const SectionHeader(title: 'Meetup Invites (Outgoing)'),
+              ..._meetupBucket.outgoing.map(
+                (row) => Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Invite to ${row.invitedDisplayName}',
+                            style: Theme.of(context)
+                                .textTheme
+                                .titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w700),
+                          ),
+                          const SizedBox(height: 8),
+                          Text('Place: ${row.placeName}'),
+                          Text('When: ${_formatInviteTime(row.proposedTime)}'),
+                          const SizedBox(height: 10),
+                          row.status == 'pending'
+                              ? OutlinedButton(
+                                  onPressed: () => _respondMeetup(row, 'cancel'),
+                                  child: const Text('Cancel'),
+                                )
+                              : StatusChip(label: row.status),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           ],
         ],
       ),
@@ -1197,11 +1366,13 @@ class FriendsTab extends StatefulWidget {
     required this.session,
     required this.refreshToken,
     required this.onOpenProfile,
+    required this.onSocialChange,
   });
 
   final SessionController session;
   final int refreshToken;
   final ValueChanged<AppProfile> onOpenProfile;
+  final VoidCallback onSocialChange;
 
   @override
   State<FriendsTab> createState() => _FriendsTabState();
@@ -1255,6 +1426,26 @@ class _FriendsTabState extends State<FriendsTab> {
     }
   }
 
+  Future<void> _proposeMeetup(AppProfile friend) async {
+    try {
+      await widget.session.api.proposeMeetup(friend: friend, me: widget.session.me);
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Meetup invitation sent to ${friend.displayName}.')),
+      );
+      widget.onSocialChange();
+    } on ApiException catch (error) {
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.message)),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return RefreshIndicator(
@@ -1296,6 +1487,11 @@ class _FriendsTabState extends State<FriendsTab> {
                           onPressed: () => launchExternalUri('mailto:${friend.email}'),
                           icon: const Icon(Icons.email_rounded),
                         ),
+                      FilledButton.tonalIcon(
+                        onPressed: () => _proposeMeetup(friend),
+                        icon: const Icon(Icons.place_rounded),
+                        label: const Text('Propose meetup'),
+                      ),
                     ],
                   ),
                 ),
@@ -1325,6 +1521,8 @@ class _ProfileTabState extends State<ProfileTab> {
   late final TextEditingController _displayNameController;
   late final TextEditingController _phoneController;
   late final TextEditingController _descriptionController;
+  late final TextEditingController _homeLatController;
+  late final TextEditingController _homeLngController;
   late final TextEditingController _goalController;
   late final TextEditingController _vibeController;
 
@@ -1339,6 +1537,12 @@ class _ProfileTabState extends State<ProfileTab> {
     _displayNameController = TextEditingController(text: me.displayName);
     _phoneController = TextEditingController(text: me.phoneNumber ?? '');
     _descriptionController = TextEditingController(text: me.description);
+    _homeLatController = TextEditingController(
+      text: me.homeLat?.toString() ?? '',
+    );
+    _homeLngController = TextEditingController(
+      text: me.homeLng?.toString() ?? '',
+    );
     _goalController = TextEditingController(
       text: me.onboardingAnswers['friendship_goal'] ?? '',
     );
@@ -1354,12 +1558,30 @@ class _ProfileTabState extends State<ProfileTab> {
     _displayNameController.dispose();
     _phoneController.dispose();
     _descriptionController.dispose();
+    _homeLatController.dispose();
+    _homeLngController.dispose();
     _goalController.dispose();
     _vibeController.dispose();
     super.dispose();
   }
 
   Future<void> _save() async {
+    final parsedLat = double.tryParse(_homeLatController.text.trim());
+    final parsedLng = double.tryParse(_homeLngController.text.trim());
+
+    if (_homeLatController.text.trim().isNotEmpty && parsedLat == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Home latitude must be a number.')),
+      );
+      return;
+    }
+    if (_homeLngController.text.trim().isNotEmpty && parsedLng == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Home longitude must be a number.')),
+      );
+      return;
+    }
+
     setState(() {
       _saving = true;
     });
@@ -1369,6 +1591,8 @@ class _ProfileTabState extends State<ProfileTab> {
           'display_name': _displayNameController.text.trim(),
           'phone_number': _phoneController.text.trim(),
           'description': _descriptionController.text.trim(),
+          if (_homeLatController.text.trim().isNotEmpty) 'home_lat': parsedLat,
+          if (_homeLngController.text.trim().isNotEmpty) 'home_lng': parsedLng,
           'share_phone_with_friends': _sharePhone,
           'share_email_with_friends': _shareEmail,
           'onboarding_answers': <String, dynamic>{
@@ -1440,6 +1664,26 @@ class _ProfileTabState extends State<ProfileTab> {
                     labelText: 'Description',
                     alignLabelWithHint: true,
                   ),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _homeLatController,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                        decoration: const InputDecoration(labelText: 'Home latitude'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: TextField(
+                        controller: _homeLngController,
+                        keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+                        decoration: const InputDecoration(labelText: 'Home longitude'),
+                      ),
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 14),
                 TextField(

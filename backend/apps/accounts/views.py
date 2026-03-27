@@ -149,6 +149,8 @@ def _serialize_profile(
                 "share_phone_with_friends": target.share_phone_with_friends,
                 "share_email_with_friends": target.share_email_with_friends,
                 "onboarding_answers": target.onboarding_answers,
+                "home_lat": target.home_lat,
+                "home_lng": target.home_lng,
             }
         )
     return data

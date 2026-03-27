@@ -28,6 +28,66 @@ def _to_bg_weather(label):
         return ''
     return _WEATHER_BG_MAP.get(label, label)
 
+
+_DEFAULT_PLACE_WEIGHTS = {
+    'park': 1.0,
+    'cafe': 0.75,
+    'library': 0.68,
+    'museum': 0.62,
+    'restaurant': 0.70,
+    'shopping_mall': 0.45,
+}
+
+
+def _bounded(value):
+    return max(0.0, min(1.0, float(value)))
+
+
+def _aggregate_place_type_weights(participant_vectors=None):
+    weights = dict(_DEFAULT_PLACE_WEIGHTS)
+    vectors = participant_vectors or []
+    if not vectors:
+        return weights
+
+    for vec in vectors:
+        if not isinstance(vec, dict):
+            continue
+        nature = _bounded(vec.get('interest_nature', 0.5))
+        arts = _bounded(vec.get('interest_arts', 0.5))
+        books = _bounded(vec.get('interest_books', 0.5))
+        history = _bounded(vec.get('interest_history', 0.5))
+        sports = _bounded(vec.get('interest_sports', 0.5))
+        music = _bounded(vec.get('interest_music', 0.5))
+        small_groups = _bounded(vec.get('prefers_small_groups', 0.5))
+
+        # Additive nudges on top of defaults so missing preferences still behave sensibly.
+        weights['park'] += 0.45 * nature + 0.25 * sports
+        weights['library'] += 0.35 * books + 0.20 * small_groups
+        weights['museum'] += 0.30 * history + 0.20 * arts
+        weights['cafe'] += 0.20 * music + 0.25 * small_groups
+        weights['restaurant'] += 0.18 * music + 0.16 * arts
+        weights['shopping_mall'] += 0.12 * sports
+
+    # Keep weights in a healthy range to avoid overpowering weather/distance.
+    return {
+        key: max(0.30, min(2.50, value / max(1, len(vectors))))
+        for key, value in weights.items()
+    }
+
+
+def _ranked_place_types(weights, limit=4):
+    ranked = sorted(weights.items(), key=lambda item: item[1], reverse=True)
+    return [name for name, _ in ranked[:limit]] or ['park']
+
+
+def _place_type_preference_score(place_types, weights):
+    if not place_types:
+        return 0.0
+    candidates = [weights.get(pt, 0.0) for pt in place_types]
+    if not candidates:
+        return 0.0
+    return max(candidates)
+
 def get_central_point(coordinates):
     if not coordinates:
         return None
@@ -44,7 +104,7 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def fetch_places(location, radius=2000):
+def fetch_places(location, radius=2000, included_types=None):
     api_key = os.getenv('GOOGLE_MAPS_API_KEY')
     if not api_key:
         print("Warning: GOOGLE_MAPS_API_KEY is not set.")
@@ -57,7 +117,7 @@ def fetch_places(location, radius=2000):
         "Content-Type": "application/json"
     }
     data = {
-        "includedTypes": ["park"],
+        "includedTypes": included_types or ["park"],
         "maxResultCount": 10,
         "languageCode": "bg",
         "locationRestriction": {
@@ -115,12 +175,15 @@ def fetch_weather(location):
         return res.json().get('list', [])
     return []
 
-def get_best_meetup_spot(coordinates):
+def get_best_meetup_spot(coordinates, participant_vectors=None, preferred_time=None):
     center = get_central_point(coordinates)
     if not center:
         return None
-        
-    places = fetch_places(center)
+
+    place_weights = _aggregate_place_type_weights(participant_vectors)
+    selected_types = _ranked_place_types(place_weights)
+
+    places = fetch_places(center, included_types=selected_types)
     weather_forecasts = fetch_weather(center)
     
     now = datetime.now()
@@ -138,6 +201,10 @@ def get_best_meetup_spot(coordinates):
                 'weather_main': forecast['weather'][0]['main']
             })
             
+    if preferred_time:
+        valid_hours.sort(key=lambda item: abs((item['time'] - preferred_time).total_seconds()))
+        valid_hours = valid_hours[:4]
+
     best_score = -9999
     best_match = None
     
@@ -168,12 +235,9 @@ def get_best_meetup_spot(coordinates):
             
             types = place.get('types', [])
 
-            # Strictly allow only real parks in final candidate scoring.
-            if 'park' not in types:
-                continue
+            preference_score = _place_type_preference_score(types, place_weights)
 
-            # Keep a light preference toward park-friendly weather.
-            amenities_score = 6
+            amenities_score = 6 + (preference_score * 2.5)
             if not vh['rain']:
                 amenities_score += 2
                     
@@ -194,7 +258,9 @@ def get_best_meetup_spot(coordinates):
                     'review_count': ratings_count,
                     'types': types,
                     'amenities': amenities_desc,
-                    'vicinity': place.get('vicinity', '')
+                    'vicinity': place.get('vicinity', ''),
+                    'preference_score': round(preference_score, 3),
+                    'selected_types': selected_types,
                 }
                 
     return best_match

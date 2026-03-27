@@ -53,6 +53,8 @@ class AccountProfileUpdateSerializer(serializers.Serializer):
     contacts_permission_granted = serializers.BooleanField(required=False)
     share_phone_with_friends = serializers.BooleanField(required=False)
     share_email_with_friends = serializers.BooleanField(required=False)
+    home_lat = serializers.FloatField(required=False, min_value=-90.0, max_value=90.0)
+    home_lng = serializers.FloatField(required=False, min_value=-180.0, max_value=180.0)
 
 
 class FriendRequestCreateSerializer(serializers.Serializer):
