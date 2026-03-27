@@ -59,9 +59,6 @@ class _MeetupScreenState extends State<MeetupScreen> {
   List<Map<String, double>> _lastParticipants = const [];
   bool _isLoading = false;
   String? _errorMessage;
-  final Set<Marker> _markers = {};
-  final FlutterLocalNotificationsPlugin _notificationsPlugin =
-      FlutterLocalNotificationsPlugin();
 
   @override
   void initState() {
@@ -320,8 +317,8 @@ class _MeetupScreenState extends State<MeetupScreen> {
       id: 0,
       title: 'Напомняне за среща',
       body:
-          'Имаш среща в ${_bestMatch!['place_name']} около $timeLabel.',
-      notificationDetails: const NotificationDetails(android: androidDetails),
+          'Имаш среща в ${_bestMatch!['place_name']} около $meetStartStr.',
+      notificationDetails: platformDetails,
     );
   }
 
