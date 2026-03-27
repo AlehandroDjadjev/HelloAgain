@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'src/theme/app_theme.dart';
 import 'android_phone_number_hint.dart';
 import 'browser_voice_bridge.dart';
 import 'meetup_screen.dart';
@@ -29,14 +30,10 @@ class HelloAgainApp extends StatelessWidget {
     return MaterialApp(
       title: 'Hello Again',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
+      theme: buildHelloAgainTheme(
         scaffoldBackgroundColor: const Color(0xFFF4EDE3),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFFB56B4D),
-          brightness: Brightness.light,
-          surface: const Color(0xFFFFFBF7),
-        ),
+        seedColor: const Color(0xFFB56B4D),
+        surfaceColor: const Color(0xFFFFFBF7),
       ),
       home: const HelloAgainShell(),
     );
