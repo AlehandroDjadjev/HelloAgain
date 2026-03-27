@@ -1,0 +1,183 @@
+{
+  "id": "helloagain_users",
+  "protocol": "at_home_mcp",
+  "kind": "backend_integrated_toolset",
+  "description": "This MCP exposes the full user and profile side of the backend. It handles signup, login, profile fetching, profile updates, evolving user context, discovery feeds, contact import, friend requests, and user-side recommendation activity. This is the main surface for reading and updating the real user object, while the recommendation system stays as derived algorithmic state.",
+  "invoke_url": "/api/accounts/",
+  "tools": [
+    {
+      "name": "register",
+      "method": "POST",
+      "path": "/api/accounts/register/",
+      "description": "Creates a new user account and the canonical user profile.",
+      "body_schema": {
+        "username": "string",
+        "email": "string",
+        "password": "string",
+        "display_name": "string",
+        "phone_number": "string",
+        "description": "string",
+        "dynamic_profile_summary": "string",
+        "profile_notes": "string",
+        "onboarding_answers": "object",
+        "contacts_permission_granted": "boolean",
+        "share_phone_with_friends": "boolean",
+        "share_email_with_friends": "boolean"
+      }
+    },
+    {
+      "name": "login",
+      "method": "POST",
+      "path": "/api/accounts/login/",
+      "description": "Signs a user in and returns their token and current profile.",
+      "body_schema": {
+        "identifier": "string",
+        "password": "string"
+      }
+    },
+    {
+      "name": "logout",
+      "method": "POST",
+      "path": "/api/accounts/logout/",
+      "description": "Logs the current user out by removing their token.",
+      "body_schema": {}
+    },
+    {
+      "name": "me",
+      "method": "GET",
+      "path": "/api/accounts/me/",
+      "description": "Fetches the canonical signed-in user profile, including evolving context fields like dynamic_profile_summary, profile_notes, and effective_description.",
+      "body_schema": {}
+    },
+    {
+      "name": "update_me",
+      "method": "PATCH",
+      "path": "/api/accounts/me/",
+      "description": "Updates the canonical signed-in user profile. This is the main place where an MCP can keep learning more about the person over time.",
+      "body_schema": {
+        "display_name": "string",
+        "phone_number": "string",
+        "description": "string",
+        "dynamic_profile_summary": "string",
+        "profile_notes": "string",
+        "onboarding_answers": "object",
+        "contacts_permission_granted": "boolean",
+        "share_phone_with_friends": "boolean",
+        "share_email_with_friends": "boolean"
+      }
+    },
+    {
+      "name": "onboarding_questions_preview",
+      "method": "POST",
+      "path": "/api/accounts/onboarding/questions/preview/",
+      "description": "Checks whether the current user description is rich enough or whether more clarification questions should be asked.",
+      "body_schema": {
+        "description": "string",
+        "onboarding_answers": "object"
+      }
+    },
+    {
+      "name": "discovery_feed",
+      "method": "GET",
+      "path": "/api/accounts/discovery/",
+      "description": "Returns the main friend recommendation feed for the signed-in user.",
+      "body_schema": {
+        "q": "string",
+        "limit": "int"
+      }
+    },
+    {
+      "name": "discovery_query",
+      "method": "POST",
+      "path": "/api/accounts/discovery/query/",
+      "description": "Finds people from a natural-language description of the kind of friend the user wants.",
+      "body_schema": {
+        "description": "string",
+        "limit": "int"
+      }
+    },
+    {
+      "name": "search_users",
+      "method": "GET",
+      "path": "/api/accounts/search/",
+      "description": "Searches users by visible text fields like name or description.",
+      "body_schema": {
+        "q": "string"
+      }
+    },
+    {
+      "name": "friends_list",
+      "method": "GET",
+      "path": "/api/accounts/friends/",
+      "description": "Lists the current user's accepted friends.",
+      "body_schema": {}
+    },
+    {
+      "name": "user_detail",
+      "method": "GET",
+      "path": "/api/accounts/users/<int:user_id>/",
+      "description": "Fetches one user's profile card with compatibility and contact visibility info.",
+      "body_schema": {
+        "user_id": "int"
+      }
+    },
+    {
+      "name": "friend_requests",
+      "method": "GET",
+      "path": "/api/accounts/friend-requests/",
+      "description": "Lists incoming and outgoing pending friend requests.",
+      "body_schema": {}
+    },
+    {
+      "name": "create_friend_request",
+      "method": "POST",
+      "path": "/api/accounts/friend-requests/",
+      "description": "Sends a friend request to another user.",
+      "body_schema": {
+        "target_user_id": "int",
+        "target_username": "string",
+        "message": "string"
+      }
+    },
+    {
+      "name": "respond_to_friend_request",
+      "method": "POST",
+      "path": "/api/accounts/friend-requests/<int:request_id>/respond/",
+      "description": "Accepts, declines, or cancels a friend request.",
+      "body_schema": {
+        "action": "string"
+      }
+    },
+    {
+      "name": "contacts",
+      "method": "GET",
+      "path": "/api/accounts/contacts/",
+      "description": "Lists imported contacts and matched users already found in the system.",
+      "body_schema": {}
+    },
+    {
+      "name": "import_contacts",
+      "method": "POST",
+      "path": "/api/accounts/contacts/import/",
+      "description": "Imports contacts so the backend can find which of them are already users.",
+      "body_schema": {
+        "replace_existing": "boolean",
+        "source": "string",
+        "contacts": "array"
+      }
+    },
+    {
+      "name": "activity_event_collection",
+      "method": "POST",
+      "path": "/api/accounts/activities/",
+      "description": "Stores recommendation-related user actions like viewing, clicking, or opening a match.",
+      "body_schema": {
+        "event_type": "string",
+        "target_user_id": "int",
+        "discovery_mode": "string",
+        "query_text": "string",
+        "metadata": "object"
+      }
+    }
+  ]
+}

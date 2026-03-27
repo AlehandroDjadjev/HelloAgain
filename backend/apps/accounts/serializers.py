@@ -12,6 +12,8 @@ class RegisterSerializer(serializers.Serializer):
     display_name = serializers.CharField(max_length=120, required=False, allow_blank=True)
     phone_number = serializers.CharField(max_length=32, required=False, allow_blank=True)
     description = serializers.CharField(required=False, allow_blank=True)
+    dynamic_profile_summary = serializers.CharField(required=False, allow_blank=True)
+    profile_notes = serializers.CharField(required=False, allow_blank=True)
     onboarding_answers = serializers.DictField(
         child=serializers.CharField(allow_blank=True),
         required=False,
@@ -46,6 +48,8 @@ class AccountProfileUpdateSerializer(serializers.Serializer):
     display_name = serializers.CharField(max_length=120, required=False, allow_blank=True)
     phone_number = serializers.CharField(max_length=32, required=False, allow_blank=True)
     description = serializers.CharField(required=False, allow_blank=True)
+    dynamic_profile_summary = serializers.CharField(required=False, allow_blank=True)
+    profile_notes = serializers.CharField(required=False, allow_blank=True)
     onboarding_answers = serializers.DictField(
         child=serializers.CharField(allow_blank=True),
         required=False,

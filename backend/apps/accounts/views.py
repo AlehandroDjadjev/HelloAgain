@@ -148,6 +148,9 @@ def _serialize_profile(
                 ),
                 "share_phone_with_friends": target.share_phone_with_friends,
                 "share_email_with_friends": target.share_email_with_friends,
+                "dynamic_profile_summary": target.dynamic_profile_summary,
+                "profile_notes": target.profile_notes,
+                "effective_description": target.effective_description,
                 "onboarding_answers": target.onboarding_answers,
             }
         )
@@ -271,6 +274,8 @@ def register_view(request):
             display_name=data.get("display_name") or data["username"],
             phone_number=data.get("phone_number", ""),
             description=data.get("description", ""),
+            dynamic_profile_summary=data.get("dynamic_profile_summary", ""),
+            profile_notes=data.get("profile_notes", ""),
             onboarding_answers=data.get("onboarding_answers", {}),
             contacts_permission_granted=data.get("contacts_permission_granted", False),
             share_phone_with_friends=data.get("share_phone_with_friends", True),
@@ -359,7 +364,13 @@ def me_view(request):
     changed_profile_fields = False
     for field, value in serializer.validated_data.items():
         setattr(profile, field, value)
-        if field in {"display_name", "description", "onboarding_answers"}:
+        if field in {
+            "display_name",
+            "description",
+            "dynamic_profile_summary",
+            "profile_notes",
+            "onboarding_answers",
+        }:
             changed_profile_fields = True
     profile.save()
 

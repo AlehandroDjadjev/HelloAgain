@@ -5,7 +5,6 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     
     # Platform APIs
-    path("api/voice-gateway/", include("voice_gateway.urls")),
     path("api/meetup/", include("meetup.urls")),
     
     # Agent & Device APIs
