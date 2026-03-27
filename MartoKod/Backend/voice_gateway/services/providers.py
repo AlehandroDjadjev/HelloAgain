@@ -18,6 +18,7 @@ from voice_gateway.services.memory import conversation_memory
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[2] / ".voice_models"
+BACKEND_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 DEFAULT_STT_LANGUAGE = "bg-BG"
 DEFAULT_GOOGLE_SPEECH_API_VERSION = "v1"
 DEFAULT_GOOGLE_SPEECH_MODEL = "latest_long"
@@ -27,7 +28,9 @@ DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "You are HelloAgain, a warm real-time voice assistant. "
-    "Keep replies concise, natural, and easy to speak aloud. "
+    "You are speaking with an older adult, so use calm, respectful, everyday language. "
+    "Avoid emojis, slang, jargon, and difficult words unless the user clearly asks for them. "
+    "Keep replies concise, natural, easy to understand, and easy to speak aloud. "
     "Reply in the same language as the user's most recent message unless asked otherwise. "
     "Prefer short spoken-friendly responses."
 )
@@ -51,9 +54,41 @@ class ProviderNotReadyError(RuntimeError):
     pass
 
 
+def _clean_env_value(raw_value: str) -> str:
+    return raw_value.strip().strip("'\"")
+
+
+def _read_env_value(key: str, env_path: Optional[Path] = None) -> str:
+    direct_value = os.environ.get(key, "")
+    if direct_value.strip():
+        return _clean_env_value(direct_value)
+
+    resolved_env_path = env_path or BACKEND_ENV_PATH
+
+    try:
+        env_text = resolved_env_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    for raw_line in env_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip() == key:
+            return _clean_env_value(value)
+
+    return ""
+
+
 class SpeechToTextProvider(abc.ABC):
     @abc.abstractmethod
-    def transcribe(self, audio_data: bytes, language: Optional[str] = None):
+    def transcribe(
+        self,
+        audio_data: bytes,
+        language: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ):
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -92,7 +127,7 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
             "GOOGLE_CLOUD_SPEECH_LANGUAGE",
             DEFAULT_STT_LANGUAGE,
         )
-        self.api_key = os.environ.get("GOOGLE_STT_API_KEY", "").strip().strip("'\"")
+        self.api_key = _read_env_value("GOOGLE_STT_API_KEY")
         self.api_version = os.environ.get(
             "GOOGLE_STT_API_VERSION",
             DEFAULT_GOOGLE_SPEECH_API_VERSION,
@@ -118,46 +153,7 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
             ).split(",")
             if phrase.strip()
         ]
-        self._client = None
         self._project_id: Optional[str] = None
-        self._load_error: Optional[str] = None
-
-    def _speech_package_available(self) -> bool:
-        try:
-            from google.cloud import speech  # noqa: F401
-        except ModuleNotFoundError:
-            return False
-        return True
-
-    def _resolve_credentials(self):
-        from google.auth import default
-        from google.oauth2 import service_account
-
-        credentials_path = os.environ.get(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "",
-        ).strip()
-        if credentials_path:
-            credentials_file = Path(credentials_path)
-            if not credentials_file.exists():
-                raise FileNotFoundError(
-                    "GOOGLE_APPLICATION_CREDENTIALS points to a missing file: "
-                    f"{credentials_file}",
-                )
-
-            credentials = service_account.Credentials.from_service_account_file(
-                str(credentials_file),
-            )
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or getattr(
-                credentials,
-                "project_id",
-                None,
-            )
-            return credentials, project_id
-
-        credentials, detected_project = default()
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or detected_project
-        return credentials, project_id
 
     def _normalize_model_name(self, model_name: str) -> str:
         normalized = model_name.strip()
@@ -178,6 +174,7 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
         audio_data: bytes,
         language: str,
         audio_metadata: Optional[dict] = None,
+        content_type: Optional[str] = None,
     ) -> dict:
         body = {
             "config": {
@@ -195,6 +192,10 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
             body["config"]["encoding"] = "LINEAR16"
             body["config"]["sampleRateHertz"] = audio_metadata["sample_rate"]
             body["config"]["audioChannelCount"] = audio_metadata["channels"]
+        elif content_type:
+            inferred_encoding = self._infer_rest_encoding(content_type)
+            if inferred_encoding:
+                body["config"]["encoding"] = inferred_encoding
 
         if self.phrase_hints:
             body["config"]["speechContexts"] = [
@@ -203,22 +204,37 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
 
         return body
 
+    def _infer_rest_encoding(self, content_type: str) -> Optional[str]:
+        normalized = content_type.split(";")[0].strip().lower()
+        if normalized in {"audio/flac", "audio/x-flac"}:
+            return "FLAC"
+        if normalized in {"audio/ogg", "audio/opus"}:
+            return "OGG_OPUS"
+        if normalized == "audio/webm":
+            return "WEBM_OPUS"
+        if normalized in {"audio/wav", "audio/wave", "audio/x-wav"}:
+            return "LINEAR16"
+        return None
+
     def _transcribe_via_api_key(
         self,
         audio_data: bytes,
         language: str,
         audio_metadata: Optional[dict] = None,
+        content_type: Optional[str] = None,
     ):
         if self.api_version == "v2":
             return self._transcribe_v2_via_rest(
                 audio_data,
                 language,
                 audio_metadata=audio_metadata,
+                content_type=content_type,
             )
         request_body = self._build_rest_request_body(
             audio_data,
             language,
             audio_metadata=audio_metadata,
+            content_type=content_type,
         )
         query = urllib.parse.urlencode({"key": self.api_key})
         url = f"https://speech.googleapis.com/v1/speech:recognize?{query}"
@@ -257,6 +273,7 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
         audio_data: bytes,
         language: str,
         audio_metadata: Optional[dict] = None,
+        content_type: Optional[str] = None,
     ) -> dict:
         config: dict[str, object] = {
             "languageCodes": [language],
@@ -273,6 +290,14 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
                 "sampleRateHertz": audio_metadata["sample_rate"],
                 "audioChannelCount": audio_metadata["channels"],
             }
+        elif content_type:
+            inferred_encoding = self._infer_rest_encoding(content_type)
+            if inferred_encoding:
+                config["explicitDecodingConfig"] = {
+                    "encoding": inferred_encoding,
+                }
+            else:
+                config["autoDecodingConfig"] = {}
         else:
             config["autoDecodingConfig"] = {}
 
@@ -286,13 +311,14 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
         audio_data: bytes,
         language: str,
         audio_metadata: Optional[dict] = None,
+        content_type: Optional[str] = None,
     ) -> str:
         if not self._project_id:
             self._project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or "api-key"
 
         if not self._project_id or self._project_id == "api-key":
             raise ProviderNotReadyError(
-                "Google STT v2 needs GOOGLE_CLOUD_PROJECT set in backend/.env.",
+                "Google STT v2 needs GOOGLE_CLOUD_PROJECT set in Backend/.env.",
             )
 
         recognizer = self.recognizer or DEFAULT_GOOGLE_SPEECH_RECOGNIZER
@@ -301,6 +327,7 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
             audio_data,
             language,
             audio_metadata=audio_metadata,
+            content_type=content_type,
         )
         query = urllib.parse.urlencode({"key": self.api_key})
         url = (
@@ -337,28 +364,13 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
         ]
         return " ".join(part for part in transcripts if part).strip()
 
-    def _ensure_client(self):
-        if self.api_key:
-            self._project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or "api-key"
-            return
-
-        if self._client is not None or self._load_error is not None:
-            return
-
-        try:
-            from google.cloud import speech
-
-            credentials, self._project_id = self._resolve_credentials()
-            if not self._project_id:
-                raise ProviderNotReadyError(
-                    "Google Cloud Speech-to-Text needs GOOGLE_CLOUD_PROJECT or "
-                    "a service-account JSON with a project_id.",
-                )
-
-            self._client = speech.SpeechClient(credentials=credentials)
-        except Exception as exc:
-            self._load_error = str(exc)
-            logger.exception("Failed to load Google Cloud Speech client")
+    def _ensure_api_key(self):
+        if not self.api_key:
+            raise ProviderNotReadyError(
+                "Google Cloud Speech-to-Text is not ready. Set GOOGLE_STT_API_KEY "
+                "in Backend/.env.",
+            )
+        self._project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or "api-key"
 
     def _normalize_transcript(self, text: str) -> str:
         cleaned = " ".join(text.split()).strip()
@@ -473,72 +485,26 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
         except wave.Error:
             return audio_data, metadata
 
-    def transcribe(self, audio_data: bytes, language: Optional[str] = None):
+    def transcribe(
+        self,
+        audio_data: bytes,
+        language: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ):
         from voice_gateway.domain.contracts import TranscriptionResult
 
-        self._ensure_client()
-        if not self.api_key and self._client is None:
-            raise ProviderNotReadyError(
-                "Google Cloud Speech-to-Text is not ready. Check "
-                "GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_STT_API_KEY in backend/.env.",
-            )
+        self._ensure_api_key()
 
         chosen_language = language or self.default_language
         prepared_audio, audio_metadata = self._prepare_audio_for_google(audio_data)
-        if self.api_key:
-            text = self._transcribe_via_api_key(
-                prepared_audio,
-                chosen_language,
-                audio_metadata=audio_metadata,
-            )
-            source = "google_cloud_speech_v1_rest"
-            auth_mode = "api_key"
-        else:
-            from google.cloud import speech
-
-            config_kwargs = {
-                "language_code": chosen_language,
-                "model": self.model,
-                "enable_automatic_punctuation": True,
-                "max_alternatives": 3,
-                "speech_contexts": [
-                    speech.SpeechContext(
-                        phrases=self.phrase_hints,
-                        boost=15.0,
-                    ),
-                ],
-                "metadata": speech.RecognitionMetadata(
-                    interaction_type=(
-                        speech.RecognitionMetadata.InteractionType.DICTATION
-                    ),
-                    microphone_distance=(
-                        speech.RecognitionMetadata.MicrophoneDistance.NEARFIELD
-                    ),
-                    original_media_type=(
-                        speech.RecognitionMetadata.OriginalMediaType.AUDIO
-                    ),
-                    recording_device_type=(
-                        speech.RecognitionMetadata.RecordingDeviceType.SMARTPHONE
-                    ),
-                ),
-            }
-            if audio_metadata and audio_metadata.get("sample_width") == 2:
-                config_kwargs.update(
-                    encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                    sample_rate_hertz=audio_metadata["sample_rate"],
-                    audio_channel_count=audio_metadata["channels"],
-                )
-            config = speech.RecognitionConfig(**config_kwargs)
-            audio = speech.RecognitionAudio(content=prepared_audio)
-            response = self._client.recognize(config=config, audio=audio, timeout=120)
-
-            text = " ".join(
-                result.alternatives[0].transcript.strip()
-                for result in response.results
-                if result.alternatives
-            ).strip()
-            source = "google_cloud_speech_v1"
-            auth_mode = "service_account"
+        text = self._transcribe_via_api_key(
+            prepared_audio,
+            chosen_language,
+            audio_metadata=audio_metadata,
+            content_type=content_type,
+        )
+        source = "google_cloud_speech_v1_rest"
+        auth_mode = "api_key"
 
         text = self._normalize_transcript(text)
         if not text:
@@ -559,24 +525,15 @@ class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
         )
 
     def status(self) -> str:
-        if self._client is not None:
-            return f"ready: {self._project_id}/{self.model}"
-        if self.api_key:
-            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or "api-key"
-            return (
-                f"configured: {self.api_version}:{project_id}/"
-                f"{self.location}/{self.recognizer}/{self.model}/api_key"
-            )
-        if self._load_error is not None:
-            return f"unavailable: {self._load_error}"
-        if not self._speech_package_available():
-            return "unavailable: package_missing"
-
-        try:
-            _, project_id = self._resolve_credentials()
-            return f"configured: {self.api_version}:{project_id}/{self.model}"
-        except Exception as exc:
-            return f"unavailable: {exc}"
+        if not self.api_key:
+            return "unavailable: api_key_missing"
+        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or "api-key"
+        if self.api_version == "v2" and project_id == "api-key":
+            return "unavailable: google_cloud_project_missing_for_v2"
+        return (
+            f"configured: {self.api_version}:{project_id}/"
+            f"{self.location}/{self.recognizer}/{self.model}/api_key"
+        )
 
 
 class OpenAILLMProvider(LLMProvider):
@@ -589,28 +546,28 @@ class OpenAILLMProvider(LLMProvider):
     ):
         self.api_key = (
             api_key
-            or os.environ.get("OPENAI_LLM_API_KEY")
-            or os.environ.get("LLM_API_KEY")
-            or os.environ.get("OPEN_AI_KEY")
+            or _read_env_value("OPENAI_LLM_API_KEY")
+            or _read_env_value("LLM_API_KEY")
+            or _read_env_value("OPEN_AI_KEY")
             or ""
         ).strip().strip("'\"")
         self.model = (
             model
-            or os.environ.get("OPENAI_LLM_MODEL")
-            or os.environ.get("OPENAI_MODEL")
+            or _read_env_value("OPENAI_LLM_MODEL")
+            or _read_env_value("OPENAI_MODEL")
             or DEFAULT_OPENAI_MODEL
         ).strip()
         self.base_url = (
             base_url
-            or os.environ.get("OPENAI_BASE_URL")
+            or _read_env_value("OPENAI_BASE_URL")
             or DEFAULT_OPENAI_BASE_URL
         ).rstrip("/")
         self.system_prompt = (
             system_prompt
-            or os.environ.get("VOICE_GATEWAY_SYSTEM_PROMPT")
+            or _read_env_value("VOICE_GATEWAY_SYSTEM_PROMPT")
             or DEFAULT_OPENAI_SYSTEM_PROMPT
         ).strip()
-        self.timeout = int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
+        self.timeout = int(_read_env_value("OPENAI_TIMEOUT_SECONDS") or "60")
 
     def _normalize_reply(self, text: str) -> str:
         return " ".join(text.split()).strip()
@@ -668,7 +625,7 @@ class OpenAILLMProvider(LLMProvider):
 
         if not self.api_key:
             raise ProviderNotReadyError(
-                "OpenAI is not ready. Set OPENAI_LLM_API_KEY in backend/.env.",
+                "OpenAI is not ready. Set OPENAI_LLM_API_KEY in Backend/.env.",
             )
 
         payload_messages: list[dict[str, str]] = []
