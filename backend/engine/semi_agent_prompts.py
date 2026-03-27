@@ -12,6 +12,7 @@ def build_step_one_mcp_prompt(
     *,
     registry: Dict[str, Any],
     chain_history: List[Dict[str, Any]],
+    board_state: Dict[str, Any],
 ) -> str:
     return f"""
 You are a Qwen worker inside a hardcoded 2 step semi agent. This is part of a set reasoning chain and you must stay aware of which exact step you are in.
@@ -22,6 +23,8 @@ The idea is to see where and how we can apply different stuff to drive a multipl
 We still have to select if its even relevant for some as tools can be wildly different.
 But just be aware of the type of descition you are making - the first step of the reasoning process.
 Try and pick through the mcp list to get 1 used mcp (at least) per request.
+If the whiteboard already has objects with `extraData`, that hidden metadata is part of the usable context too.
+Use both the user prompt and the board object extra data when deciding what MCP to use.
 
 This is step 1.
 - Step 1 decides whether MCPs are needed and which MCP calls to make.
@@ -60,6 +63,9 @@ Current at-home MCP registry:
 
 Previous chain history:
 {_pretty_json(chain_history)}
+
+Current whiteboard state:
+{_pretty_json(board_state)}
 """.strip()
 
 

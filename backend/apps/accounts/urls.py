@@ -8,6 +8,9 @@ urlpatterns = [
     path("login/", views.login_view, name="accounts_login"),
     path("logout/", views.logout_view, name="accounts_logout"),
     path("me/", views.me_view, name="accounts_me"),
+    path("agent/profile/update/", views.agent_profile_update_view, name="accounts_agent_profile_update"),
+    path("agent/connections/find/", views.agent_find_connection_view, name="accounts_agent_find_connection"),
+    path("agent/users/<int:user_id>/widget/", views.agent_user_widget_view, name="accounts_agent_user_widget"),
     path(
         "onboarding/questions/preview/",
         views.onboarding_questions_preview,

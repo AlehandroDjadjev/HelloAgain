@@ -1,0 +1,34 @@
+{
+  "id": "connections",
+  "protocol": "at_home_mcp",
+  "kind": "backend_integrated_toolset",
+  "description": "This MCP wraps the social account and recommendation system so the agent can keep the current user's profile fresh and surface real nearby or compatible people as whiteboard objects.",
+  "invoke_url": "/api/agent/mcps/connections/invoke/",
+  "tools": [
+    {
+      "name": "update_profile",
+      "method": "POST",
+      "path": "/api/accounts/agent/profile/update/",
+      "description": "Use this when the user reveals durable facts or preferences about themselves and their social profile should be updated before future matching.",
+      "body_schema": {
+        "user_id": "string",
+        "prompt": "string",
+        "profile_patch": "object",
+        "profile_json": "object",
+        "board_state": "object"
+      }
+    },
+    {
+      "name": "find_connection",
+      "method": "POST",
+      "path": "/api/accounts/agent/connections/find/",
+      "description": "Use this when the user would benefit from being connected to another person. It turns the current intent into a temporary search description and finds the closest real user match.",
+      "body_schema": {
+        "user_id": "string",
+        "prompt": "string",
+        "limit": "integer",
+        "board_state": "object"
+      }
+    }
+  ]
+}
