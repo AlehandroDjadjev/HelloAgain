@@ -159,6 +159,10 @@ class CustomMcpRegistryTests(SimpleTestCase):
 
         self.assertEqual(response_format["type"], "json_schema")
         _assert_openai_object_schemas_are_strict(self, response_format["json_schema"]["schema"])
+        action_enum = (
+            response_format["json_schema"]["schema"]["properties"]["board_commands"]["items"]["properties"]["action"]["enum"]
+        )
+        self.assertIn("click object", action_enum)
 
 
 class LocalDevCorsMiddlewareTests(SimpleTestCase):
@@ -692,6 +696,36 @@ class SemiAgentServiceTests(SimpleTestCase):
         self.assertEqual(payload["focus_object"]["text"], "Call Mom Soon")
         self.assertEqual(payload["focus_object"]["name"], "call_mom_soon")
         self.assertEqual(payload["focus_object"]["result_title"], "Call Mom Soon")
+
+    def test_normalize_step_two_plan_accepts_click_object_alias(self) -> None:
+        service = SemiAgentService()
+
+        payload = service._normalize_step_two_plan(
+            {
+                "focus_object": {
+                    "name": "best_match",
+                    "text": "Best Match",
+                    "result_title": "Best Match",
+                },
+                "board_commands": [
+                    {
+                        "action": "click object",
+                        "name": "best_match",
+                    }
+                ],
+                "result_bindings": [],
+            },
+            prompt="open the object for me",
+            board_state={"board": {"width": 1000, "height": 700}, "objects": []},
+            largest_empty_space={"bbox": {"x": 0, "y": 0, "width": 1000, "height": 700}},
+            step_one={"memory_hint": "instant"},
+            current_results=[],
+        )
+
+        self.assertIn(
+            {"action": "click", "name": "best_match"},
+            payload["board_commands"],
+        )
 
     def test_opening_user_object_returns_specialized_user_viewer(self) -> None:
         class FakeConnectionsService:

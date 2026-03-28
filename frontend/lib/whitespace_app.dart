@@ -1206,7 +1206,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   @override
   void initState() {
     super.initState();
-    _sceneController = SceneController();
+    _sceneController = SceneController(
+      onClickObject: (object) => _openObjectResult(object, automated: true),
+    );
     _backendClient = AgentBackendClient();
     _voiceBridge = createBrowserVoiceBridge();
     _sessionId = 'whitespace_${DateTime.now().millisecondsSinceEpoch}';
@@ -1261,8 +1263,11 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     }
   }
 
-  Future<void> _openObjectResult(SceneObjectData object) async {
-    if (_isBusy) return;
+  Future<void> _openObjectResult(
+    SceneObjectData object, {
+    bool automated = false,
+  }) async {
+    if (_isBusy && !automated) return;
     setState(() {
       _isBusy = true;
       _statusText = 'Opening ${object.text}...';
@@ -3116,9 +3121,10 @@ class AgentBackendClient {
 }
 
 class SceneController extends ChangeNotifier {
-  SceneController();
+  SceneController({this.onClickObject});
   final Map<String, SceneObjectData> _objects = <String, SceneObjectData>{};
   final math.Random _random = math.Random();
+  final Future<void> Function(SceneObjectData object)? onClickObject;
 
   Size _boardSize = const Size(1000, 700);
 
@@ -3180,7 +3186,7 @@ class SceneController extends ChangeNotifier {
   Future<Map<String, dynamic>> executeCommandMap(
     Map<String, dynamic> command,
   ) async {
-    final action = (command['action'] ?? '').toString().trim();
+    final action = _normalizeActionName(command['action']);
 
     switch (action) {
       case 'create':
@@ -3204,6 +3210,15 @@ class SceneController extends ChangeNotifier {
       default:
         throw UnsupportedError('Unknown action "$action".');
     }
+  }
+
+  String _normalizeActionName(Object? rawAction) {
+    final action = (rawAction ?? '').toString().trim();
+    final compact = action.toLowerCase().replaceAll(RegExp(r'[\s_-]+'), '');
+    if (compact == 'clickobject') {
+      return 'click';
+    }
+    return action;
   }
 
   Map<String, dynamic> _hydrateSceneFromJson(Map<String, dynamic> json) {
@@ -3394,6 +3409,7 @@ class SceneController extends ChangeNotifier {
       throw StateError('Object "$name" not found.');
     }
 
+    await onClickObject?.call(current);
     return {'ok': true, 'action': 'click', 'name': name};
   }
 
