@@ -42,6 +42,9 @@ _PLACE_TYPE_BG_MAP = {
 
 logger = logging.getLogger(__name__)
 _BULGARIA_TZ = ZoneInfo('Europe/Sofia')
+_PLACE_COMPATIBILITY_WEIGHT = 0.52
+_DISTANCE_WEIGHT = 0.18
+_REVIEWS_WEIGHT = 0.10
 
 
 def _to_bg_weather(label):
@@ -975,11 +978,10 @@ def get_ranked_meetup_spots(
                 averaged_profile,
             )
             base_score_01 = _bounded(
-                (0.38 * place_compatibility)
+                (_PLACE_COMPATIBILITY_WEIGHT * place_compatibility)
                 + (_WEATHER_WEIGHT * context_weather)
-                + (0.18 * dist_score)
-                + (0.10 * reviews_score)
-                + (0.14 * user_similarity)
+                + (_DISTANCE_WEIGHT * dist_score)
+                + (_REVIEWS_WEIGHT * reviews_score)
             )
             total_score_01 = _bounded(
                 base_score_01
@@ -1027,10 +1029,14 @@ def get_ranked_meetup_spots(
                     'weather': round(weather_score, 4),
                     'time_window_weight': round(time_weight, 4),
                     'context_weather': round(context_weather, 4),
+                    'place_compatibility_weight': _PLACE_COMPATIBILITY_WEIGHT,
                     'weather_weight': _WEATHER_WEIGHT,
                     'distance': round(dist_score, 4),
+                    'distance_weight': _DISTANCE_WEIGHT,
                     'reviews': round(reviews_score, 4),
+                    'reviews_weight': _REVIEWS_WEIGHT,
                     'user_similarity': round(user_similarity, 4),
+                    'user_similarity_weight': 0.0,
                     'graph_place_score': round(graph_place_score, 4),
                     'graph_place_bonus_weight': _GRAPH_PLACE_BONUS_WEIGHT,
                     'base_score': round(base_score_01, 4),

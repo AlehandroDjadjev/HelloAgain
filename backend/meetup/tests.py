@@ -141,6 +141,36 @@ class MeetupSemanticRankingTests(TestCase):
 		self.assertTrue(rows)
 		self.assertLess(int(rows[0]['user_similarity_score']), 40)
 
+	def test_pair_similarity_does_not_change_numeric_place_score(self, *_):
+		coordinates = [{'lat': 42.69, 'lng': 23.34}, {'lat': 42.688, 'lng': 23.335}]
+		descriptions = [
+			'I love parks and quiet outdoor talks.',
+			'I prefer cafes and calm conversations.',
+		]
+
+		with patch('meetup.services._pair_user_similarity', return_value=0.0):
+			low_similarity_rows = get_ranked_meetup_spots(
+				coordinates=coordinates,
+				participant_descriptions=descriptions,
+				top_n=3,
+			)
+
+		with patch('meetup.services._pair_user_similarity', return_value=1.0):
+			high_similarity_rows = get_ranked_meetup_spots(
+				coordinates=coordinates,
+				participant_descriptions=descriptions,
+				top_n=3,
+			)
+
+		self.assertTrue(low_similarity_rows)
+		self.assertTrue(high_similarity_rows)
+		self.assertEqual(low_similarity_rows[0]['place_name'], high_similarity_rows[0]['place_name'])
+		self.assertEqual(low_similarity_rows[0]['score'], high_similarity_rows[0]['score'])
+		self.assertEqual(low_similarity_rows[0]['score_breakdown']['user_similarity_weight'], 0.0)
+		self.assertEqual(high_similarity_rows[0]['score_breakdown']['user_similarity_weight'], 0.0)
+		self.assertEqual(low_similarity_rows[0]['user_similarity_score'], 0)
+		self.assertEqual(high_similarity_rows[0]['user_similarity_score'], 100)
+
 	def test_very_short_descriptions_do_not_crash(self, *_):
 		rows = get_ranked_meetup_spots(
 			coordinates=[{'lat': 42.69, 'lng': 23.34}, {'lat': 42.688, 'lng': 23.335}],
