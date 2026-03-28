@@ -18,7 +18,7 @@ class AgentClient {
   Future<Map<String, dynamic>> createSession({
     String deviceId = 'flutter-test',
     String inputMode = 'text',
-    String reasoningProvider = 'local',
+    String reasoningProvider = 'openai',
     List<String> supportedPackages = const [],
   }) async {
     return _post('/api/agent/sessions/', {
@@ -28,6 +28,44 @@ class AgentClient {
       'supported_packages': supportedPackages,
     });
   }
+
+  Future<Map<String, dynamic>> submitCommand({
+    required String prompt,
+    String deviceId = 'flutter-test',
+    String inputMode = 'text',
+    String reasoningProvider = 'openai',
+    List<String> supportedPackages = const [],
+  }) => _post('/api/agent/command/', {
+    'prompt': prompt,
+    'device_id': deviceId,
+    'input_mode': inputMode,
+    'reasoning_provider': reasoningProvider,
+    'supported_packages': supportedPackages,
+  });
+
+  Future<Map<String, dynamic>> startPhoneCommand({
+    required String prompt,
+    String deviceId = 'flutter-test',
+    String inputMode = 'text',
+    String reasoningProvider = 'openai',
+    List<String> supportedPackages = const [],
+  }) => _post('/api/agent/phone-command/', {
+    'prompt': prompt,
+    'device_id': deviceId,
+    'input_mode': inputMode,
+    'reasoning_provider': reasoningProvider,
+    'supported_packages': supportedPackages,
+  });
+
+  Future<Map<String, dynamic>> prepareNavigation({
+    required String prompt,
+    String deviceId = 'flutter-test',
+    List<String> supportedPackages = const [],
+  }) => _post('/api/agent/navigation/prepare/', {
+    'prompt': prompt,
+    'device_id': deviceId,
+    'supported_packages': supportedPackages,
+  });
 
   Future<Map<String, dynamic>> pauseSession(String sessionId) =>
       _post('/api/agent/sessions/$sessionId/pause/', {});

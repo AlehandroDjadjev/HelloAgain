@@ -93,6 +93,8 @@ class WhitespaceLaunchConfig {
       resolvedDisplayName != null;
 }
 
+enum HelloAgainStage { booting, intro, onboarding, board }
+
 class StandaloneWhitespaceShell extends StatefulWidget {
   const StandaloneWhitespaceShell({
     super.key,
@@ -110,13 +112,72 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
   static const _tokenKey = 'hello_again.account_token';
 
   late final AgentBackendClient _backendClient;
+  late final BrowserVoiceBridge _voiceBridge;
   _ResolvedWhitespaceLaunch? _launch;
+
+  SharedPreferences? _prefs;
+  HelloAgainStage _stage = HelloAgainStage.booting;
+  AppAccountSession? _session;
+  bool _showContinue = false;
+  bool _isListening = false;
+  bool _isWorking = false;
+  bool _isConfirming = false;
+  int _currentStepIndex = 0;
+  String _statusText = 'Preparing Hello Again...';
+  String _promptText = '';
+  String _transcriptPreview = '';
+  final Map<String, String> _answers = <String, String>{};
+
+  static const List<_RegistrationStep> _steps = [
+    _RegistrationStep(
+      id: 'name',
+      title: 'Your name',
+      prompt: 'Hello. Tell me what you would like the app to call you.',
+    ),
+    _RegistrationStep(
+      id: 'phone_number',
+      title: 'Phone number',
+      prompt:
+          'Now say your phone number slowly, digit by digit, so I can create your profile.',
+    ),
+    _RegistrationStep(
+      id: 'description',
+      title: 'A few words about you',
+      prompt:
+          'Tell me in a few calm sentences what kind of person you are so I can get to know you.',
+    ),
+    _RegistrationStep(
+      id: 'ideal_company',
+      title: 'Good company',
+      prompt:
+          'What kind of people make you feel most comfortable and happy spending time together?',
+    ),
+    _RegistrationStep(
+      id: 'favorite_things',
+      title: 'Favorite topics',
+      prompt:
+          'What do you most enjoy talking about, or what have you enjoyed doing lately?',
+    ),
+    _RegistrationStep(
+      id: 'good_meetup',
+      title: 'A good meetup',
+      prompt: 'What makes a meetup feel warm, calm, and successful for you?',
+    ),
+  ];
 
   @override
   void initState() {
     super.initState();
     _backendClient = AgentBackendClient();
+    _voiceBridge = createBrowserVoiceBridge();
     unawaited(_bootstrap());
+  }
+
+  @override
+  void dispose() {
+    _voiceBridge.stopRecognition();
+    _voiceBridge.stopAudio();
+    super.dispose();
   }
 
   Future<void> _bootstrap() async {
@@ -125,11 +186,20 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
 
     if (!mounted) return;
     setState(() {
+      _prefs = prefs;
       _launch = launch;
+      _session = launch?.session;
+      if (launch != null) {
+        _stage = HelloAgainStage.board;
+        _statusText = launch.welcomeText;
+      } else {
+        _stage = HelloAgainStage.intro;
+        _statusText = 'A calm start is ready.';
+      }
     });
   }
 
-  Future<_ResolvedWhitespaceLaunch> _resolveLaunch(
+  Future<_ResolvedWhitespaceLaunch?> _resolveLaunch(
     SharedPreferences prefs,
   ) async {
     final explicitLaunch = await _resolveExplicitLaunch();
@@ -151,12 +221,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
       }
     }
 
-    return _ResolvedWhitespaceLaunch.guest(
-      userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
-      displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
-      welcomeText:
-          'Whitespace board launched directly. Login and registration are skipped in this target.',
-    );
+    return null;
   }
 
   Future<_ResolvedWhitespaceLaunch?> _resolveExplicitLaunch() async {
@@ -186,6 +251,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
           accountToken: explicitToken,
           welcomeText:
               'The provided token could not be verified at startup, but the whitespace board was launched directly.',
+          session: null,
         );
       }
     }
@@ -198,18 +264,367 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final launch = _launch;
-    if (launch == null) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+  void _handleIntroFinished() {
+    if (_session != null || _launch != null) {
+      setState(() {
+        _stage = HelloAgainStage.board;
+      });
+      return;
+    }
+    setState(() {
+      _showContinue = true;
+      _statusText = 'Tap Continue and I will guide you through registration.';
+    });
+  }
+
+  Future<void> _startRegistration() async {
+    if (_isWorking) return;
+    setState(() {
+      _showContinue = false;
+      _stage = HelloAgainStage.onboarding;
+      _currentStepIndex = 0;
+      _answers.clear();
+      _transcriptPreview = '';
+      _isConfirming = false;
+    });
+    await _runCurrentStep();
+  }
+
+  Future<void> _runCurrentStep() async {
+    final step = _steps[_currentStepIndex];
+    if (!mounted) return;
+    setState(() {
+      _promptText = step.prompt;
+      _statusText = 'I am about to ask the question out loud.';
+      _transcriptPreview = '';
+      _isWorking = true;
+      _isListening = false;
+      _isConfirming = false;
+    });
+
+    try {
+      while (mounted) {
+        await _speakOnboardingText(step.prompt);
+        if (!mounted) return;
+        setState(() {
+          _isListening = true;
+          _isConfirming = false;
+          _statusText = 'I am listening carefully...';
+        });
+
+        final capturedTurn = await _voiceBridge.captureAudioTurn(
+          language: 'bg-BG',
+        );
+        final transcript = await _resolveCapturedTranscript(capturedTurn);
+        final normalized = _normalizeAnswer(step.id, transcript);
+
+        if (normalized.isEmpty) {
+          await _speakOnboardingText(
+            'I could not hear you clearly. I will repeat the question.',
+          );
+          if (!mounted) return;
+          setState(() {
+            _isListening = false;
+            _statusText = 'I could not hear the answer clearly. Repeating the question.';
+          });
+          continue;
+        }
+
+        if (!mounted) return;
+        setState(() {
+          _transcriptPreview = normalized;
+          _isListening = false;
+          _isConfirming = true;
+          _statusText =
+              'I heard: "$normalized". Say yes to confirm or no to repeat.';
+        });
+
+        final confirmed = await _confirmTranscript(normalized);
+        if (!mounted) return;
+        if (!confirmed) {
+          setState(() {
+            _isConfirming = false;
+            _statusText = 'Okay, I will ask the question again.';
+          });
+          continue;
+        }
+
+        _answers[step.id] = normalized;
+        break;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _isConfirming = false;
+      });
+
+      if (_currentStepIndex == _steps.length - 1) {
+        await _submitRegistration();
+        return;
+      }
+
+      setState(() {
+        _currentStepIndex += 1;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 260));
+      await _runCurrentStep();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _isListening = false;
+        _isConfirming = false;
+        _isWorking = false;
+        _statusText =
+            'I could not hear clearly. Tap once and I will repeat the current question.';
+      });
+    }
+  }
+
+  Future<bool> _confirmTranscript(String transcript) async {
+    await _speakOnboardingText(
+      'I heard: $transcript. If that is correct, say yes. If not, say no and I will repeat the question.',
+    );
+
+    while (mounted) {
+      setState(() {
+        _isListening = true;
+        _statusText = 'Please say only yes or no.';
+      });
+
+      final capturedTurn = await _voiceBridge.captureAudioTurn(
+        language: 'bg-BG',
+      );
+      final confirmation = await _resolveCapturedTranscript(capturedTurn);
+      final normalized = _normalizeConfirmationAnswer(confirmation);
+      if (normalized != null) {
+        setState(() {
+          _isListening = false;
+        });
+        return normalized;
+      }
+
+      setState(() {
+        _isListening = false;
+        _statusText = 'I did not understand the confirmation. I will ask again.';
+      });
+      await _speakOnboardingText('I did not understand. Please say only yes or no.');
     }
 
-    return AgentBoardScreen(
-      userId: launch.userId,
-      accountToken: launch.accountToken,
-      welcomeText: launch.welcomeText,
+    return false;
+  }
+
+  Future<String> _resolveCapturedTranscript(
+    CapturedAudioTurn capturedTurn,
+  ) async {
+    final directTranscript = (capturedTurn.transcript ?? '').trim();
+    if (directTranscript.isNotEmpty) {
+      return directTranscript;
+    }
+    final payload = await _backendClient.transcribeSpeechTurn(
+      audioBase64: capturedTurn.audioBase64,
+      audioMimeType: capturedTurn.mimeType,
+      userId: 'hello_again_registration',
+      sessionId: 'registration_${DateTime.now().millisecondsSinceEpoch}',
+      language: capturedTurn.language,
     );
+    return (payload['transcript'] ?? payload['message'] ?? '')
+        .toString()
+        .trim();
+  }
+
+  String _normalizeAnswer(String stepId, String transcript) {
+    final clean = transcript.trim();
+    if (stepId != 'phone_number') {
+      return clean;
+    }
+
+    final digitWords = <String, String>{
+      'zero': '0',
+      'oh': '0',
+      'one': '1',
+      'two': '2',
+      'three': '3',
+      'four': '4',
+      'for': '4',
+      'five': '5',
+      'six': '6',
+      'seven': '7',
+      'eight': '8',
+      'nine': '9',
+      'plus': '+',
+      'nula': '0',
+      'edno': '1',
+      'dve': '2',
+      'dva': '2',
+      'tri': '3',
+      'chetiri': '4',
+      'pet': '5',
+      'shest': '6',
+      'sedem': '7',
+      'osem': '8',
+      'devet': '9',
+    };
+
+    digitWords.addAll(const {
+      'nula': '0',
+      'edno': '1',
+      'dve': '2',
+      'dva': '2',
+      'tri': '3',
+      'chetiri': '4',
+      'pet': '5',
+      'shest': '6',
+      'sedem': '7',
+      'osem': '8',
+      'devet': '9',
+      'plyus': '+',
+    });
+
+    final pieces = clean
+        .toLowerCase()
+        .replaceAll('-', ' ')
+        .split(RegExp(r'\s+'))
+        .where((item) => item.trim().isNotEmpty);
+
+    final buffer = StringBuffer();
+    for (final piece in pieces) {
+      if (digitWords.containsKey(piece)) {
+        buffer.write(digitWords[piece]);
+      } else {
+        buffer.write(piece.replaceAll(RegExp(r'[^0-9+]'), ''));
+      }
+    }
+    return buffer.toString().trim();
+  }
+
+  bool? _normalizeConfirmationAnswer(String transcript) {
+    final words = transcript
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9\s]+', caseSensitive: false), ' ')
+        .split(RegExp(r'\s+'))
+        .where((item) => item.isNotEmpty)
+        .toList();
+
+    const yesWords = {
+      'yes',
+      'yep',
+      'correct',
+      'right',
+      'okay',
+    };
+    const noWords = {'no', 'wrong', 'repeat', 'again'};
+
+    if (words.any(yesWords.contains)) {
+      return true;
+    }
+    if (words.any(noWords.contains)) {
+      return false;
+    }
+    return null;
+  }
+
+  Future<void> _speakOnboardingText(String text) async {
+    try {
+      final payload = await _backendClient.speakText(
+        text: text,
+        language: 'bg-BG',
+      );
+      final audioBase64 = (payload['audio_base64'] ?? '').toString().trim();
+      final mimeType = (payload['audio_mime_type'] ?? 'audio/wav')
+          .toString()
+          .trim();
+      if (audioBase64.isNotEmpty) {
+        await _voiceBridge.playBase64Audio(
+          audioBase64: audioBase64,
+          mimeType: mimeType.isEmpty ? 'audio/wav' : mimeType,
+        );
+        return;
+      }
+    } catch (_) {}
+
+    await _voiceBridge.playText(text);
+  }
+
+  Future<void> _submitRegistration() async {
+    if (!mounted) return;
+    setState(() {
+      _statusText = 'Creating your profile...';
+      _isWorking = true;
+      _isConfirming = false;
+    });
+
+    final onboardingAnswers = <String, String>{
+      'ideal_company': _answers['ideal_company'] ?? '',
+      'favorite_things': _answers['favorite_things'] ?? '',
+      'good_meetup': _answers['good_meetup'] ?? '',
+    };
+
+    try {
+      final session = await _backendClient.registerVoiceProfile(
+        name: _answers['name'] ?? '',
+        phoneNumber: _answers['phone_number'] ?? '',
+        description: _answers['description'] ?? '',
+        onboardingAnswers: onboardingAnswers,
+      );
+      await _prefs?.setString(_tokenKey, session.token);
+      if (!mounted) return;
+      setState(() {
+        _session = session;
+        _launch = _ResolvedWhitespaceLaunch.fromSession(session);
+        _stage = HelloAgainStage.board;
+        _isWorking = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _isWorking = false;
+        _statusText =
+            'Registration could not finish. Tap once and I will repeat the current step. ${error.toString()}';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    switch (_stage) {
+      case HelloAgainStage.booting:
+        return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      case HelloAgainStage.intro:
+        return IntroOnboardingScreen(
+          showContinue: _showContinue,
+          statusText: _statusText,
+          onFinished: _handleIntroFinished,
+          onContinue: _startRegistration,
+        );
+      case HelloAgainStage.onboarding:
+        final step = _steps[_currentStepIndex];
+        return RegistrationScreen(
+          title: step.title,
+          prompt: _promptText,
+          statusText: _statusText,
+          transcript: _transcriptPreview,
+          isListening: _isListening,
+          isWorking: _isWorking,
+          isConfirming: _isConfirming,
+          stepNumber: _currentStepIndex + 1,
+          stepCount: _steps.length,
+          onRetry: _runCurrentStep,
+        );
+      case HelloAgainStage.board:
+        final session = _session;
+        final launch = _launch;
+        return AgentBoardScreen(
+          userId:
+              session?.userId.toString() ??
+              launch?.userId ??
+              'whitespace_frontend',
+          accountToken: session?.token ?? launch?.accountToken,
+          welcomeText: session == null
+              ? launch?.welcomeText
+              : 'Welcome, ${session.displayName}. Your space is ready.',
+        );
+    }
   }
 }
 
@@ -218,11 +633,13 @@ class _ResolvedWhitespaceLaunch {
     required this.userId,
     this.accountToken,
     required this.welcomeText,
+    this.session,
   });
 
   final String userId;
   final String? accountToken;
   final String welcomeText;
+  final AppAccountSession? session;
 
   factory _ResolvedWhitespaceLaunch.fromSession(AppAccountSession session) {
     return _ResolvedWhitespaceLaunch(
@@ -230,6 +647,7 @@ class _ResolvedWhitespaceLaunch {
       accountToken: session.token,
       welcomeText:
           'Welcome back, ${session.displayName}. The whitespace board is ready.',
+      session: session,
     );
   }
 
@@ -245,8 +663,434 @@ class _ResolvedWhitespaceLaunch {
     return _ResolvedWhitespaceLaunch(
       userId: userId,
       welcomeText: welcomeText.isEmpty ? fallbackWelcome : welcomeText,
+      session: null,
     );
   }
+}
+
+class IntroOnboardingScreen extends StatefulWidget {
+  const IntroOnboardingScreen({
+    super.key,
+    required this.showContinue,
+    required this.statusText,
+    required this.onFinished,
+    required this.onContinue,
+  });
+
+  final bool showContinue;
+  final String statusText;
+  final VoidCallback onFinished;
+  final Future<void> Function() onContinue;
+
+  @override
+  State<IntroOnboardingScreen> createState() => _IntroOnboardingScreenState();
+}
+
+class _IntroOnboardingScreenState extends State<IntroOnboardingScreen>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  bool _finished = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1400),
+    )..forward();
+    _controller.addStatusListener((status) {
+      if (!_finished && status == AnimationStatus.completed) {
+        _finished = true;
+        widget.onFinished();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final slide = Tween<Offset>(
+      begin: const Offset(0, 1.4),
+      end: Offset.zero,
+    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic));
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF4EDE3),
+      body: _WarmPaperBackground(
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(24, 24, 24, 30),
+            child: Column(
+              children: [
+                const Spacer(),
+                SlideTransition(
+                  position: slide,
+                  child: const Text(
+                    'Hello Again',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 48,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF3C2A20),
+                      letterSpacing: -1.2,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 18),
+                Text(
+                  widget.statusText,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 17,
+                    height: 1.45,
+                    color: Color(0xFF6A5447),
+                  ),
+                ),
+                const Spacer(),
+                AnimatedOpacity(
+                  opacity: widget.showContinue ? 1 : 0,
+                  duration: const Duration(milliseconds: 420),
+                  curve: Curves.easeOut,
+                  child: AnimatedSlide(
+                    offset: widget.showContinue
+                        ? Offset.zero
+                        : const Offset(0, 0.16),
+                    duration: const Duration(milliseconds: 420),
+                    curve: Curves.easeOutCubic,
+                    child: IgnorePointer(
+                      ignoring: !widget.showContinue,
+                      child: SizedBox(
+                        width: double.infinity,
+                        child: FilledButton(
+                          onPressed: widget.onContinue,
+                          style: FilledButton.styleFrom(
+                            backgroundColor: const Color(0xFFB56B4D),
+                            foregroundColor: Colors.white,
+                            padding: const EdgeInsets.symmetric(vertical: 18),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(22),
+                            ),
+                          ),
+                          child: const Text(
+                            'Continue',
+                            style: TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class RegistrationScreen extends StatelessWidget {
+  const RegistrationScreen({
+    super.key,
+    required this.title,
+    required this.prompt,
+    required this.statusText,
+    required this.transcript,
+    required this.isListening,
+    required this.isWorking,
+    required this.isConfirming,
+    required this.stepNumber,
+    required this.stepCount,
+    required this.onRetry,
+  });
+
+  final String title;
+  final String prompt;
+  final String statusText;
+  final String transcript;
+  final bool isListening;
+  final bool isWorking;
+  final bool isConfirming;
+  final int stepNumber;
+  final int stepCount;
+  final Future<void> Function() onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final progress = stepCount == 0 ? 0.0 : stepNumber / stepCount;
+    final indicatorColor = isListening
+        ? const Color(0xFFB56B4D)
+        : isConfirming
+        ? const Color(0xFF7A8B67)
+        : const Color(0xFFC8B6A1);
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF4EDE3),
+      body: _WarmPaperBackground(
+        child: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
+            child: Column(
+              children: [
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.82),
+                    borderRadius: BorderRadius.circular(28),
+                    border: Border.all(color: const Color(0xFFE5D6C7)),
+                    boxShadow: [
+                      BoxShadow(
+                        color: const Color(0xFF8B6A55).withValues(alpha: 0.09),
+                        blurRadius: 26,
+                        offset: const Offset(0, 12),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Step $stepNumber of $stepCount',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF8E725F),
+                          letterSpacing: 0.2,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(999),
+                        child: LinearProgressIndicator(
+                          value: progress.clamp(0, 1),
+                          minHeight: 6,
+                          backgroundColor: const Color(0xFFE9DDD1),
+                          valueColor: const AlwaysStoppedAnimation<Color>(
+                            Color(0xFFB56B4D),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 22),
+                      Text(
+                        title,
+                        style: const TextStyle(
+                          fontSize: 28,
+                          height: 1.1,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF2F241D),
+                        ),
+                      ),
+                      const SizedBox(height: 14),
+                      Text(
+                        prompt,
+                        style: const TextStyle(
+                          fontSize: 18,
+                          height: 1.48,
+                          color: Color(0xFF625247),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                Expanded(
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(20),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.70),
+                      borderRadius: BorderRadius.circular(28),
+                      border: Border.all(color: const Color(0xFFE8DCCF)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        AnimatedContainer(
+                          duration: const Duration(milliseconds: 220),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: indicatorColor.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 10,
+                                height: 10,
+                                decoration: BoxDecoration(
+                                  color: indicatorColor,
+                                  shape: BoxShape.circle,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                isListening
+                                    ? 'Listening'
+                                    : isConfirming
+                                    ? 'Waiting for confirmation'
+                                    : 'Your answer',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w700,
+                                  color: indicatorColor,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        Text(
+                          transcript.isEmpty
+                              ? 'Speak calmly. I will fill in the answer for you.'
+                              : transcript,
+                          style: const TextStyle(
+                            fontSize: 24,
+                            height: 1.42,
+                            color: Color(0xFF312620),
+                          ),
+                        ),
+                        const Spacer(),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(16),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF8F1E8),
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Text(
+                            statusText,
+                            style: const TextStyle(
+                              fontSize: 15,
+                              height: 1.45,
+                              color: Color(0xFF6D5A4E),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton(
+                    onPressed: isWorking ? null : onRetry,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF6B5444),
+                      side: const BorderSide(color: Color(0xFFD6C4B2)),
+                      backgroundColor: Colors.white.withValues(alpha: 0.60),
+                      padding: const EdgeInsets.symmetric(vertical: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(22),
+                      ),
+                    ),
+                    child: Text(
+                      isListening ? 'Listening...' : 'Repeat question',
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _WarmPaperBackground extends StatelessWidget {
+  const _WarmPaperBackground({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        const ColoredBox(color: Color(0xFFF4EDE3)),
+        Positioned(
+          top: -28,
+          right: -10,
+          child: _BackdropOrb(diameter: 180, color: const Color(0xFFE8D7C6)),
+        ),
+        Positioned(
+          top: 120,
+          left: -46,
+          child: _BackdropOrb(diameter: 128, color: const Color(0xFFE3D4C3)),
+        ),
+        Positioned(
+          bottom: -44,
+          right: 18,
+          child: _BackdropOrb(diameter: 168, color: const Color(0xFFDDCBB8)),
+        ),
+        Positioned.fill(
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.06),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.22)),
+            ),
+          ),
+        ),
+        child,
+      ],
+    );
+  }
+}
+
+class _BackdropOrb extends StatelessWidget {
+  const _BackdropOrb({required this.diameter, required this.color});
+
+  final double diameter;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: diameter,
+      height: diameter,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: color.withValues(alpha: 0.42),
+        boxShadow: [
+          BoxShadow(
+            color: color.withValues(alpha: 0.22),
+            blurRadius: 48,
+            spreadRadius: 8,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RegistrationStep {
+  const _RegistrationStep({
+    required this.id,
+    required this.title,
+    required this.prompt,
+  });
+
+  final String id;
+  final String title;
+  final String prompt;
 }
 
 class AppAccountSession {
@@ -254,25 +1098,28 @@ class AppAccountSession {
     required this.token,
     required this.userId,
     required this.displayName,
+    this.phoneNumber = '',
   });
 
   final String token;
   final int userId;
   final String displayName;
+  final String phoneNumber;
 
   AppAccountSession copyWith({
     String? token,
     int? userId,
     String? displayName,
+    String? phoneNumber,
   }) {
     return AppAccountSession(
       token: token ?? this.token,
       userId: userId ?? this.userId,
       displayName: displayName ?? this.displayName,
+      phoneNumber: phoneNumber ?? this.phoneNumber,
     );
   }
 }
-
 class AgentBoardScreen extends StatefulWidget {
   const AgentBoardScreen({
     super.key,
@@ -318,6 +1165,10 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       _lastSpeech = widget.welcomeText!.trim();
     }
     unawaited(_hydrateBoardFromBackend());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _ensureVoiceLoopStartedAutomatically();
+    });
   }
 
   @override
@@ -421,6 +1272,27 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     final message = _promptController.text.trim();
     if (message.isEmpty || _isBusy || _isListening) return;
     await _submitPrompt(message: message, triggeredBySpeech: false);
+  }
+
+  void _ensureVoiceLoopStartedAutomatically() {
+    if (_voiceLoopEnabled || _isBusy) {
+      return;
+    }
+    if (!_voiceBridge.isSpeechRecognitionSupported) {
+      setState(() {
+        _statusText =
+            'Always-listening voice is unavailable here. Open the app in a supported Chrome browser to use hands-free mode.';
+      });
+      return;
+    }
+
+    final token = _voiceLoopToken + 1;
+    setState(() {
+      _voiceLoopEnabled = true;
+      _voiceLoopToken = token;
+      _statusText = 'Voice conversation mode is on automatically. Listening...';
+    });
+    unawaited(_runVoiceLoop(token));
   }
 
   void _toggleVoiceLoop() {
@@ -1906,6 +2778,7 @@ class AgentBackendClient {
       userId: int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0,
       displayName: (profile['display_name'] ?? profile['name'] ?? 'Friend')
           .toString(),
+      phoneNumber: (profile['phone_number'] ?? '').toString().trim(),
     );
   }
 
@@ -1932,6 +2805,7 @@ class AgentBackendClient {
       token: (payload['token'] ?? '').toString(),
       userId: int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0,
       displayName: (profile['display_name'] ?? name).toString(),
+      phoneNumber: (profile['phone_number'] ?? phoneNumber).toString().trim(),
     );
   }
 

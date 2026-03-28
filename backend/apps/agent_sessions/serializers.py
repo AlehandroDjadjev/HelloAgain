@@ -43,7 +43,7 @@ class AgentSessionCreateSerializer(serializers.Serializer):
     input_mode = serializers.ChoiceField(choices=["voice", "text"], default="voice")
     reasoning_provider = serializers.ChoiceField(
         choices=ReasoningProvider.values,
-        default=ReasoningProvider.LOCAL,
+        default=ReasoningProvider.OPENAI,
     )
     supported_packages = serializers.ListField(
         child=serializers.CharField(max_length=255),
@@ -56,6 +56,45 @@ class SessionCreateResponseSerializer(serializers.Serializer):
     session_id = serializers.UUIDField()
     status = serializers.CharField()
     reasoning_provider = serializers.ChoiceField(choices=ReasoningProvider.values)
+
+
+class AgentCommandSubmitSerializer(serializers.Serializer):
+    """
+    POST /api/agent/command/
+    One-shot convenience wrapper for the session-based automation pipeline.
+    """
+    prompt = serializers.CharField(min_length=1)
+    device_id = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_blank=True,
+        default="",
+    )
+    input_mode = serializers.ChoiceField(choices=["voice", "text"], default="text")
+    reasoning_provider = serializers.ChoiceField(
+        choices=ReasoningProvider.values,
+        default=ReasoningProvider.OPENAI,
+    )
+    supported_packages = serializers.ListField(
+        child=serializers.CharField(max_length=255),
+        required=False,
+        default=list,
+    )
+
+
+class NavigationPrepareSerializer(serializers.Serializer):
+    prompt = serializers.CharField(min_length=1)
+    device_id = serializers.CharField(
+        max_length=255,
+        required=False,
+        allow_blank=True,
+        default="",
+    )
+    supported_packages = serializers.ListField(
+        child=serializers.CharField(max_length=255),
+        required=False,
+        default=list,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +203,23 @@ class IntentReadyResponseSerializer(serializers.Serializer):
     execution_ready   = serializers.BooleanField()
     can_auto_compile  = serializers.BooleanField()
     session_status    = serializers.CharField()
+
+
+class AgentCommandResponseSerializer(serializers.Serializer):
+    session_id = serializers.UUIDField()
+    session_status = serializers.CharField()
+    reasoning_provider = serializers.ChoiceField(choices=ReasoningProvider.values)
+    intent = serializers.DictField()
+    execution_ready = serializers.BooleanField()
+    can_auto_compile = serializers.BooleanField()
+
+
+class NavigationPrepareResponseSerializer(serializers.Serializer):
+    session_id = serializers.UUIDField()
+    session_status = serializers.CharField()
+    intent = serializers.DictField()
+    execution_ready = serializers.BooleanField()
+    debug = serializers.DictField(required=False)
 
 
 # ---------------------------------------------------------------------------

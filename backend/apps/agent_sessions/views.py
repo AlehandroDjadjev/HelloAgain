@@ -43,12 +43,16 @@ from .execution_service import ExecutionService
 from .models import AgentSession, ConfirmationRecord, SessionStatus
 from .serializers import (
     ActionResultV2Serializer,
+    AgentCommandResponseSerializer,
+    AgentCommandSubmitSerializer,
     AgentSessionCreateSerializer,
     AgentSessionDetailSerializer,
     ConfirmationRecordSerializer,
     ExecutionDecisionSerializer,
     IntentReadyResponseSerializer,
     IntentSubmitSerializer,
+    NavigationPrepareResponseSerializer,
+    NavigationPrepareSerializer,
     NextStepRequestSerializer,
     PendingConfirmationResponseSerializer,
     SessionApproveSerializer,
@@ -118,6 +122,90 @@ def _user_id_from_request(request: Request) -> str:
     if request.user and request.user.is_authenticated:
         return str(request.user.pk)
     return request.data.get("user_id", "anonymous")
+
+
+def _prepare_session_for_transcript(
+    session: AgentSession,
+    transcript: str,
+) -> dict:
+    clean_transcript = transcript.strip()
+    if session.transcript != clean_transcript:
+        session.transcript = clean_transcript
+        session.save(update_fields=["transcript", "updated_at"])
+
+    svc = IntentService(
+        client=LLMClient.from_reasoning_provider(session.reasoning_provider)
+    )
+    intent_result = svc.parse_intent(
+        transcript=clean_transcript,
+        supported_packages=list(session.supported_packages) or None,
+    )
+
+    PlanService.store_intent(
+        session=session,
+        raw_transcript=clean_transcript,
+        parsed_intent=intent_result.to_dict(),
+        llm_raw_response=intent_result.raw_llm_response,
+        goal_type=intent_result.goal_type,
+        confidence=intent_result.confidence,
+        ambiguity_flags=intent_result.ambiguity_flags,
+    )
+
+    session.store_intent_data(
+        goal=intent_result.goal,
+        target_app=intent_result.app_package,
+        entities=intent_result.entities or {},
+        risk_level=intent_result.risk_level or "low",
+    )
+
+    if session.status not in SessionService.TERMINAL:
+        if session.status not in (
+            SessionStatus.EXECUTING,
+            SessionStatus.AWAITING_CONFIRMATION,
+        ):
+            if session.status == SessionStatus.CREATED:
+                SessionService.transition(session, SessionStatus.PLANNING)
+                session.refresh_from_db()
+            if session.status not in (
+                SessionStatus.EXECUTING,
+                SessionStatus.AWAITING_CONFIRMATION,
+            ):
+                SessionService.transition(session, SessionStatus.EXECUTING)
+                session.refresh_from_db()
+
+        if not session.started_at:
+            session.started_at = datetime.now(timezone.utc)
+            session.save(update_fields=["started_at", "updated_at"])
+
+    session.refresh_from_db()
+    return {
+        "intent": intent_result.to_dict(),
+        "execution_ready": session.status == SessionStatus.EXECUTING,
+        "can_auto_compile": PlanCompiler.has_template(
+            intent_result.goal_type,
+            intent_result.app_package,
+        ),
+        "session_status": session.status,
+    }
+
+
+def _create_prepared_command_session(
+    request: Request,
+    validated_data: dict,
+) -> tuple[AgentSession, dict]:
+    session = SessionService.create(
+        user_id=_user_id_from_request(request),
+        device_id=validated_data["device_id"],
+        transcript=validated_data["prompt"],
+        input_mode=validated_data["input_mode"],
+        reasoning_provider=validated_data["reasoning_provider"],
+        supported_packages=validated_data["supported_packages"],
+    )
+    response_payload = _prepare_session_for_transcript(
+        session,
+        validated_data["prompt"],
+    )
+    return session, response_payload
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +366,133 @@ class SessionIntentView(APIView):
                 "session_status":   session.status,
             }).data,
             status=status.HTTP_200_OK,
+        )
+
+
+class AgentCommandView(APIView):
+    """
+    POST /api/agent/command/
+
+    One-shot wrapper for the session-based Android pipeline. Accepts a text
+    prompt, creates a session, parses intent, and returns a prepared session
+    in one round-trip.
+    """
+
+    def post(self, request: Request) -> Response:
+        ser = AgentCommandSubmitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        session, response_payload = _create_prepared_command_session(request, d)
+
+        return Response(
+            AgentCommandResponseSerializer({
+                "session_id": session.id,
+                "session_status": response_payload["session_status"],
+                "reasoning_provider": session.reasoning_provider,
+                "intent": response_payload["intent"],
+                "execution_ready": response_payload["execution_ready"],
+                "can_auto_compile": response_payload["can_auto_compile"],
+            }).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PhoneCommandView(APIView):
+    """
+    POST /api/agent/phone-command/
+
+    Single URL for the stripped Run Phone Command flow. Accepts a prompt and
+    returns a prepared executable session in one round-trip so the frontend can
+    immediately continue with the device execution loop.
+    """
+
+    def post(self, request: Request) -> Response:
+        ser = AgentCommandSubmitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+        session, response_payload = _create_prepared_command_session(request, d)
+
+        return Response(
+            AgentCommandResponseSerializer({
+                "session_id": session.id,
+                "session_status": response_payload["session_status"],
+                "reasoning_provider": session.reasoning_provider,
+                "intent": response_payload["intent"],
+                "execution_ready": response_payload["execution_ready"],
+                "can_auto_compile": response_payload["can_auto_compile"],
+            }).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class NavigationPrepareView(APIView):
+    """
+    POST /api/agent/navigation/prepare/
+
+    Deterministic navigation-only preparation endpoint.
+    This bypasses the local/Qwen parsing path and compiles the Google Maps
+    plan immediately so the mobile client can execute in plan mode while the
+    session stays on the OpenAI side for any downstream fallback work.
+    """
+
+    def post(self, request: Request) -> Response:
+        ser = NavigationPrepareSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        session = SessionService.create(
+            user_id=_user_id_from_request(request),
+            device_id=d["device_id"],
+            transcript=d["prompt"],
+            input_mode="text",
+            reasoning_provider="openai",
+            supported_packages=d["supported_packages"],
+        )
+
+        intent_result = IntentService.parse_navigation_only(d["prompt"])
+        destination = str((intent_result.entities or {}).get("destination", "")).strip()
+        if (
+            intent_result.goal_type not in ("navigate_to", "start_navigation")
+            or intent_result.app_package != "com.google.android.apps.maps"
+            or destination == ""
+        ):
+            SessionService.cancel(session)
+            return Response(
+                {"detail": "The navigation request is too unclear. Add a destination."},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        PlanService.store_intent(
+            session=session,
+            raw_transcript=d["prompt"].strip(),
+            parsed_intent=intent_result.to_dict(),
+            llm_raw_response=intent_result.raw_llm_response,
+            goal_type=intent_result.goal_type,
+            confidence=intent_result.confidence,
+            ambiguity_flags=intent_result.ambiguity_flags,
+        )
+
+        compiled_plan = PlanCompiler.compile(intent_result, str(session.id))
+        plan_record = PlanService.store_plan(session=session, validated_plan=compiled_plan)
+        approved_plan = PlanService.approve_plan(session=session)
+        session.refresh_from_db()
+
+        return Response(
+            NavigationPrepareResponseSerializer({
+                "session_id": session.id,
+                "session_status": session.status,
+                "intent": intent_result.to_dict(),
+                "execution_ready": session.status == SessionStatus.APPROVED,
+                "debug": {
+                    "plan_id": str(approved_plan.id),
+                    "step_count": approved_plan.step_count,
+                    "executor_hint": PlanService.get_executor_hint(intent_result.app_package),
+                    "steps": approved_plan.steps,
+                    "destination": destination,
+                },
+            }).data,
+            status=status.HTTP_201_CREATED,
         )
 
 

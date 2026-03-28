@@ -47,8 +47,11 @@ _POSITIVE_PREFERENCE_VERBS = {
     "enjoys",
     "харесвам",
     "обичам",
+    "обожавам",
     "предпочитам",
     "искам",
+    "понасям",
+    "търпя",
 }
 
 _NEGATIVE_PREFERENCE_VERBS = {
@@ -64,6 +67,8 @@ _NEGATIVE_PREFERENCE_VERBS = {
     "нехаресвам",
     "необичам",
     "неискам",
+    "непонасям",
+    "нетърпя",
 }
 
 _OBJECT_STOPWORDS = {

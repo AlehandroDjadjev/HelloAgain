@@ -1,6 +1,9 @@
 from django.urls import path
 
 from .views import (
+    AgentCommandView,
+    NavigationPrepareView,
+    PhoneCommandView,
     ConfirmationApproveView,
     ConfirmationRejectView,
     SessionActionResultView,
@@ -17,6 +20,10 @@ from .views import (
 )
 
 urlpatterns = [
+    path("command/", AgentCommandView.as_view(), name="agent-command"),
+    path("phone-command/", PhoneCommandView.as_view(), name="phone-command"),
+    path("navigation/prepare/", NavigationPrepareView.as_view(), name="navigation-prepare"),
+
     # Session lifecycle
     path("sessions/", SessionCreateView.as_view(), name="session-create"),
     path("sessions/<uuid:session_id>/", SessionDetailView.as_view(), name="session-detail"),

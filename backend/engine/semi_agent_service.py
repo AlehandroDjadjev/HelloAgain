@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Dict, List
+from urllib.parse import quote_plus
 
 from .custom_mcp_registry import CustomMcpRegistry
 from .llm_parser import QwenPromptParser
@@ -27,6 +28,16 @@ if TYPE_CHECKING:
 
 
 class SemiAgentService:
+    SUPPORTED_MCP_TOOLS = {
+        "gnn_actions": {"add_action", "fetch_action", "conversation"},
+        "connections": {"update_profile", "find_connection"},
+        "phone_command": {"open_phone_command"},
+    }
+    SUPPORTED_TOOL_NAMES = {
+        tool_name
+        for tool_names in SUPPORTED_MCP_TOOLS.values()
+        for tool_name in tool_names
+    }
     BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS = 256
     BOARD_PIPELINE_JSON_CONTINUATION_BUDGET = 0
     RUN_JOB_TTL_SECONDS = 900
@@ -1274,6 +1285,11 @@ class SemiAgentService:
                 user_id=user_id,
                 board_state=board_state,
             )
+        if mcp_id == "phone_command":
+            return self._dispatch_phone_command_tool(
+                tool_name=tool_name,
+                prompt=prompt,
+            )
         raise ValueError(f"Unsupported MCP '{mcp_id}'.")
 
     def _dispatch_gnn_tool(
@@ -1318,6 +1334,23 @@ class SemiAgentService:
             )
         raise ValueError(f"Unsupported tool '{tool_name}'.")
 
+    def _dispatch_phone_command_tool(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+    ) -> Dict[str, Any]:
+        if tool_name != "open_phone_command":
+            raise ValueError(f"Unsupported tool '{tool_name}'.")
+        encoded_prompt = quote_plus(prompt)
+        return {
+            "ok": True,
+            "prompt": prompt,
+            "open_url": f"/api/agent/phone-command/open/?prompt={encoded_prompt}",
+            "deep_link": f"helloagain://phone-command?prompt={encoded_prompt}",
+            "message": "Phone command app handoff is ready.",
+        }
+
     def _summarize_mcp_result(self, mcp_id: str, tool_name: str, result: Dict[str, Any]) -> str:
         if mcp_id == "connections":
             if tool_name == "find_connection":
@@ -1332,6 +1365,11 @@ class SemiAgentService:
                 if description:
                     return f"Updated your connection profile: {description[:180]}"
                 return self._clean_text(result.get("message")) or "Profile update finished."
+        if mcp_id == "phone_command":
+            launch_prompt = self._clean_text(result.get("prompt"))
+            if launch_prompt:
+                return f"Prepared the phone command handoff for {launch_prompt}."
+            return self._clean_text(result.get("message")) or "Phone command handoff is ready."
         if tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             chosen_name = self._clean_text(chosen.get("name"))
@@ -2367,6 +2405,8 @@ class SemiAgentService:
                 return self._clip_focus_title(candidate)
         elif mcp_id == "connections" and tool_name == "update_profile":
             return "Profile Update"
+        elif mcp_id == "phone_command" and tool_name == "open_phone_command":
+            return "Phone Command"
         elif tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             candidate = self._clean_text(chosen.get("name"))

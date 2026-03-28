@@ -44,6 +44,7 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertEqual(payload["mcps"][0]["id"], "gnn_actions")
         self.assertTrue(payload["mcps"][0]["descriptor_url"].endswith("/api/agent/mcps/gnn_actions/"))
         self.assertTrue(any(item["id"] == "connections" for item in payload["mcps"]))
+        self.assertTrue(any(item["id"] == "phone_command" for item in payload["mcps"]))
 
         descriptor = registry.load_descriptor("gnn_actions", base_url="http://localhost:8000")
         self.assertEqual(descriptor["id"], "gnn_actions")
@@ -54,6 +55,11 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertEqual(connections_descriptor["id"], "connections")
         self.assertEqual(len(connections_descriptor["tools"]), 2)
         self.assertTrue(connections_descriptor["invoke_url"].endswith("/api/agent/mcps/connections/invoke/"))
+
+        phone_command_descriptor = registry.load_descriptor("phone_command", base_url="http://localhost:8000")
+        self.assertEqual(phone_command_descriptor["id"], "phone_command")
+        self.assertEqual(len(phone_command_descriptor["tools"]), 1)
+        self.assertTrue(phone_command_descriptor["invoke_url"].endswith("/api/agent/mcps/phone_command/invoke/"))
 
     def test_service_builds_tool_catalog_from_registry_descriptors(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -242,6 +248,39 @@ class WhiteboardMemoryStoreTests(SimpleTestCase):
 
             self.assertEqual(normalized["objects"][0]["extraData"]["kind"], "user")
             self.assertEqual(normalized["objects"][0]["extraData"]["user_id"], 12)
+
+
+class NavigationPageTests(SimpleTestCase):
+    def test_home_page_uses_navigation_surface(self) -> None:
+        response = self.client.get("/?prompt=Take%20me%20home")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Navigation")
+        self.assertContains(response, "Take me home")
+        self.assertNotContains(response, "Preference Graph Console")
+
+    def test_navigation_api_redirects_to_navigation_page(self) -> None:
+        response = self.client.post(
+            "/api/agent/navigation/",
+            data='{"prompt":"Take me to Central Park"}',
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "/?prompt=Take+me+to+Central+Park")
+
+    def test_phone_command_open_redirects_to_flutter_deep_link(self) -> None:
+        response = self.client.post(
+            "/api/agent/phone-command/open/",
+            data='{"prompt":"Open Chrome"}',
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response["Location"],
+            "helloagain://phone-command?prompt=Open+Chrome",
+        )
 
 
 class SemiAgentServiceTests(SimpleTestCase):

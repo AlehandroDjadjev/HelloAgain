@@ -1,6 +1,8 @@
 from django.urls import path
 from .views import (
     add_action_view,
+    agent_navigation_view,
+    agent_phone_command_open_view,
     agent_board_memory_view,
     agent_object_delete_view,
     agent_mcp_descriptor_view,
@@ -12,6 +14,7 @@ from .views import (
     agent_run_start_view,
     agent_run_whitespace_view,
     conversation_view,
+    console_view,
     fetch_action_view,
     home_view,
     qwen_health_view,
@@ -21,6 +24,7 @@ from .views import (
 
 urlpatterns = [
     path("", home_view, name="home"),
+    path("console/", console_view, name="console"),
     path("api/add-action/", add_action_view, name="add_action"),
     path("api/fetch-action/", fetch_action_view, name="fetch_action"),
     path("api/conversation/", conversation_view, name="conversation"),
@@ -32,6 +36,8 @@ urlpatterns = [
     path("api/agent/mcps/<str:mcp_id>/invoke/", agent_mcp_invoke_view, name="agent_mcp_invoke"),
     path("api/agent/board-memory/", agent_board_memory_view, name="agent_board_memory"),
     path("api/agent/run/", agent_run_view, name="agent_run"),
+    path("api/agent/navigation/", agent_navigation_view, name="agent_navigation"),
+    path("api/agent/phone-command/open/", agent_phone_command_open_view, name="agent_phone_command_open"),
     path("api/agent/run/start/", agent_run_start_view, name="agent_run_start"),
     path("api/agent/run/<str:run_id>/speech/", agent_run_speech_view, name="agent_run_speech"),
     path("api/agent/run/<str:run_id>/whitespace/", agent_run_whitespace_view, name="agent_run_whitespace"),
