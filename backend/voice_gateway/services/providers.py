@@ -24,7 +24,7 @@ DEFAULT_GOOGLE_SPEECH_API_VERSION = "v1"
 DEFAULT_GOOGLE_SPEECH_MODEL = "latest_long"
 DEFAULT_GOOGLE_SPEECH_LOCATION = "global"
 DEFAULT_GOOGLE_SPEECH_RECOGNIZER = "_"
-DEFAULT_OPENAI_MODEL = "gpt-5-mini"
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "You are HelloAgain, a warm real-time voice assistant. "
@@ -572,11 +572,18 @@ class OpenAILLMProvider(LLMProvider):
     def _normalize_reply(self, text: str) -> str:
         return " ".join(text.split()).strip()
 
-    def _request_openai(self, messages: list[dict[str, str]]) -> str:
+    def _request_openai(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        response_format: Optional[dict] = None,
+    ) -> str:
         payload = {
             "model": self.model,
             "messages": messages,
         }
+        if isinstance(response_format, dict) and response_format:
+            payload["response_format"] = response_format
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -620,6 +627,7 @@ class OpenAILLMProvider(LLMProvider):
         include_history: bool = True,
         history_prompt: Optional[str] = None,
         store_history: bool = True,
+        response_format: Optional[dict] = None,
     ):
         from voice_gateway.domain.contracts import LLMResult
 
@@ -652,7 +660,12 @@ class OpenAILLMProvider(LLMProvider):
         if not payload_messages:
             raise ValueError("At least one message is required for OpenAI generation.")
 
-        message = self._normalize_reply(self._request_openai(payload_messages))
+        message = self._normalize_reply(
+            self._request_openai(
+                payload_messages,
+                response_format=response_format,
+            )
+        )
         if not message:
             raise ValueError("OpenAI returned an empty response.")
 

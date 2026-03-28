@@ -269,6 +269,109 @@ class MeetupInviteNotificationApiTests(TestCase):
 		note_obj = MeetupNotification.objects.first()
 		self.assertEqual(note_obj.recipient_profile_id, self.invited_profile.id)
 
+	@patch('meetup.views.get_best_meetup_spot')
+	def test_propose_accepts_friend_name_and_resolves_only_accepted_friend(self, mock_best):
+		mock_best.return_value = {
+			'place_name': 'Talk Cafe',
+			'place_lat': 42.688,
+			'place_lng': 23.335,
+			'weather': 'Ясно',
+			'temperature': 23,
+			'score': 82,
+			'recommended_time': '2026-03-28 16:00',
+		}
+
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps({'friend_name': self.invited_profile.display_name}),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(response.json()['invite']['invited_user_id'], self.invited_user.id)
+
+	def test_propose_rejects_non_friend_user_id(self):
+		outsider_user = User.objects.create_user(username='outsider', password='x')
+		AccountProfile.objects.create(
+			user=outsider_user,
+			display_name='Outsider',
+			home_lat=42.681,
+			home_lng=23.321,
+		)
+
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps({'friend_user_id': outsider_user.id}),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 403)
+		self.assertEqual(response.json()['code'], 'FRIEND_REQUIRED')
+
+	def test_propose_rejects_invalid_friend_user_id(self):
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps({'friend_user_id': 'not-a-number'}),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json()['code'], 'INVALID_FRIEND')
+
+	def test_propose_rejects_unknown_friend_name(self):
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps({'friend_name': 'Несъществуващ приятел'}),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 404)
+		self.assertEqual(response.json()['code'], 'FRIEND_NOT_FOUND')
+
+	def test_propose_rejects_ambiguous_friend_name(self):
+		duplicate_user = User.objects.create_user(username='bob-2', password='x')
+		duplicate_profile = AccountProfile.objects.create(
+			user=duplicate_user,
+			display_name=self.invited_profile.display_name,
+			home_lat=42.682,
+			home_lng=23.322,
+		)
+		FriendRequest.objects.create(
+			from_profile=self.requester_profile,
+			to_profile=duplicate_profile,
+			status=FriendRequest.Status.ACCEPTED,
+		)
+
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps({'friend_name': self.invited_profile.display_name}),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json()['code'], 'FRIEND_NAME_AMBIGUOUS')
+
+	def test_propose_rejects_multiple_friend_selectors(self):
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps(
+				{
+					'friend_name': self.invited_profile.display_name,
+					'friend_user_id': self.invited_user.id,
+				}
+			),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json()['code'], 'MULTIPLE_FRIEND_SELECTORS')
+
 	def test_accept_creates_requester_notification_and_two_reminders(self):
 		proposed = timezone.now() + timedelta(hours=1)
 		invite = MeetupInvite.objects.create(

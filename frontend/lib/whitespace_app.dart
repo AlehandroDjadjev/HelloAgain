@@ -12,9 +12,20 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'browser_voice_bridge.dart';
 import 'src/config/backend_base_url.dart';
+import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
 
 Future<void> main() async {
+  await _runWhitespaceApp(
+    const WhitespaceLaunchConfig.boardOnlyFromEnvironment(),
+  );
+}
+
+Future<void> mainWithOnboarding() async {
+  await _runWhitespaceApp(const WhitespaceLaunchConfig.fromEnvironment());
+}
+
+Future<void> _runWhitespaceApp(WhitespaceLaunchConfig launchConfig) async {
   WidgetsFlutterBinding.ensureInitialized();
   try {
     await dotenv.load(fileName: '.env');
@@ -24,11 +35,16 @@ Future<void> main() async {
   await SystemChrome.setPreferredOrientations(const [
     DeviceOrientation.portraitUp,
   ]);
-  runApp(const AgentBoardApp());
+  runApp(AgentBoardApp(launchConfig: launchConfig));
 }
 
 class AgentBoardApp extends StatelessWidget {
-  const AgentBoardApp({super.key});
+  const AgentBoardApp({
+    super.key,
+    this.launchConfig = const WhitespaceLaunchConfig.fromEnvironment(),
+  });
+
+  final WhitespaceLaunchConfig launchConfig;
 
   @override
   Widget build(BuildContext context) {
@@ -40,25 +56,104 @@ class AgentBoardApp extends StatelessWidget {
         seedColor: const Color(0xFFBB5A3C),
         surfaceColor: const Color(0xFFFFFBF7),
       ),
-      home: const HelloAgainShell(),
+      home: StandaloneWhitespaceShell(launchConfig: launchConfig),
     );
   }
 }
 
-enum HelloAgainStage { booting, intro, onboarding, board }
+class WhitespaceLaunchConfig {
+  const WhitespaceLaunchConfig({
+    this.userId = '',
+    this.accountToken = '',
+    this.displayName = '',
+    this.skipStoredSessionLookup = false,
+    this.launchBoardDirectly = false,
+  });
 
-class HelloAgainShell extends StatefulWidget {
-  const HelloAgainShell({super.key});
+  const WhitespaceLaunchConfig.fromEnvironment()
+    : userId = const String.fromEnvironment('WHITESPACE_USER_ID'),
+      accountToken = const String.fromEnvironment('WHITESPACE_ACCOUNT_TOKEN'),
+      displayName = const String.fromEnvironment('WHITESPACE_DISPLAY_NAME'),
+      skipStoredSessionLookup = const bool.fromEnvironment(
+        'WHITESPACE_SKIP_STORED_SESSION_LOOKUP',
+        defaultValue: false,
+      ),
+      launchBoardDirectly = const bool.fromEnvironment(
+        'WHITESPACE_LAUNCH_BOARD_DIRECTLY',
+        defaultValue: false,
+      );
 
-  @override
-  State<HelloAgainShell> createState() => _HelloAgainShellState();
+  const WhitespaceLaunchConfig.boardOnly({
+    this.userId = 'whitespace_frontend_guest',
+    this.accountToken = '',
+    this.displayName = 'friend',
+    this.skipStoredSessionLookup = false,
+  }) : launchBoardDirectly = true;
+
+  const WhitespaceLaunchConfig.boardOnlyFromEnvironment()
+    : userId = const String.fromEnvironment(
+        'WHITESPACE_USER_ID',
+        defaultValue: 'whitespace_frontend_guest',
+      ),
+      accountToken = const String.fromEnvironment('WHITESPACE_ACCOUNT_TOKEN'),
+      displayName = const String.fromEnvironment(
+        'WHITESPACE_DISPLAY_NAME',
+        defaultValue: 'friend',
+      ),
+      skipStoredSessionLookup = const bool.fromEnvironment(
+        'WHITESPACE_SKIP_STORED_SESSION_LOOKUP',
+        defaultValue: false,
+      ),
+      launchBoardDirectly = true;
+
+  final String userId;
+  final String accountToken;
+  final String displayName;
+  final bool skipStoredSessionLookup;
+  final bool launchBoardDirectly;
+
+  String? get resolvedUserId {
+    final value = userId.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  String? get resolvedAccountToken {
+    final value = accountToken.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  String? get resolvedDisplayName {
+    final value = displayName.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  bool get hasExplicitLaunchData =>
+      resolvedUserId != null ||
+      resolvedAccountToken != null ||
+      resolvedDisplayName != null;
 }
 
-class _HelloAgainShellState extends State<HelloAgainShell> {
+enum HelloAgainStage { booting, intro, onboarding, board }
+
+class StandaloneWhitespaceShell extends StatefulWidget {
+  const StandaloneWhitespaceShell({
+    super.key,
+    this.launchConfig = const WhitespaceLaunchConfig.fromEnvironment(),
+  });
+
+  final WhitespaceLaunchConfig launchConfig;
+
+  @override
+  State<StandaloneWhitespaceShell> createState() =>
+      _StandaloneWhitespaceShellState();
+}
+
+class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
   static const _tokenKey = 'hello_again.account_token';
 
   late final AgentBackendClient _backendClient;
   late final BrowserVoiceBridge _voiceBridge;
+  _ResolvedWhitespaceLaunch? _launch;
 
   SharedPreferences? _prefs;
   HelloAgainStage _stage = HelloAgainStage.booting;
@@ -68,7 +163,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   bool _isWorking = false;
   bool _isConfirming = false;
   int _currentStepIndex = 0;
-  String _statusText = 'Подготвяме Hello Again...';
+  String _statusText = 'Preparing Hello Again...';
   String _promptText = '';
   String _transcriptPreview = '';
   final Map<String, String> _answers = <String, String>{};
@@ -76,37 +171,37 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   static const List<_RegistrationStep> _steps = [
     _RegistrationStep(
       id: 'name',
-      title: 'Вашето име',
-      prompt: 'Здравейте. Кажете ми как искате приложението да Ви нарича.',
+      title: 'Your name',
+      prompt: 'Hello. Tell me what you would like the app to call you.',
     ),
     _RegistrationStep(
       id: 'phone_number',
-      title: 'Телефонен номер',
+      title: 'Phone number',
       prompt:
-          'Сега кажете телефонния си номер бавно, цифра по цифра, за да създам профила Ви.',
+          'Now say your phone number slowly, digit by digit, so I can create your profile.',
     ),
     _RegistrationStep(
       id: 'description',
-      title: 'Няколко думи за Вас',
+      title: 'A few words about you',
       prompt:
-          'Разкажете ми с няколко спокойни изречения какъв човек сте, за да Ви опозная.',
+          'Tell me in a few calm sentences what kind of person you are so I can get to know you.',
     ),
     _RegistrationStep(
       id: 'ideal_company',
-      title: 'Приятна компания',
+      title: 'Good company',
       prompt:
-          'С какви хора се чувствате най-спокойно и приятно да прекарвате време?',
+          'What kind of people make you feel most comfortable and happy spending time together?',
     ),
     _RegistrationStep(
       id: 'favorite_things',
-      title: 'Любими теми',
+      title: 'Favorite topics',
       prompt:
-          'За какво най-много обичате да говорите или какво обичате да правите напоследък?',
+          'What do you most enjoy talking about, or what have you enjoyed doing lately?',
     ),
     _RegistrationStep(
       id: 'good_meetup',
-      title: 'Хубава среща',
-      prompt: 'Какво прави една среща топла, спокойна и успешна за Вас?',
+      title: 'A good meetup',
+      prompt: 'What makes a meetup feel warm, calm, and successful for you?',
     ),
   ];
 
@@ -127,29 +222,99 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
 
   Future<void> _bootstrap() async {
     final prefs = await SharedPreferences.getInstance();
-    AppAccountSession? session;
-    final storedToken = prefs.getString(_tokenKey) ?? '';
-    if (storedToken.isNotEmpty) {
-      try {
-        session = await _backendClient.fetchCurrentSession(token: storedToken);
-      } catch (_) {
-        await prefs.remove(_tokenKey);
-      }
-    }
+    final launch = await _resolveLaunch(prefs);
 
     if (!mounted) return;
     setState(() {
       _prefs = prefs;
-      _session = session;
-      _stage = HelloAgainStage.intro;
-      _statusText = session == null
-          ? 'Спокойното начало е готово.'
-          : 'Добре дошли отново. Отварям Вашето място.';
+      _launch = launch;
+      _session = launch?.session;
+      if (launch != null) {
+        _stage = HelloAgainStage.board;
+        _statusText = launch.welcomeText;
+      } else {
+        _stage = HelloAgainStage.intro;
+        _statusText = 'A calm start is ready.';
+      }
     });
   }
 
+  Future<_ResolvedWhitespaceLaunch?> _resolveLaunch(
+    SharedPreferences prefs,
+  ) async {
+    final explicitLaunch = await _resolveExplicitLaunch();
+    if (explicitLaunch != null) {
+      return explicitLaunch;
+    }
+
+    if (!widget.launchConfig.skipStoredSessionLookup) {
+      final storedToken = (prefs.getString(_tokenKey) ?? '').trim();
+      if (storedToken.isNotEmpty) {
+        try {
+          final session = await _backendClient.fetchCurrentSession(
+            token: storedToken,
+          );
+          return _ResolvedWhitespaceLaunch.fromSession(session);
+        } catch (_) {
+          await prefs.remove(_tokenKey);
+        }
+      }
+    }
+
+    if (widget.launchConfig.launchBoardDirectly) {
+      return _ResolvedWhitespaceLaunch.guest(
+        userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+        displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
+        welcomeText:
+            'Whitespace board launched directly. Onboarding was skipped for this entrypoint.',
+      );
+    }
+
+    return null;
+  }
+
+  Future<_ResolvedWhitespaceLaunch?> _resolveExplicitLaunch() async {
+    if (!widget.launchConfig.hasExplicitLaunchData) {
+      return null;
+    }
+
+    final explicitToken = widget.launchConfig.resolvedAccountToken;
+    if (explicitToken != null) {
+      try {
+        final session = await _backendClient.fetchCurrentSession(
+          token: explicitToken,
+        );
+        return _ResolvedWhitespaceLaunch.fromSession(
+          session.copyWith(
+            displayName:
+                widget.launchConfig.resolvedDisplayName ?? session.displayName,
+            userId:
+                int.tryParse(widget.launchConfig.resolvedUserId ?? '') ??
+                session.userId,
+          ),
+        );
+      } catch (_) {
+        return _ResolvedWhitespaceLaunch(
+          userId:
+              widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+          accountToken: explicitToken,
+          welcomeText:
+              'The provided token could not be verified at startup, but the whitespace board was launched directly.',
+          session: null,
+        );
+      }
+    }
+
+    return _ResolvedWhitespaceLaunch.guest(
+      userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+      displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
+      welcomeText:
+          'Whitespace board launched with an explicit local user identity and no login flow.',
+    );
+  }
+
   void _handleIntroFinished() {
-    if (_session != null) {
+    if (_session != null || _launch != null) {
       setState(() {
         _stage = HelloAgainStage.board;
       });
@@ -157,7 +322,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     }
     setState(() {
       _showContinue = true;
-      _statusText = 'Натиснете „Продължи“ и ще Ви преведа през регистрацията.';
+      _statusText = 'Tap Continue and I will guide you through registration.';
     });
   }
 
@@ -179,7 +344,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     if (!mounted) return;
     setState(() {
       _promptText = step.prompt;
-      _statusText = 'Сега ще Ви задам въпроса на глас.';
+      _statusText = 'I am about to ask the question out loud.';
       _transcriptPreview = '';
       _isWorking = true;
       _isListening = false;
@@ -193,7 +358,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         setState(() {
           _isListening = true;
           _isConfirming = false;
-          _statusText = 'Слушам Ви внимателно...';
+          _statusText = 'I am listening carefully...';
         });
 
         final capturedTurn = await _voiceBridge.captureAudioTurn(
@@ -204,12 +369,12 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
 
         if (normalized.isEmpty) {
           await _speakOnboardingText(
-            'Не успях да Ви чуя добре. Ще повторя въпроса.',
+            'I could not hear you clearly. I will repeat the question.',
           );
           if (!mounted) return;
           setState(() {
             _isListening = false;
-            _statusText = 'Не успях да чуя отговора ясно. Повтарям въпроса.';
+            _statusText = 'I could not hear the answer clearly. Repeating the question.';
           });
           continue;
         }
@@ -220,7 +385,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
           _isListening = false;
           _isConfirming = true;
           _statusText =
-              'Чух: „$normalized“. Кажете „да“ за потвърждение или „не“ за повторение.';
+              'I heard: "$normalized". Say yes to confirm or no to repeat.';
         });
 
         final confirmed = await _confirmTranscript(normalized);
@@ -228,7 +393,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         if (!confirmed) {
           setState(() {
             _isConfirming = false;
-            _statusText = 'Добре, ще задам въпроса отново.';
+            _statusText = 'Okay, I will ask the question again.';
           });
           continue;
         }
@@ -252,27 +417,27 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       });
       await Future<void>.delayed(const Duration(milliseconds: 260));
       await _runCurrentStep();
-    } catch (error) {
+    } catch (_) {
       if (!mounted) return;
       setState(() {
         _isListening = false;
         _isConfirming = false;
         _isWorking = false;
         _statusText =
-            'Не успях да чуя ясно. Натиснете веднъж и ще повторя текущия въпрос.';
+            'I could not hear clearly. Tap once and I will repeat the current question.';
       });
     }
   }
 
   Future<bool> _confirmTranscript(String transcript) async {
     await _speakOnboardingText(
-      'Чух: $transcript. Ако това е правилно, кажете да. Ако не е правилно, кажете не и ще повторя въпроса.',
+      'I heard: $transcript. If that is correct, say yes. If not, say no and I will repeat the question.',
     );
 
     while (mounted) {
       setState(() {
         _isListening = true;
-        _statusText = 'Моля, кажете само „да“ или „не“.';
+        _statusText = 'Please say only yes or no.';
       });
 
       final capturedTurn = await _voiceBridge.captureAudioTurn(
@@ -289,9 +454,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
 
       setState(() {
         _isListening = false;
-        _statusText = 'Не разбрах потвърждението. Ще попитам отново.';
+        _statusText = 'I did not understand the confirmation. I will ask again.';
       });
-      await _speakOnboardingText('Не разбрах. Моля кажете само да или не.');
+      await _speakOnboardingText('I did not understand. Please say only yes or no.');
     }
 
     return false;
@@ -336,32 +501,32 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       'eight': '8',
       'nine': '9',
       'plus': '+',
-      'нула': '0',
-      'едно': '1',
-      'две': '2',
-      'два': '2',
-      'три': '3',
-      'четири': '4',
-      'пет': '5',
-      'шест': '6',
-      'седем': '7',
-      'осем': '8',
-      'девет': '9',
+      'nula': '0',
+      'edno': '1',
+      'dve': '2',
+      'dva': '2',
+      'tri': '3',
+      'chetiri': '4',
+      'pet': '5',
+      'shest': '6',
+      'sedem': '7',
+      'osem': '8',
+      'devet': '9',
     };
 
     digitWords.addAll(const {
-      'нула': '0',
-      'едно': '1',
-      'две': '2',
-      'два': '2',
-      'три': '3',
-      'четири': '4',
-      'пет': '5',
-      'шест': '6',
-      'седем': '7',
-      'осем': '8',
-      'девет': '9',
-      'плюс': '+',
+      'nula': '0',
+      'edno': '1',
+      'dve': '2',
+      'dva': '2',
+      'tri': '3',
+      'chetiri': '4',
+      'pet': '5',
+      'shest': '6',
+      'sedem': '7',
+      'osem': '8',
+      'devet': '9',
+      'plyus': '+',
     });
 
     final pieces = clean
@@ -385,22 +550,19 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     final words = transcript
         .trim()
         .toLowerCase()
-        .replaceAll(RegExp(r'[^a-zа-я0-9\s]+', caseSensitive: false), ' ')
+        .replaceAll(RegExp(r'[^a-z0-9\s]+', caseSensitive: false), ' ')
         .split(RegExp(r'\s+'))
         .where((item) => item.isNotEmpty)
         .toList();
 
     const yesWords = {
-      'да',
       'yes',
       'yep',
       'correct',
-      'правилно',
-      'точно',
-      'добре',
-      'става',
+      'right',
+      'okay',
     };
-    const noWords = {'не', 'no', 'wrong', 'грешно', 'повтори', 'отново'};
+    const noWords = {'no', 'wrong', 'repeat', 'again'};
 
     if (words.any(yesWords.contains)) {
       return true;
@@ -436,7 +598,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   Future<void> _submitRegistration() async {
     if (!mounted) return;
     setState(() {
-      _statusText = 'Създавам Вашия профил...';
+      _statusText = 'Creating your profile...';
       _isWorking = true;
       _isConfirming = false;
     });
@@ -458,6 +620,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       if (!mounted) return;
       setState(() {
         _session = session;
+        _launch = _ResolvedWhitespaceLaunch.fromSession(session);
         _stage = HelloAgainStage.board;
         _isWorking = false;
       });
@@ -466,7 +629,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       setState(() {
         _isWorking = false;
         _statusText =
-            'Регистрацията не можа да завърши. Натиснете веднъж и ще повторя текущата стъпка. ${error.toString()}';
+            'Registration could not finish. Tap once and I will repeat the current step. ${error.toString()}';
       });
     }
   }
@@ -499,14 +662,58 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         );
       case HelloAgainStage.board:
         final session = _session;
+        final launch = _launch;
         return AgentBoardScreen(
-          userId: session?.userId.toString() ?? 'whitespace_frontend',
-          accountToken: session?.token,
+          userId:
+              session?.userId.toString() ??
+              launch?.userId ??
+              'whitespace_frontend',
+          accountToken: session?.token ?? launch?.accountToken,
           welcomeText: session == null
-              ? null
-              : 'Добре дошли, ${session.displayName}. Вашето място е готово.',
+              ? launch?.welcomeText
+              : 'Welcome, ${session.displayName}. Your space is ready.',
         );
     }
+  }
+}
+
+class _ResolvedWhitespaceLaunch {
+  const _ResolvedWhitespaceLaunch({
+    required this.userId,
+    this.accountToken,
+    required this.welcomeText,
+    this.session,
+  });
+
+  final String userId;
+  final String? accountToken;
+  final String welcomeText;
+  final AppAccountSession? session;
+
+  factory _ResolvedWhitespaceLaunch.fromSession(AppAccountSession session) {
+    return _ResolvedWhitespaceLaunch(
+      userId: session.userId.toString(),
+      accountToken: session.token,
+      welcomeText:
+          'Welcome back, ${session.displayName}. The whitespace board is ready.',
+      session: session,
+    );
+  }
+
+  factory _ResolvedWhitespaceLaunch.guest({
+    required String userId,
+    required String displayName,
+    required String welcomeText,
+  }) {
+    final cleanDisplayName = displayName.trim();
+    final fallbackWelcome = cleanDisplayName.isEmpty
+        ? 'Whitespace board ready.'
+        : 'Welcome, $cleanDisplayName. The whitespace board is ready.';
+    return _ResolvedWhitespaceLaunch(
+      userId: userId,
+      welcomeText: welcomeText.isEmpty ? fallbackWelcome : welcomeText,
+      session: null,
+    );
   }
 }
 
@@ -619,7 +826,7 @@ class _IntroOnboardingScreenState extends State<IntroOnboardingScreen>
                             ),
                           ),
                           child: const Text(
-                            'Продължи',
+                            'Continue',
                             style: TextStyle(
                               fontSize: 18,
                               fontWeight: FontWeight.w700,
@@ -701,7 +908,7 @@ class RegistrationScreen extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Стъпка $stepNumber от $stepCount',
+                        'Step $stepNumber of $stepCount',
                         style: const TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w700,
@@ -780,10 +987,10 @@ class RegistrationScreen extends StatelessWidget {
                               const SizedBox(width: 8),
                               Text(
                                 isListening
-                                    ? 'Слушам'
+                                    ? 'Listening'
                                     : isConfirming
-                                    ? 'Чакам потвърждение'
-                                    : 'Вашият отговор',
+                                    ? 'Waiting for confirmation'
+                                    : 'Your answer',
                                 style: TextStyle(
                                   fontSize: 14,
                                   fontWeight: FontWeight.w700,
@@ -796,7 +1003,7 @@ class RegistrationScreen extends StatelessWidget {
                         const SizedBox(height: 18),
                         Text(
                           transcript.isEmpty
-                              ? 'Говорете спокойно. Ще попълня отговора вместо Вас.'
+                              ? 'Speak calmly. I will fill in the answer for you.'
                               : transcript,
                           style: const TextStyle(
                             fontSize: 24,
@@ -840,7 +1047,7 @@ class RegistrationScreen extends StatelessWidget {
                       ),
                     ),
                     child: Text(
-                      isListening ? 'Слушам...' : 'Повтори въпроса',
+                      isListening ? 'Listening...' : 'Repeat question',
                       style: const TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.w700,
@@ -962,7 +1169,6 @@ class AppAccountSession {
     );
   }
 }
-
 class AgentBoardScreen extends StatefulWidget {
   const AgentBoardScreen({
     super.key,
@@ -985,6 +1191,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   late final BrowserVoiceBridge _voiceBridge;
   final TextEditingController _promptController = TextEditingController();
   late final String _sessionId;
+  _ActiveUserPopup? _activeUserPopup;
   String _lastSpeech =
       'The board is ready for the whitespace conversation pipeline.';
   String _statusText = 'Loading saved board memory...';
@@ -1028,17 +1235,17 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     try {
       final payload = await _backendClient.fetchBoardMemory(
         token: widget.accountToken,
+        userId: widget.userId,
       );
       final boardState = Map<String, dynamic>.from(
         payload['board_state'] as Map? ?? const {},
       );
       final objects = (boardState['objects'] as List?) ?? const [];
-      if (objects.isNotEmpty) {
-        await _sceneController.executeCommandMap({
-          'action': 'hydrateScene',
-          'objects': objects,
-        });
-      }
+      await _sceneController.executeCommandMap({
+        'action': 'hydrateScene',
+        'objects': objects,
+      });
+      _closePopupIfObjectMissing();
       if (!mounted) return;
       setState(() {
         _statusText = objects.isEmpty
@@ -1065,16 +1272,48 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       final payload = await _backendClient.openObject(
         object: object.toJson(),
         userId: widget.userId,
+        token: widget.accountToken,
       );
       await _applyCommands(payload['board_commands']);
       final viewer = Map<String, dynamic>.from(
         payload['viewer'] as Map? ?? const {},
       );
       if (mounted && viewer.isNotEmpty) {
-        await showDialog<void>(
-          context: context,
-          builder: (context) => AgentResultDialog(viewer: viewer),
-        );
+        final widgetType = (viewer['widget_type'] ?? '').toString();
+        if (widgetType == 'user_connection') {
+          setState(() {
+            _activeUserPopup = _ActiveUserPopup(
+              objectName: object.name,
+              viewer: viewer,
+            );
+          });
+        } else if (widgetType == 'phone_command_launcher') {
+          final prompt = (viewer['prompt'] ?? '').toString().trim();
+          final rawAutoRun = viewer['auto_run_on_open'];
+          final autoRunOnOpen = rawAutoRun is bool
+              ? rawAutoRun
+              : rawAutoRun?.toString().trim().toLowerCase() != 'false';
+          if (prompt.isNotEmpty) {
+            await Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => NavigationLauncherScreen(
+                  initialPrompt: prompt,
+                  autoRunOnOpen: autoRunOnOpen,
+                ),
+              ),
+            );
+          } else {
+            await showDialog<void>(
+              context: context,
+              builder: (context) => AgentResultDialog(viewer: viewer),
+            );
+          }
+        } else {
+          await showDialog<void>(
+            context: context,
+            builder: (context) => AgentResultDialog(viewer: viewer),
+          );
+        }
       }
       if (!mounted) return;
       setState(() {
@@ -1276,6 +1515,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         largestEmptySpace: _sceneController.findLargestEmptySpaceSnapshot(),
         userId: widget.userId,
         sessionId: _sessionId,
+        token: widget.accountToken,
       );
 
       final runId = (startPayload['run_id'] ?? '').toString();
@@ -1410,6 +1650,184 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         Map<String, dynamic>.from(rawCommand),
       );
     }
+    _closePopupIfObjectMissing();
+  }
+
+  Future<void> _removeBoardObject(SceneObjectData object) async {
+    await _sceneController.executeCommandMap({
+      'action': 'delete',
+      'name': object.name,
+    });
+  }
+
+  Future<void> _persistDeletedBoardObject(SceneObjectData object) async {
+    try {
+      final boardState = _sceneController.exportStateSnapshot();
+      final token = (widget.accountToken ?? '').trim();
+      if (token.isNotEmpty) {
+        await _backendClient.persistBoardMemory(
+          token: token,
+          boardState: boardState,
+          removedResultId: object.resultId,
+        );
+      } else {
+        await _backendClient.persistAnonymousBoardMemory(
+          userId: widget.userId,
+          boardState: boardState,
+          removedResultId: object.resultId,
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _statusText = 'Removed ${object.text} from the saved board state.';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _statusText =
+            'Removed ${object.text} locally, but could not save the board update. ${_formatError(error)}';
+      });
+    }
+  }
+
+  void _dismissUserPopup() {
+    if (!mounted) return;
+    setState(() {
+      _activeUserPopup = null;
+    });
+  }
+
+  void _closePopupIfObjectMissing() {
+    final popup = _activeUserPopup;
+    if (popup == null) return;
+    if (_sceneController.objects.containsKey(popup.objectName)) {
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _activeUserPopup = null;
+    });
+  }
+
+  Future<void> _persistBoardStateSilently() async {
+    final token = (widget.accountToken ?? '').trim();
+    try {
+      if (token.isNotEmpty) {
+        await _backendClient.persistBoardMemory(
+          token: token,
+          boardState: _sceneController.exportStateSnapshot(),
+        );
+      } else {
+        await _backendClient.persistAnonymousBoardMemory(
+          userId: widget.userId,
+          boardState: _sceneController.exportStateSnapshot(),
+        );
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _refreshBoardStateAndPopup({
+    bool closePopup = false,
+    Map<String, dynamic>? viewer,
+  }) async {
+    if (closePopup) {
+      _dismissUserPopup();
+    } else if (viewer != null && _activeUserPopup != null && mounted) {
+      setState(() {
+        _activeUserPopup = _activeUserPopup!.copyWith(viewer: viewer);
+      });
+    }
+    await _hydrateBoardFromBackend();
+  }
+
+  Future<void> _sendThreadMessage(int threadId, String message) async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      throw StateError(
+        'A logged-in account token is required to send messages.',
+      );
+    }
+    final payload = await _backendClient.sendThreadMessage(
+      threadId: threadId,
+      message: message,
+      token: token,
+    );
+    await _refreshBoardStateAndPopup(
+      viewer: Map<String, dynamic>.from(payload['viewer'] as Map? ?? const {}),
+    );
+  }
+
+  Future<void> _applyThreadFriendshipAction(
+    int threadId,
+    String action, {
+    String message = '',
+  }) async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      throw StateError(
+        'A logged-in account token is required for friendship actions.',
+      );
+    }
+    final payload = await _backendClient.applyThreadFriendshipAction(
+      threadId: threadId,
+      action: action,
+      token: token,
+      message: message,
+    );
+    await _refreshBoardStateAndPopup(
+      closePopup: (payload['removed'] ?? false) == true,
+      viewer: Map<String, dynamic>.from(payload['viewer'] as Map? ?? const {}),
+    );
+  }
+
+  Future<void> _rejectThread(int threadId) async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      throw StateError(
+        'A logged-in account token is required to reject a chat.',
+      );
+    }
+    await _backendClient.rejectThread(threadId: threadId, token: token);
+    await _refreshBoardStateAndPopup(closePopup: true);
+  }
+
+  Widget _buildUserPopup({
+    required Size boardSize,
+    required SceneObjectData object,
+    required Map<String, dynamic> viewer,
+  }) {
+    const popupWidth = 360.0;
+    const popupHeight = 430.0;
+    const gap = 18.0;
+    final width = math.min(popupWidth, math.max(280.0, boardSize.width - 24.0));
+    final height = math.min(
+      popupHeight,
+      math.max(260.0, boardSize.height - 140.0),
+    );
+    final prefersRight =
+        object.x + object.width + gap + width <= boardSize.width;
+    final dx = prefersRight
+        ? object.x + object.width + gap
+        : math.max(12.0, object.x - width - gap);
+    final dy = (object.y - 12.0)
+        .clamp(12.0, math.max(12.0, boardSize.height - height - 96.0))
+        .toDouble();
+
+    return Positioned(
+      left: dx,
+      top: dy,
+      child: SizedBox(
+        width: width,
+        height: height,
+        child: UserConnectionPopup(
+          viewer: viewer,
+          onClose: _dismissUserPopup,
+          onSendMessage: _sendThreadMessage,
+          onFriendshipAction: _applyThreadFriendshipAction,
+          onRejectChat: _rejectThread,
+        ),
+      ),
+    );
   }
 
   void _fillPromptFromTranscript(String transcript) {
@@ -1501,6 +1919,10 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                   constraints.maxWidth,
                   constraints.maxHeight,
                 );
+                final activePopup = _activeUserPopup;
+                final activePopupObject = activePopup == null
+                    ? null
+                    : _sceneController.objects[activePopup.objectName];
                 _sceneController.setBoardSize(boardSize);
 
                 return Stack(
@@ -1534,8 +1956,14 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 key: ValueKey(object.name),
                                 data: object,
                                 onTap: () => _openObjectResult(object),
-                                onDeleteComplete: () => _sceneController
-                                    .finalizeDelete(object.name),
+                                onRemovePressed: () {
+                                  unawaited(_removeBoardObject(object));
+                                },
+                                onDeleteComplete: () {
+                                  _sceneController.finalizeDelete(object.name);
+                                  _closePopupIfObjectMissing();
+                                  unawaited(_persistDeletedBoardObject(object));
+                                },
                                 onDragPositionChanged: (x, y) {
                                   _sceneController.setObjectPositionFromDrag(
                                     object.name,
@@ -1543,12 +1971,26 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                     y,
                                   );
                                 },
+                                onDragEnded: _persistBoardStateSilently,
                               ),
                             ),
                           ],
                         ),
                       ),
                     ),
+                    if (activePopup != null && activePopupObject != null) ...[
+                      Positioned.fill(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onTap: _dismissUserPopup,
+                        ),
+                      ),
+                      _buildUserPopup(
+                        boardSize: boardSize,
+                        object: activePopupObject,
+                        viewer: activePopup.viewer,
+                      ),
+                    ],
                     Positioned(
                       top: topInset,
                       left: horizontalPadding,
@@ -1782,6 +2224,438 @@ class AgentResponseCard extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _ActiveUserPopup {
+  const _ActiveUserPopup({required this.objectName, required this.viewer});
+
+  final String objectName;
+  final Map<String, dynamic> viewer;
+
+  _ActiveUserPopup copyWith({
+    String? objectName,
+    Map<String, dynamic>? viewer,
+  }) {
+    return _ActiveUserPopup(
+      objectName: objectName ?? this.objectName,
+      viewer: viewer ?? this.viewer,
+    );
+  }
+}
+
+class UserConnectionPopup extends StatefulWidget {
+  const UserConnectionPopup({
+    super.key,
+    required this.viewer,
+    required this.onClose,
+    required this.onSendMessage,
+    required this.onFriendshipAction,
+    required this.onRejectChat,
+  });
+
+  final Map<String, dynamic> viewer;
+  final VoidCallback onClose;
+  final Future<void> Function(int threadId, String message) onSendMessage;
+  final Future<void> Function(int threadId, String action, {String message})
+  onFriendshipAction;
+  final Future<void> Function(int threadId) onRejectChat;
+
+  @override
+  State<UserConnectionPopup> createState() => _UserConnectionPopupState();
+}
+
+class _UserConnectionPopupState extends State<UserConnectionPopup> {
+  final TextEditingController _messageController = TextEditingController();
+  bool _isSending = false;
+  String _errorText = '';
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _runAction(Future<void> Function() action) async {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _isSending = true;
+      _errorText = '';
+    });
+    try {
+      await action();
+      if (!mounted) return;
+      _messageController.clear();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorText = error.toString().trim();
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSending = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = Map<String, dynamic>.from(
+      widget.viewer['user'] as Map? ?? const {},
+    );
+    final thread = Map<String, dynamic>.from(
+      widget.viewer['thread'] as Map? ?? const {},
+    );
+    final counterparty = Map<String, dynamic>.from(
+      thread['counterparty'] as Map? ?? const {},
+    );
+    final messages = (thread['messages'] as List?) ?? const [];
+    final friendStatus = (thread['friend_status'] ?? 'none').toString();
+    final threadId = int.tryParse((thread['id'] ?? '').toString()) ?? 0;
+    final phoneNumber =
+        (counterparty['phone_number'] ?? user['phone_number'] ?? '').toString();
+    final description =
+        (counterparty['description'] ?? user['description'] ?? '').toString();
+    final sharedInterests =
+        ((user['match_summary'] as Map?)?['shared_interests'] as List?) ??
+        const [];
+
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.97),
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(
+            color: Colors.black.withValues(alpha: 0.08),
+            width: 0.9,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.18),
+              blurRadius: 28,
+              offset: const Offset(0, 18),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        (user['display_name'] ?? 'User').toString(),
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        phoneNumber.isEmpty
+                            ? 'No phone available'
+                            : phoneNumber,
+                        style: TextStyle(
+                          color: Colors.black.withValues(alpha: 0.58),
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  onPressed: _isSending ? null : widget.onClose,
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _PopupChip(
+                  text: friendStatus.replaceAll('_', ' '),
+                  color: friendStatus == 'accepted'
+                      ? const Color(0xFF356B46)
+                      : const Color(0xFF8D5B22),
+                ),
+                if (sharedInterests.isNotEmpty)
+                  _PopupChip(
+                    text: sharedInterests.take(2).join(' / '),
+                    color: const Color(0xFF4B647A),
+                  ),
+              ],
+            ),
+            if (description.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                description,
+                style: TextStyle(
+                  color: Colors.black.withValues(alpha: 0.76),
+                  height: 1.28,
+                ),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+            const SizedBox(height: 14),
+            Expanded(
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF7F0E7),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: messages.isEmpty
+                    ? Center(
+                        child: Text(
+                          'No messages yet. Say hi and see where it goes.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.black.withValues(alpha: 0.52),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      )
+                    : ListView.separated(
+                        itemCount: messages.length,
+                        separatorBuilder: (_, _) => const SizedBox(height: 10),
+                        itemBuilder: (context, index) {
+                          final message = Map<String, dynamic>.from(
+                            messages[index] as Map? ?? const {},
+                          );
+                          final isMe = message['is_me'] == true;
+                          return Align(
+                            alignment: isMe
+                                ? Alignment.centerRight
+                                : Alignment.centerLeft,
+                            child: Container(
+                              constraints: const BoxConstraints(maxWidth: 230),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isMe
+                                    ? const Color(0xFFB85A40)
+                                    : Colors.white,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Text(
+                                (message['text'] ?? '').toString(),
+                                style: TextStyle(
+                                  color: isMe ? Colors.white : Colors.black87,
+                                  height: 1.24,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                if (friendStatus == 'none')
+                  _PopupActionButton(
+                    label: 'Add friend',
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () => widget.onFriendshipAction(threadId, 'send'),
+                          ),
+                  ),
+                if (friendStatus == 'incoming_pending')
+                  _PopupActionButton(
+                    label: 'Accept friend',
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () => widget.onFriendshipAction(threadId, 'accept'),
+                          ),
+                  ),
+                if (friendStatus == 'incoming_pending')
+                  _PopupActionButton(
+                    label: 'Decline request',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () =>
+                                widget.onFriendshipAction(threadId, 'decline'),
+                          ),
+                  ),
+                if (friendStatus == 'outgoing_pending')
+                  _PopupActionButton(
+                    label: 'Cancel request',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () => widget.onFriendshipAction(threadId, 'cancel'),
+                          ),
+                  ),
+                if (friendStatus == 'accepted')
+                  _PopupActionButton(
+                    label: 'Unfriend',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () =>
+                                widget.onFriendshipAction(threadId, 'unfriend'),
+                          ),
+                  ),
+                if (friendStatus != 'accepted')
+                  _PopupActionButton(
+                    label: 'Reject chat',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(() => widget.onRejectChat(threadId)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFFF4E8D9),
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: TextField(
+                controller: _messageController,
+                enabled: !_isSending && threadId > 0,
+                minLines: 1,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                  hintText: 'Send a message...',
+                  border: InputBorder.none,
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 14,
+                  ),
+                ),
+                onSubmitted: (value) {
+                  final text = value.trim();
+                  if (text.isEmpty || _isSending || threadId <= 0) return;
+                  _runAction(() => widget.onSendMessage(threadId, text));
+                },
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _errorText,
+                    style: const TextStyle(
+                      color: Color(0xFF9F3A24),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: (_isSending || threadId <= 0)
+                      ? null
+                      : () {
+                          final text = _messageController.text.trim();
+                          if (text.isEmpty) return;
+                          _runAction(
+                            () => widget.onSendMessage(threadId, text),
+                          );
+                        },
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFFB85A40),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 13,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  child: Text(_isSending ? 'Sending' : 'Send'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PopupChip extends StatelessWidget {
+  const _PopupChip({required this.text, required this.color});
+
+  final String text;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 11,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+    );
+  }
+}
+
+enum _PopupButtonTone { primary, soft }
+
+class _PopupActionButton extends StatelessWidget {
+  const _PopupActionButton({
+    required this.label,
+    this.tone = _PopupButtonTone.primary,
+    this.onPressed,
+  });
+
+  final String label;
+  final _PopupButtonTone tone;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final isSoft = tone == _PopupButtonTone.soft;
+    return TextButton(
+      onPressed: onPressed,
+      style: TextButton.styleFrom(
+        backgroundColor: isSoft
+            ? const Color(0xFFF1E2D4)
+            : const Color(0xFFE7C4B4),
+        foregroundColor: const Color(0xFF70331F),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      ),
+      child: Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
     );
   }
 }
@@ -2042,8 +2916,41 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> fetchBoardMemory({String? token}) {
-    return _getJson('/api/agent/board-memory/', token: token);
+  Future<Map<String, dynamic>> fetchBoardMemory({String? token, String? userId}) {
+    final cleanToken = (token ?? '').trim();
+    if (cleanToken.isNotEmpty) {
+      return _getJson('/api/accounts/me/board-state/', token: cleanToken);
+    }
+    final cleanUserId = (userId ?? '').trim();
+    final path = cleanUserId.isEmpty
+        ? '/api/agent/board-memory/'
+        : '/api/agent/board-memory/?user_id=${Uri.encodeQueryComponent(cleanUserId)}';
+    return _getJson(path, token: token);
+  }
+
+  Future<Map<String, dynamic>> persistBoardMemory({
+    required String token,
+    required Map<String, dynamic> boardState,
+    String? removedResultId,
+  }) {
+    return _postJson('/api/accounts/me/board-state/', {
+      'board_state': boardState,
+      if ((removedResultId ?? '').trim().isNotEmpty)
+        'removed_result_id': removedResultId!.trim(),
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> persistAnonymousBoardMemory({
+    required String userId,
+    required Map<String, dynamic> boardState,
+    String? removedResultId,
+  }) {
+    return _postJson('/api/agent/board-memory/', {
+      'user_id': userId,
+      'board_state': boardState,
+      if ((removedResultId ?? '').trim().isNotEmpty)
+        'removed_result_id': removedResultId!.trim(),
+    });
   }
 
   Future<Map<String, dynamic>> transcribeSpeechTurn({
@@ -2075,6 +2982,7 @@ class AgentBackendClient {
     required Map<String, dynamic> largestEmptySpace,
     required String userId,
     required String sessionId,
+    String? token,
   }) {
     return _postJson('/api/agent/run/start/', {
       'prompt': prompt,
@@ -2082,7 +2990,7 @@ class AgentBackendClient {
       'largest_empty_space': largestEmptySpace,
       'user_id': userId,
       'session_id': sessionId,
-    });
+    }, token: token);
   }
 
   Future<Map<String, dynamic>> fetchAgentSpeech(String runId) {
@@ -2096,11 +3004,45 @@ class AgentBackendClient {
   Future<Map<String, dynamic>> openObject({
     required Map<String, dynamic> object,
     required String userId,
+    String? token,
   }) {
     return _postJson('/api/agent/open-object/', {
       'object': object,
       'user_id': userId,
-    });
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> sendThreadMessage({
+    required int threadId,
+    required String message,
+    required String token,
+  }) {
+    return _postJson('/api/accounts/threads/$threadId/messages/', {
+      'message': message,
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> applyThreadFriendshipAction({
+    required int threadId,
+    required String action,
+    required String token,
+    String message = '',
+  }) {
+    return _postJson('/api/accounts/threads/$threadId/friendship/', {
+      'action': action,
+      if (message.trim().isNotEmpty) 'message': message.trim(),
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> rejectThread({
+    required int threadId,
+    required String token,
+  }) {
+    return _postJson(
+      '/api/accounts/threads/$threadId/reject/',
+      const {},
+      token: token,
+    );
   }
 
   Future<Map<String, dynamic>> _getJson(String path, {String? token}) async {
@@ -2183,14 +3125,14 @@ class SceneController extends ChangeNotifier {
   Map<String, SceneObjectData> get objects => _objects;
 
   static const List<Color> _mainColors = [
-    Color(0xFFD36E6A),
-    Color(0xFF6E9ACC),
-    Color(0xFF6EA886),
-    Color(0xFFD59667),
-    Color(0xFF9A77B7),
-    Color(0xFFD7C46C),
-    Color(0xFF5FA39A),
-    Color(0xFFC4749C),
+    Color(0xFFB8928D),
+    Color(0xFF8FA6B6),
+    Color(0xFF93AA9A),
+    Color(0xFFB8A18E),
+    Color(0xFFA596B3),
+    Color(0xFFC0B792),
+    Color(0xFF8EA9A6),
+    Color(0xFFB39AA7),
   ];
 
   void setBoardSize(Size size) {
@@ -2563,7 +3505,7 @@ class SceneController extends ChangeNotifier {
   Color _randomMainColor() {
     return _desaturateColor(
       _mainColors[_random.nextInt(_mainColors.length)],
-      0.20,
+      0.42,
     );
   }
 
@@ -2575,7 +3517,7 @@ class SceneController extends ChangeNotifier {
     if (value == null) return null;
 
     if (value is int) {
-      return _desaturateColor(Color(value), 0.20);
+      return _desaturateColor(Color(value), 0.42);
     }
 
     final raw = value.toString().trim();
@@ -2584,14 +3526,14 @@ class SceneController extends ChangeNotifier {
     final lower = raw.toLowerCase();
 
     const byName = <String, Color>{
-      'red': Color(0xFFD36E6A),
-      'blue': Color(0xFF6E9ACC),
-      'green': Color(0xFF6EA886),
-      'orange': Color(0xFFD59667),
-      'purple': Color(0xFF9A77B7),
-      'yellow': Color(0xFFD7C46C),
-      'teal': Color(0xFF5FA39A),
-      'pink': Color(0xFFC4749C),
+      'red': Color(0xFFB8928D),
+      'blue': Color(0xFF8FA6B6),
+      'green': Color(0xFF93AA9A),
+      'orange': Color(0xFFB8A18E),
+      'purple': Color(0xFFA596B3),
+      'yellow': Color(0xFFC0B792),
+      'teal': Color(0xFF8EA9A6),
+      'pink': Color(0xFFB39AA7),
       'random': Color(0x00000000),
     };
 
@@ -2600,7 +3542,7 @@ class SceneController extends ChangeNotifier {
     }
 
     if (byName.containsKey(lower)) {
-      return _desaturateColor(byName[lower]!, 0.20);
+      return _desaturateColor(byName[lower]!, 0.42);
     }
 
     final clean = lower.replaceFirst('#', '');
@@ -2608,7 +3550,7 @@ class SceneController extends ChangeNotifier {
     final parsed = int.tryParse(hex, radix: 16);
     if (parsed == null) return null;
 
-    return _desaturateColor(Color(parsed), 0.20);
+    return _desaturateColor(Color(parsed), 0.42);
   }
 
   double _readDouble(dynamic value, {required double fallback}) {
@@ -2692,6 +3634,18 @@ class SceneObjectData {
   final List<String> tags;
   final Map<String, dynamic> extraData;
 
+  bool get isUserObject {
+    final kind = (extraData['kind'] ?? '').toString().trim().toLowerCase();
+    if (kind == 'user' || kind == 'user_chat') {
+      return true;
+    }
+
+    return tags.any((tag) {
+      final normalized = tag.trim().toLowerCase();
+      return normalized == 'type:user' || normalized == 'entity:user';
+    });
+  }
+
   SceneObjectData copyWith({
     String? name,
     String? text,
@@ -2755,14 +3709,18 @@ class BoardObjectWidget extends StatefulWidget {
     super.key,
     required this.data,
     required this.onTap,
+    required this.onRemovePressed,
     required this.onDeleteComplete,
     required this.onDragPositionChanged,
+    required this.onDragEnded,
   });
 
   final SceneObjectData data;
   final VoidCallback onTap;
+  final VoidCallback onRemovePressed;
   final VoidCallback onDeleteComplete;
   final void Function(double x, double y) onDragPositionChanged;
+  final Future<void> Function() onDragEnded;
 
   @override
   State<BoardObjectWidget> createState() => _BoardObjectWidgetState();
@@ -2909,7 +3867,6 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
 
     final motionEffect = _isDragging ? 1.0 : _motionEffectProgress(moveRaw);
     final motionScale = lerpDouble(1.0, 0.8, motionEffect)!;
-    final saturation = lerpDouble(1.0, 0.0, motionEffect)!;
 
     final scaleValue = _scaleController.isAnimating
         ? _computeScalePopValue(
@@ -2921,18 +3878,12 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
 
     final opacity = _computeDeleteOpacity(_deleteController.value);
     final visualScale = scaleValue * motionScale;
-
-    final innerSize = math
-        .max(
-          12.0,
-          math.min(widget.data.width, widget.data.height) -
-              (widget.data.innerInset * 2),
-        )
-        .toDouble();
-
-    final textBoxWidth = (innerSize * 0.72)
-        .clamp(36.0, widget.data.width)
-        .toDouble();
+    final borderRadius = BorderRadius.circular(
+      (math.min(widget.data.width, widget.data.height) * 0.18)
+          .clamp(18.0, 26.0)
+          .toDouble(),
+    );
+    final canRemove = !widget.data.isUserObject;
 
     return Positioned(
       left: livePosition.dx,
@@ -2942,176 +3893,107 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
         alignment: Alignment.center,
         child: Opacity(
           opacity: opacity,
-          child: ColorFiltered(
-            colorFilter: ColorFilter.matrix(_saturationMatrix(saturation)),
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: widget.onTap,
-              onPanStart: (details) {
-                final box = context.findRenderObject() as RenderBox?;
-                if (box == null) return;
-                _dragPointerOffset = box.globalToLocal(details.globalPosition);
-                setState(() {
-                  _isDragging = true;
-                });
-              },
-              onPanUpdate: (details) {
-                final board = context
-                    .findAncestorRenderObjectOfType<RenderBox>();
-                final dragOffset = _dragPointerOffset;
-                if (board == null || dragOffset == null) return;
-                final localOnBoard = board.globalToLocal(
-                  details.globalPosition,
-                );
-                widget.onDragPositionChanged(
-                  localOnBoard.dx - dragOffset.dx,
-                  localOnBoard.dy - dragOffset.dy,
-                );
-              },
-              onPanEnd: (_) {
-                setState(() {
-                  _isDragging = false;
-                  _dragPointerOffset = null;
-                });
-              },
-              onPanCancel: () {
-                setState(() {
-                  _isDragging = false;
-                  _dragPointerOffset = null;
-                });
-              },
-              child: SizedBox(
-                width: widget.data.width,
-                height: widget.data.height,
-                child: Stack(
-                  children: [
-                    Container(
-                      width: widget.data.width,
-                      height: widget.data.height,
-                      decoration: BoxDecoration(
-                        color: widget.data.color,
-                        border: Border.all(
-                          color: Colors.black.withValues(alpha: 0.08),
-                          width: 1,
-                        ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: widget.data.color.withValues(alpha: 0.22),
-                            blurRadius: 22,
-                            spreadRadius: 2,
-                            offset: const Offset(0, 6),
-                          ),
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            blurRadius: 24,
-                            spreadRadius: 0.5,
-                            offset: const Offset(0, 8),
-                          ),
-                        ],
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: widget.onTap,
+            onPanStart: (details) {
+              final box = context.findRenderObject() as RenderBox?;
+              if (box == null) return;
+              _dragPointerOffset = box.globalToLocal(details.globalPosition);
+              setState(() {
+                _isDragging = true;
+              });
+            },
+            onPanUpdate: (details) {
+              final board = context.findAncestorRenderObjectOfType<RenderBox>();
+              final dragOffset = _dragPointerOffset;
+              if (board == null || dragOffset == null) return;
+              final localOnBoard = board.globalToLocal(details.globalPosition);
+              widget.onDragPositionChanged(
+                localOnBoard.dx - dragOffset.dx,
+                localOnBoard.dy - dragOffset.dy,
+              );
+            },
+            onPanEnd: (_) {
+              setState(() {
+                _isDragging = false;
+                _dragPointerOffset = null;
+              });
+              unawaited(widget.onDragEnded());
+            },
+            onPanCancel: () {
+              setState(() {
+                _isDragging = false;
+                _dragPointerOffset = null;
+              });
+              unawaited(widget.onDragEnded());
+            },
+            child: SizedBox(
+              width: widget.data.width,
+              height: widget.data.height,
+              child: Stack(
+                children: [
+                  Container(
+                    width: widget.data.width,
+                    height: widget.data.height,
+                    decoration: BoxDecoration(
+                      color: widget.data.color,
+                      borderRadius: borderRadius,
+                      border: Border.all(
+                        color: Colors.black.withValues(alpha: 0.08),
+                        width: 1,
                       ),
                     ),
-                    Positioned.fill(
-                      child: Center(
-                        child: Container(
-                          width: innerSize,
-                          height: innerSize,
-                          decoration: BoxDecoration(
-                            color: _darken(widget.data.color, 0.22),
-                          ),
-                        ),
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 14,
+                    ),
+                    child: Text(
+                      widget.data.text,
+                      textAlign: TextAlign.center,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: _bestTextColor(widget.data.color),
+                        fontWeight: FontWeight.w700,
+                        fontSize:
+                            (math.min(widget.data.width, widget.data.height) *
+                                    0.18)
+                                .clamp(14.0, 22.0)
+                                .toDouble(),
+                        height: 1.1,
                       ),
                     ),
+                  ),
+                  if (canRemove)
                     Positioned(
                       top: 8,
-                      left: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.10),
-                          border: Border.all(
-                            color: Colors.black.withValues(alpha: 0.14),
-                            width: 0.7,
-                          ),
-                        ),
-                        child: Text(
-                          widget.data.memoryType,
-                          style: TextStyle(
-                            color: _bestTextColor(widget.data.color),
-                            fontSize: 10,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 0.3,
-                          ),
-                        ),
-                      ),
-                    ),
-                    if (widget.data.deleteAfterClick)
-                      Positioned(
-                        top: 8,
-                        right: 8,
+                      right: 8,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: widget.onRemovePressed,
                         child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 4,
-                          ),
+                          width: 24,
+                          height: 24,
+                          alignment: Alignment.center,
                           decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.16),
-                            border: Border.all(
-                              color: Colors.black.withValues(alpha: 0.18),
-                              width: 0.7,
-                            ),
+                            color: Colors.black.withValues(alpha: 0.12),
+                            shape: BoxShape.circle,
                           ),
                           child: Text(
-                            'one tap',
+                            'x',
                             style: TextStyle(
                               color: _bestTextColor(widget.data.color),
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ),
-                    Positioned.fill(
-                      child: Center(
-                        child: Container(
-                          width: textBoxWidth,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.10),
-                            border: Border.all(
-                              color: Colors.black.withValues(alpha: 0.18),
-                              width: 0.7,
-                            ),
-                          ),
-                          child: Text(
-                            widget.data.text,
-                            textAlign: TextAlign.center,
-                            maxLines: 3,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: _bestTextColor(widget.data.color),
+                              fontSize: 12,
                               fontWeight: FontWeight.w700,
-                              fontSize: math.max(
-                                12,
-                                math.min(
-                                      widget.data.width,
-                                      widget.data.height,
-                                    ) *
-                                    0.14,
-                              ),
-                              height: 1.05,
+                              height: 1,
                             ),
                           ),
                         ),
                       ),
                     ),
-                  ],
-                ),
+                ],
               ),
             ),
           ),
@@ -3305,49 +4187,10 @@ class _GridLayer {
   final List<double> horizontalPositions;
 }
 
-List<double> _saturationMatrix(double saturation) {
-  final s = saturation.clamp(0.0, 1.0).toDouble();
-  final inv = 1 - s;
-  const rw = 0.2126;
-  const gw = 0.7152;
-  const bw = 0.0722;
-
-  return <double>[
-    inv * rw + s,
-    inv * gw,
-    inv * bw,
-    0,
-    0,
-    inv * rw,
-    inv * gw + s,
-    inv * bw,
-    0,
-    0,
-    inv * rw,
-    inv * gw,
-    inv * bw + s,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-  ];
-}
-
 Color _desaturateColor(Color color, double amount) {
   final hsl = HSLColor.fromColor(color);
   final next = hsl.withSaturation(
     (hsl.saturation * (1 - amount)).clamp(0.0, 1.0).toDouble(),
-  );
-  return next.toColor();
-}
-
-Color _darken(Color color, double amount) {
-  final hsl = HSLColor.fromColor(color);
-  final next = hsl.withLightness(
-    (hsl.lightness - amount).clamp(0.0, 1.0).toDouble(),
   );
   return next.toColor();
 }

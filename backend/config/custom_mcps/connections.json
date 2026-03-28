@@ -2,14 +2,14 @@
   "id": "connections",
   "protocol": "at_home_mcp",
   "kind": "backend_integrated_toolset",
-  "description": "This MCP wraps the social account and recommendation system so the agent can keep the current user's profile fresh and surface real nearby or compatible people as whiteboard objects.",
+  "description": "This MCP wraps the social account and recommendation system so the agent can keep the current user's profile fresh and surface real nearby or compatible people as whiteboard chat objects.",
   "invoke_url": "/api/agent/mcps/connections/invoke/",
   "tools": [
     {
       "name": "update_profile",
-      "method": "POST",
+      "method": "POST", 
       "path": "/api/accounts/agent/profile/update/",
-      "description": "Use this when the user reveals durable facts or preferences about themselves and their social profile should be updated before future matching.",
+      "description": "Use this when the user reveals durable facts or preferences about themselves and their social profile should be updated before future matching. Not emotion related jsut flat facts",
       "body_schema": {
         "user_id": "string",
         "prompt": "string",
@@ -22,7 +22,7 @@
       "name": "find_connection",
       "method": "POST",
       "path": "/api/accounts/agent/connections/find/",
-      "description": "Use this when the user would benefit from being connected to another person. It turns the current intent into a temporary search description and finds the closest real user match.",
+      "description": "Use this when the user would benefit from being connected to another person. It combines the user's durable profile with the current prompt into a temporary search description, finds the closest real user match, and returns metadata for a user chat object on the whiteboard.",
       "body_schema": {
         "user_id": "string",
         "prompt": "string",

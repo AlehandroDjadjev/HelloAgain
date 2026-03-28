@@ -11,6 +11,7 @@ def _pretty_json(payload: Dict[str, Any] | List[Any] | None) -> str:
 def build_step_one_mcp_prompt(
     *,
     registry: Dict[str, Any],
+    tool_catalog: Dict[str, Any],
     chain_history: List[Dict[str, Any]],
     board_state: Dict[str, Any],
 ) -> str:
@@ -22,7 +23,7 @@ First we run a sort of "mcp" layer. Now this doesnt use real mcps but exposes re
 The idea is to see where and how we can apply different stuff to drive a multiple step process - start with an abstract mcp then a another can be run ontop after.
 We still have to select if its even relevant for some as tools can be wildly different.
 But just be aware of the type of descition you are making - the first step of the reasoning process.
-Try and pick through the mcp list to get 1 used mcp (at least) per request.
+Stage 1 always runs. It must explicitly choose an MCP tool or explicitly choose no MCPs. Do not leave the tool decision implicit.
 If the whiteboard already has objects with `extraData`, that hidden metadata is part of the usable context too.
 Use both the user prompt and the board object extra data when deciding what MCP to use.
 
@@ -30,6 +31,15 @@ This is step 1.
 - Step 1 decides whether MCPs are needed and which MCP calls to make.
 - Step 2 waits for the MCP results, can recall stage 1, also does some work on processing them.
 - Keep the full JSON within 256 output tokens.
+- Choose the MCP tool whose descriptor most directly matches the request.
+- Do not invent a default MCP choice when you are unsure. If no MCP is justified, return `needs_mcps=false` and an empty `mcp_calls` array.
+- Requests about finding, matching, or connecting with a real person should prefer a people / connection tool over an emotion or action-memory tool.
+
+GNN TOOL CHOICE RULES:
+- Use `gnn_actions.add_action` when the user describes a concrete activity, behavior, or coping thing they did and it should become remembered action memory.
+- Use `gnn_actions.fetch_action` when the user needs a recommendation, what-fits-now suggestion, or action retrieval.
+- Use `gnn_actions.conversation` only when there is no meaningful new action to store and no recommendation to fetch. This should be rare.
+- If the user describes an activity that changed mood or energy, prefer `add_action` over `conversation`.
 
 Return exactly one JSON object and nothing else.
 
@@ -61,6 +71,9 @@ JSON shape:
 Current at-home MCP registry:
 {_pretty_json(registry)}
 
+Available MCP tools:
+{_pretty_json(tool_catalog)}
+
 Previous chain history:
 {_pretty_json(chain_history)}
 
@@ -75,6 +88,7 @@ def build_step_two_board_prompt(
     largest_empty_space: Dict[str, Any],
     step_one_plan: Dict[str, Any],
     mcp_results: List[Dict[str, Any]],
+    tool_catalog: Dict[str, Any],
     chain_history: List[Dict[str, Any]],
 ) -> str:
     return f"""
@@ -199,6 +213,9 @@ Step 1 plan:
 
 MCP results so far:
 {_pretty_json(mcp_results)}
+
+Available MCP tools:
+{_pretty_json(tool_catalog)}
 
 Previous chain history:
 {_pretty_json(chain_history)}
