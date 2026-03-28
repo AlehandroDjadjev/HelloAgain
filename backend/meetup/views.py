@@ -112,6 +112,14 @@ def _notification_payload(notification: MeetupNotification) -> dict:
     }
 
 
+def _close_invite_request_notifications(invite: MeetupInvite) -> None:
+    MeetupNotification.objects.filter(
+        invite=invite,
+        notification_type=MeetupNotification.Type.INVITE_REQUEST,
+        read_at__isnull=True,
+    ).update(read_at=timezone.now())
+
+
 def _create_meetup_notification(
     *,
     recipient,
@@ -435,10 +443,17 @@ def meetup_notifications_collection(request):
         and item.scheduled_for is not None
         and item.scheduled_for <= timezone.now()
     ]
+    visible_notifications = [
+        item
+        for item in notifications
+        if item.notification_type != MeetupNotification.Type.REMINDER_20M
+        or item.scheduled_for is None
+        or item.scheduled_for <= timezone.now()
+    ]
 
     return _json_ok(
         {
-            "notifications": [_notification_payload(item) for item in notifications],
+            "notifications": [_notification_payload(item) for item in visible_notifications],
             "due_reminders": [_notification_payload(item) for item in due_reminders],
         }
     )
@@ -515,6 +530,7 @@ def respond_meetup_invite(request, invite_id: int):
     invite.status = status_map[action]
     invite.responded_at = timezone.now()
     invite.save(update_fields=["status", "responded_at", "updated_at"])
+    _close_invite_request_notifications(invite)
 
     generated_notifications = []
     if action == "accept":

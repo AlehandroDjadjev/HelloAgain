@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import math
 import re
 import secrets
+import time
+from dataclasses import dataclass
 from typing import Iterable
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.db.models import Q
 from django.utils.text import slugify
@@ -12,7 +19,11 @@ from django.utils.text import slugify
 from recommendations.gat.feature_schema import get_default_feature_vector
 from recommendations.models import ElderProfile, SocialEdge
 from recommendations.services.compatibility_engine import compare_people, dominant_traits
-from recommendations.services.feature_extraction import extract_feature_profile, extraction_to_vectors
+from recommendations.services.feature_extraction import (
+    extract_feature_profile,
+    extract_preference_intents,
+    extraction_to_vectors,
+)
 from recommendations.services.profile_ingestion import (
     apply_interaction_signals,
     hydrate_profile_from_description,
@@ -26,6 +37,96 @@ from .models import (
     RecommendationActivity,
     normalize_email,
 )
+
+
+@dataclass(frozen=True)
+class IssuedAuthToken:
+    key: str
+    session_key: str
+
+
+_ACCOUNT_JWT_ALGORITHM = "HS256"
+_ACCOUNT_JWT_TYPE = "hello_again_access"
+_ACCOUNT_JWT_TTL_SECONDS = 60 * 60 * 24 * 30
+
+_DESCRIPTION_CONTEXT_BONUS_WEIGHT = 0.08
+_DESCRIPTION_CONTEXT_BONUS_CAP = 0.05
+_FRIENDSHIP_SIGNAL_BASE = 0.45
+_FRIENDSHIP_SIGNAL_EDGE_WEIGHT = 0.35
+_FRIENDSHIP_BONUS_CAP = 0.055
+_INTERACTION_BONUS_CAP = 0.035
+
+
+def _jwt_secret() -> bytes:
+    secret = getattr(settings, "ACCOUNT_JWT_SECRET", "") or settings.SECRET_KEY
+    return str(secret).encode("utf-8")
+
+
+def _base64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _base64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(f"{value}{padding}".encode("ascii"))
+
+
+def _jwt_sign(signing_input: str) -> str:
+    digest = hmac.new(
+        _jwt_secret(),
+        signing_input.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return _base64url_encode(digest)
+
+
+def _encode_account_jwt(payload: dict[str, object]) -> str:
+    header_segment = _base64url_encode(
+        json.dumps(
+            {"alg": _ACCOUNT_JWT_ALGORITHM, "typ": "JWT"},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    payload_segment = _base64url_encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    signing_input = f"{header_segment}.{payload_segment}"
+    signature_segment = _jwt_sign(signing_input)
+    return f"{signing_input}.{signature_segment}"
+
+
+def _decode_account_jwt(token: str) -> dict[str, object] | None:
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3 or not all(parts):
+        return None
+    header_segment, payload_segment, signature_segment = parts
+    signing_input = f"{header_segment}.{payload_segment}"
+    expected_signature = _jwt_sign(signing_input)
+    if not hmac.compare_digest(signature_segment, expected_signature):
+        return None
+    try:
+        header = json.loads(_base64url_decode(header_segment).decode("utf-8"))
+        payload = json.loads(_base64url_decode(payload_segment).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        return None
+    if header.get("alg") != _ACCOUNT_JWT_ALGORITHM:
+        return None
+    if payload.get("token_type") != _ACCOUNT_JWT_TYPE:
+        return None
+    now = int(time.time())
+    try:
+        exp = int(payload.get("exp", 0) or 0)
+        iat = int(payload.get("iat", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if exp <= now or iat > now + 60:
+        return None
+    return payload
 
 
 def split_display_name(display_name: str) -> tuple[str, str]:
@@ -85,24 +186,52 @@ def ensure_account_profile(user: User) -> AccountProfile:
     return profile
 
 
-def issue_token(user: User) -> AccountToken:
+def issue_token(user: User) -> IssuedAuthToken:
+    profile = ensure_account_profile(user)
     token, _ = AccountToken.objects.update_or_create(
         user=user,
         defaults={"key": secrets.token_hex(24)},
     )
-    return token
+    now = int(time.time())
+    ttl_seconds = int(
+        getattr(settings, "ACCOUNT_JWT_TTL_SECONDS", _ACCOUNT_JWT_TTL_SECONDS)
+    )
+    jwt_token = _encode_account_jwt(
+        {
+            "sub": str(user.pk),
+            "user_id": user.pk,
+            "phone_number": profile.phone_number or "",
+            "display_name": profile.display_name or user.get_full_name().strip() or user.username,
+            "jti": token.key,
+            "iat": now,
+            "exp": now + max(60, ttl_seconds),
+            "token_type": _ACCOUNT_JWT_TYPE,
+        }
+    )
+    return IssuedAuthToken(key=jwt_token, session_key=token.key)
 
 
 def profile_for_token(token_key: str | None) -> AccountProfile | None:
     if not token_key:
         return None
+    payload = _decode_account_jwt(token_key)
+    if payload is None:
+        return None
+    try:
+        user_id = int(payload.get("user_id", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    session_key = str(payload.get("jti") or "").strip()
+    if user_id <= 0 or not session_key:
+        return None
     token = (
         AccountToken.objects.select_related("user", "user__account_profile", "user__account_profile__elder_profile")
-        .filter(key=token_key)
+        .filter(key=session_key, user_id=user_id)
         .first()
     )
     if not token:
         return None
+    token.save(update_fields=["last_used_at"])
     return ensure_account_profile(token.user)
 
 
@@ -229,6 +358,8 @@ def build_match_summary(
         right_confidence=target.elder_profile.feature_confidence or {},
         graph_score=graph_score,
         embedding_score=graph_score,
+        left_intents=extract_preference_intents(viewer.effective_description or viewer.description),
+        right_intents=extract_preference_intents(target.effective_description or target.description),
     )
 
 
@@ -249,9 +380,63 @@ def refresh_social_edge_for_friendship(left: AccountProfile, right: AccountProfi
         right_elder.feature_vector or {},
         left_confidence=left_elder.feature_confidence or {},
         right_confidence=right_elder.feature_confidence or {},
+        left_intents=extract_preference_intents(left.effective_description or left.description),
+        right_intents=extract_preference_intents(right.effective_description or right.description),
     )
-    edge_weight = max(0.75, float(comparison["compatibility_score"]))
+    edge_weight = _friendship_edge_weight_from_comparison(comparison)
     return SocialEdge.upsert(left_elder, right_elder, edge_weight)
+
+
+def _friendship_edge_weight_from_comparison(comparison: dict | None) -> float:
+    score = float((comparison or {}).get("compatibility_score", 0.18))
+    breakdown = (comparison or {}).get("score_breakdown") or {}
+    contradiction_count = int(breakdown.get("contradiction_count", 0) or 0)
+    intent_contradictions = int(breakdown.get("intent_contradictions", 0) or 0)
+
+    edge_weight = 0.22 + (0.63 * _bounded(score))
+    total_contradictions = contradiction_count + intent_contradictions
+    if total_contradictions > 0:
+        edge_weight *= max(0.45, 1.0 - (0.18 * total_contradictions))
+    return _bounded(max(0.18, edge_weight))
+
+
+def _calibrated_graph_similarity(
+    *,
+    viewer: AccountProfile,
+    target: AccountProfile,
+    raw_graph_score: float,
+) -> float:
+    if not viewer.elder_profile_id or not target.elder_profile_id:
+        return _bounded(raw_graph_score)
+
+    comparison = compare_people(
+        viewer.elder_profile.feature_vector or {},
+        target.elder_profile.feature_vector or {},
+        left_confidence=viewer.elder_profile.feature_confidence or {},
+        right_confidence=target.elder_profile.feature_confidence or {},
+        graph_score=raw_graph_score,
+        embedding_score=raw_graph_score,
+        left_intents=extract_preference_intents(viewer.effective_description or viewer.description),
+        right_intents=extract_preference_intents(target.effective_description or target.description),
+    )
+    compatibility_score = float(comparison.get("compatibility_score", 0.5))
+    breakdown = comparison.get("score_breakdown", {})
+    contradiction_count = int(breakdown.get("contradiction_count", 0) or 0)
+    intent_contradictions = int(breakdown.get("intent_contradictions", 0) or 0)
+    shared_polarity_topics = int(breakdown.get("shared_polarity_topics", 0) or 0)
+
+    blended = (0.58 * _bounded(raw_graph_score)) + (0.42 * _bounded(compatibility_score))
+    cap = _bounded(compatibility_score + (0.18 if compatibility_score < 0.75 else 0.22))
+
+    total_contradictions = contradiction_count + intent_contradictions
+    if total_contradictions > 0:
+        penalty = max(0.25, 1.0 - (0.18 * total_contradictions))
+        if shared_polarity_topics > 0 and contradiction_count >= shared_polarity_topics:
+            penalty = min(penalty, 0.55)
+        blended *= penalty
+        cap = min(cap, _bounded(compatibility_score + 0.08))
+
+    return _bounded(min(blended, cap))
 
 
 def graph_scores_for_profile(viewer: AccountProfile) -> dict[int, float]:
@@ -268,12 +453,27 @@ def graph_scores_for_profile(viewer: AccountProfile) -> dict[int, float]:
 
         query_index = snapshot["elder_ids"].index(viewer_elder_id)
         query_embedding = snapshot["embeddings"][query_index]
+        targets = {
+            int(item.elder_profile_id): item
+            for item in AccountProfile.objects.select_related("elder_profile")
+            .exclude(pk=viewer.pk)
+            .filter(elder_profile_id__in=snapshot["elder_ids"])
+        }
         scores: dict[int, float] = {}
         for index, elder_id in enumerate(snapshot["elder_ids"]):
             if elder_id == viewer_elder_id:
                 continue
             similarity = float((query_embedding * snapshot["embeddings"][index]).sum().item())
-            scores[int(elder_id)] = max(0.0, min(1.0, (similarity + 1.0) / 2.0))
+            raw_score = max(0.0, min(1.0, (similarity + 1.0) / 2.0))
+            target = targets.get(int(elder_id))
+            if target is None:
+                scores[int(elder_id)] = raw_score
+                continue
+            scores[int(elder_id)] = _calibrated_graph_similarity(
+                viewer=viewer,
+                target=target,
+                raw_graph_score=raw_score,
+            )
         return scores
     except Exception:
         return {}
@@ -281,6 +481,79 @@ def graph_scores_for_profile(viewer: AccountProfile) -> dict[int, float]:
 
 def _bounded(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _social_bonus_cap(semantic_similarity: float) -> float:
+    semantic = _bounded(semantic_similarity)
+    if semantic >= 0.65:
+        return 0.09
+    if semantic >= 0.45:
+        return 0.07
+    return 0.05
+
+
+def _social_edge_for_pair(left: AccountProfile, right: AccountProfile) -> SocialEdge | None:
+    if not left.elder_profile_id or not right.elder_profile_id:
+        return None
+
+    elder_a = left.elder_profile
+    elder_b = right.elder_profile
+    if elder_a.id > elder_b.id:
+        elder_a, elder_b = elder_b, elder_a
+
+    return SocialEdge.objects.filter(elder_a=elder_a, elder_b=elder_b).first()
+
+
+def friendship_signal_for_pair(viewer: AccountProfile, target: AccountProfile) -> float:
+    if get_friendship_status(viewer, target) != FriendRequest.Status.ACCEPTED:
+        return 0.0
+
+    edge = _social_edge_for_pair(viewer, target)
+    edge_weight = float(edge.gat_weight) if edge is not None else 0.18
+    normalized_edge_weight = _bounded((edge_weight - 0.18) / 0.62)
+    return _bounded(_FRIENDSHIP_SIGNAL_BASE + (_FRIENDSHIP_SIGNAL_EDGE_WEIGHT * normalized_edge_weight))
+
+
+def build_recommendation_score(
+    *,
+    semantic_similarity: float,
+    friendship_signal: float,
+    interaction_quality_signal: float,
+    semantic_context_score: float = 0.0,
+) -> dict[str, float]:
+    semantic = _bounded(semantic_similarity)
+    friendship_signal = _bounded(friendship_signal)
+    interaction_quality_signal = _bounded(interaction_quality_signal)
+    semantic_context_score = _bounded(semantic_context_score)
+
+    semantic_context_bonus = min(
+        _DESCRIPTION_CONTEXT_BONUS_CAP,
+        _DESCRIPTION_CONTEXT_BONUS_WEIGHT * semantic_context_score,
+    )
+    friendship_bonus = min(
+        _FRIENDSHIP_BONUS_CAP,
+        _FRIENDSHIP_BONUS_CAP * friendship_signal,
+    )
+    interaction_quality_bonus = min(
+        _INTERACTION_BONUS_CAP,
+        _INTERACTION_BONUS_CAP * interaction_quality_signal,
+    )
+
+    total_bonus = min(
+        _social_bonus_cap(semantic),
+        semantic_context_bonus + friendship_bonus + interaction_quality_bonus,
+    )
+
+    return {
+        "semantic_similarity": round(semantic, 4),
+        "semantic_context_score": round(semantic_context_score, 4),
+        "semantic_context_bonus": round(semantic_context_bonus, 4),
+        "friendship_signal": round(friendship_signal, 4),
+        "friendship_bonus": round(friendship_bonus, 4),
+        "interaction_quality_signal": round(interaction_quality_signal, 4),
+        "interaction_quality_bonus": round(interaction_quality_bonus, 4),
+        "final_score": round(_bounded(semantic + total_bonus), 4),
+    }
 
 
 def calibrate_match_percent(
@@ -457,7 +730,7 @@ def record_recommendation_activity(
         _activity_signal_vector(actor, target, event_type=event_type, signal_strength=strength)
 
         if event_type == RecommendationActivity.EventType.FRIEND_REQUEST_ACCEPTED:
-            _update_edge_weight(actor, target, weight=max(0.82, strength), prefer_higher=True)
+            refresh_social_edge_for_friendship(actor, target)
         elif event_type in {
             RecommendationActivity.EventType.FRIEND_REQUEST_SENT,
             RecommendationActivity.EventType.RECOMMENDATION_CLICKED,
@@ -479,7 +752,7 @@ def _match_row(
     matched_contact_ids: set[int],
     graph_score: float,
     activity_score: float,
-    raw_score: float,
+    recommendation_score: dict[str, float],
     discovery_mode: str,
     comparison: dict | None,
     query_comparison: dict | None = None,
@@ -495,7 +768,7 @@ def _match_row(
     certainty_score = float((comparison or {}).get("certainty_score", 0.0))
     requester_fit_score = float((comparison or {}).get("compatibility_score", 0.0))
     row["discovery_mode"] = discovery_mode
-    row["raw_score"] = round(_bounded(raw_score), 4)
+    row["raw_score"] = round(_bounded(recommendation_score["final_score"]), 4)
     if discovery_mode == RecommendationActivity.DiscoveryMode.DESCRIBE_SOMEONE and query_comparison:
         query_fit_score = float((query_comparison or {}).get("compatibility_score", 0.0))
         row["match_percent"] = int(round(100 * _bounded(query_fit_score)))
@@ -504,12 +777,20 @@ def _match_row(
         row["match_percent"] = int(round(100 * _bounded(requester_fit_score)))
     else:
         row["match_percent"] = calibrate_match_percent(
-            raw_score,
+            recommendation_score["final_score"],
             feature_alignment=feature_alignment,
             certainty_score=certainty_score,
             graph_score=graph_score,
         )
     row["score_components"] = {
+        "semantic_similarity": round(_bounded(recommendation_score["semantic_similarity"]), 4),
+        "semantic_context_score": round(_bounded(recommendation_score["semantic_context_score"]), 4),
+        "semantic_context_bonus": round(_bounded(recommendation_score["semantic_context_bonus"]), 4),
+        "friendship_signal": round(_bounded(recommendation_score["friendship_signal"]), 4),
+        "friendship_bonus": round(_bounded(recommendation_score["friendship_bonus"]), 4),
+        "interaction_quality_signal": round(_bounded(recommendation_score["interaction_quality_signal"]), 4),
+        "interaction_quality_bonus": round(_bounded(recommendation_score["interaction_quality_bonus"]), 4),
+        "final_score": round(_bounded(recommendation_score["final_score"]), 4),
         "graph_score": round(_bounded(graph_score), 4),
         "activity_score": round(_bounded(activity_score), 4),
         "requester_fit_score": round(_bounded(requester_fit_score), 4),
@@ -582,23 +863,27 @@ def recommend_profiles_for_viewer(
     graph_scores = graph_scores_for_profile(viewer)
     rows: list[dict] = []
     for target in queryset[: max(limit * 4, 30)]:
+        target_graph_score = float(graph_scores.get(target.elder_profile_id or -1, 0.0))
         comparison = build_match_summary(
             viewer,
             target,
-            graph_score=float(graph_scores.get(target.elder_profile_id or -1, 0.0)),
+            graph_score=target_graph_score,
         )
         requester_fit = float((comparison or {}).get("compatibility_score", 0.0))
-        graph_score = float(graph_scores.get(target.elder_profile_id or -1, requester_fit))
         activity_score = activity_affinity_for_pair(viewer, target)
-        raw_score = (0.50 * graph_score) + (0.35 * requester_fit) + (0.15 * activity_score)
+        recommendation_score = build_recommendation_score(
+            semantic_similarity=requester_fit,
+            friendship_signal=friendship_signal_for_pair(viewer, target),
+            interaction_quality_signal=activity_score,
+        )
         rows.append(
             _match_row(
                 viewer=viewer,
                 target=target,
                 matched_contact_ids=matched_contact_ids,
-                graph_score=graph_score,
+                graph_score=target_graph_score,
                 activity_score=activity_score,
-                raw_score=raw_score,
+                recommendation_score=recommendation_score,
                 discovery_mode=RecommendationActivity.DiscoveryMode.FOR_YOU,
                 comparison=comparison,
             )
@@ -636,6 +921,8 @@ def recommend_profiles_for_description(
             right_confidence=target.elder_profile.feature_confidence or {},
             graph_score=target_graph_score,
             embedding_score=target_graph_score,
+            left_intents=extract_preference_intents(description),
+            right_intents=extract_preference_intents(target.effective_description or target.description),
         )
         requester_comparison = build_match_summary(viewer, target, graph_score=target_graph_score)
         semantic_query_fit = float(query_comparison.get("compatibility_score", 0.0))
@@ -643,7 +930,12 @@ def recommend_profiles_for_description(
         query_fit = (0.72 * semantic_query_fit) + (0.28 * keyword_fit)
         requester_fit = float((requester_comparison or {}).get("compatibility_score", 0.0))
         activity_score = activity_affinity_for_pair(viewer, target)
-        raw_score = (0.60 * query_fit) + (0.15 * requester_fit) + (0.10 * activity_score) + (0.15 * target_graph_score)
+        recommendation_score = build_recommendation_score(
+            semantic_similarity=query_fit,
+            semantic_context_score=requester_fit,
+            friendship_signal=friendship_signal_for_pair(viewer, target),
+            interaction_quality_signal=activity_score,
+        )
         rows.append(
             _match_row(
                 viewer=viewer,
@@ -651,7 +943,7 @@ def recommend_profiles_for_description(
                 matched_contact_ids=matched_contact_ids,
                 graph_score=target_graph_score,
                 activity_score=activity_score,
-                raw_score=raw_score,
+                recommendation_score=recommendation_score,
                 discovery_mode=RecommendationActivity.DiscoveryMode.DESCRIBE_SOMEONE,
                 comparison=requester_comparison,
                 query_comparison={

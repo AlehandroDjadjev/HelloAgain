@@ -4,11 +4,12 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.test import TestCase
+from django.utils import timezone
 
-from recommendations.models import ElderProfile
+from recommendations.models import ElderProfile, SocialEdge
 
-from .models import AccountProfile, OnboardingDraft, RecommendationActivity
-from .services import issue_token
+from .models import AccountProfile, FriendRequest, OnboardingDraft, RecommendationActivity
+from .services import issue_token, recommend_profiles_for_viewer
 
 
 class AccountApiTests(TestCase):
@@ -44,6 +45,36 @@ class AccountApiTests(TestCase):
             description=description,
             contacts_permission_granted=contacts_permission_granted,
         )
+
+    def _set_feature_vector(self, profile: AccountProfile, **overrides: float) -> None:
+        vector = dict(profile.elder_profile.feature_vector or {})
+        vector.update({key: float(value) for key, value in overrides.items()})
+        profile.elder_profile.feature_vector = vector
+        profile.elder_profile.feature_confidence = {
+            feature_name: 1.0 for feature_name in profile.elder_profile.feature_vector
+        }
+        profile.elder_profile.save(update_fields=["feature_vector", "feature_confidence", "updated_at"])
+
+    def test_issue_token_returns_jwt_and_me_accepts_it(self):
+        profile = self._create_profile(
+            username="jwt-user",
+            email="jwt@example.com",
+            phone_number="+359888111999",
+            display_name="JWT User",
+        )
+        token = issue_token(profile.user)
+
+        self.assertEqual(len(token.key.split(".")), 3)
+
+        response = self.client.get(
+            "/api/accounts/me/",
+            **{"HTTP_AUTHORIZATION": f"Token {token.key}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["profile"]["user_id"], profile.user_id)
+        self.assertEqual(payload["profile"]["phone_number"], "+359888111999")
 
     @patch("apps.accounts.views.seed_social_graph_for_profile")
     @patch("apps.accounts.views.sync_profile_to_recommendations")
@@ -449,6 +480,9 @@ class AccountApiTests(TestCase):
         self.assertIn("match_percent", payload["results"][0])
         self.assertIn("raw_score", payload["results"][0])
         self.assertIn("score_components", payload["results"][0])
+        self.assertIn("semantic_similarity", payload["results"][0]["score_components"])
+        self.assertIn("friendship_signal", payload["results"][0]["score_components"])
+        self.assertIn("final_score", payload["results"][0]["score_components"])
 
         filtered = self.client.get(
             "/api/accounts/discovery/?q=Best",
@@ -457,6 +491,265 @@ class AccountApiTests(TestCase):
         self.assertEqual(filtered.status_code, 200)
         self.assertEqual(filtered.json()["count"], 1)
         self.assertEqual(filtered.json()["results"][0]["user_id"], match.user_id)
+
+    @patch("recommendations.gat.recommender.get_embedding_snapshot")
+    def test_graph_scores_are_calibrated_when_embedding_similarity_is_overconfident(
+        self,
+        mock_snapshot,
+    ):
+        viewer = self._create_profile(
+            username="graphviewer",
+            email="graphviewer@example.com",
+            display_name="Graph Viewer",
+            description="Loves parks and active outdoor walks.",
+        )
+        target = self._create_profile(
+            username="graphtarget",
+            email="graphtarget@example.com",
+            display_name="Graph Target",
+            description="Avoids parks and prefers quiet indoor time.",
+        )
+
+        viewer.elder_profile.feature_vector.update(
+            {
+                "interest_nature": 1.0,
+                "interest_sports": 0.9,
+                "activity_level": 0.9,
+                "prefers_small_groups": 0.2,
+                "adventure_comfort": 0.9,
+            }
+        )
+        viewer.elder_profile.feature_confidence = {name: 1.0 for name in viewer.elder_profile.feature_vector}
+        viewer.elder_profile.save(update_fields=["feature_vector", "feature_confidence", "updated_at"])
+
+        target.elder_profile.feature_vector.update(
+            {
+                "interest_nature": 0.0,
+                "interest_sports": 0.1,
+                "activity_level": 0.1,
+                "prefers_small_groups": 0.9,
+                "adventure_comfort": 0.1,
+            }
+        )
+        target.elder_profile.feature_confidence = {name: 1.0 for name in target.elder_profile.feature_vector}
+        target.elder_profile.save(update_fields=["feature_vector", "feature_confidence", "updated_at"])
+
+        class _Scalar:
+            def __init__(self, value: float):
+                self._value = value
+
+            def item(self):
+                return self._value
+
+        class _Vec:
+            def __init__(self, values):
+                self.values = list(values)
+
+            def __mul__(self, other):
+                return _Vec([left * right for left, right in zip(self.values, other.values)])
+
+            def sum(self):
+                return _Scalar(sum(self.values))
+
+        mock_snapshot.return_value = {
+            "elder_ids": [viewer.elder_profile_id, target.elder_profile_id],
+            "embeddings": [
+                _Vec([1.0, 0.0]),
+                _Vec([0.999, 0.001]),
+            ],
+        }
+
+        response = self.client.get(
+            f"/api/accounts/users/{target.user_id}/",
+            **self._auth_headers(viewer.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()["profile"]
+        self.assertLess(payload["graph_score"], 0.75)
+        self.assertLess(payload["match_summary"]["compatibility_score"], 0.50)
+
+    def test_refresh_social_edge_for_friendship_uses_compatibility_aware_weight(self):
+        left = self._create_profile(
+            username="edgeleft",
+            email="edgeleft@example.com",
+            display_name="Edge Left",
+            description="Strong park lover.",
+        )
+        right = self._create_profile(
+            username="edgeright",
+            email="edgeright@example.com",
+            display_name="Edge Right",
+            description="Strong park avoider.",
+        )
+
+        left.elder_profile.feature_vector.update(
+            {
+                "interest_nature": 1.0,
+                "interest_sports": 0.9,
+                "activity_level": 0.9,
+            }
+        )
+        left.elder_profile.feature_confidence = {name: 1.0 for name in left.elder_profile.feature_vector}
+        left.elder_profile.save(update_fields=["feature_vector", "feature_confidence", "updated_at"])
+
+        right.elder_profile.feature_vector.update(
+            {
+                "interest_nature": 0.0,
+                "interest_sports": 0.1,
+                "activity_level": 0.1,
+            }
+        )
+        right.elder_profile.feature_confidence = {name: 1.0 for name in right.elder_profile.feature_vector}
+        right.elder_profile.save(update_fields=["feature_vector", "feature_confidence", "updated_at"])
+
+        from .services import refresh_social_edge_for_friendship
+
+        edge = refresh_social_edge_for_friendship(left, right)
+
+        self.assertIsNotNone(edge)
+        self.assertLess(edge.gat_weight, 0.75)
+
+    def test_accepted_friendship_adds_only_a_modest_bonus(self):
+        viewer = self._create_profile(
+            username="quietviewer",
+            email="quietviewer@example.com",
+            display_name="Quiet Viewer",
+            description="Likes deep philosophical conversations, matcha, and calm cafes.",
+        )
+        target = self._create_profile(
+            username="loudfriend",
+            email="loudfriend@example.com",
+            display_name="Loud Friend",
+            description="Likes loud parties and outdoor sports.",
+        )
+
+        self._set_feature_vector(
+            viewer,
+            extroversion=0.15,
+            prefers_small_groups=0.92,
+            conversation_depth=0.95,
+            activity_level=0.20,
+            adventure_comfort=0.15,
+            interest_arts=0.85,
+            interest_sports=0.10,
+            interest_nature=0.20,
+        )
+        self._set_feature_vector(
+            target,
+            extroversion=0.92,
+            prefers_small_groups=0.12,
+            conversation_depth=0.20,
+            activity_level=0.95,
+            adventure_comfort=0.90,
+            interest_arts=0.15,
+            interest_sports=0.95,
+            interest_nature=0.90,
+        )
+
+        before_row = next(
+            item for item in recommend_profiles_for_viewer(viewer, limit=5) if item["user_id"] == target.user_id
+        )
+
+        FriendRequest.objects.create(
+            from_profile=viewer,
+            to_profile=target,
+            status=FriendRequest.Status.ACCEPTED,
+            responded_at=timezone.now(),
+        )
+        SocialEdge.upsert(viewer.elder_profile, target.elder_profile, 0.32)
+
+        after_row = next(
+            item for item in recommend_profiles_for_viewer(viewer, limit=5) if item["user_id"] == target.user_id
+        )
+
+        self.assertAlmostEqual(
+            before_row["score_components"]["semantic_similarity"],
+            after_row["score_components"]["semantic_similarity"],
+            places=4,
+        )
+        self.assertGreater(after_row["raw_score"], before_row["raw_score"])
+        self.assertLess(after_row["raw_score"] - before_row["raw_score"], 0.08)
+        self.assertGreater(after_row["score_components"]["friendship_signal"], 0.0)
+        self.assertGreater(after_row["score_components"]["friendship_bonus"], 0.0)
+        self.assertLess(after_row["score_components"]["semantic_similarity"], 0.65)
+
+    def test_semantic_match_can_still_outrank_accepted_friend(self):
+        viewer = self._create_profile(
+            username="thoughtfulviewer",
+            email="thoughtfulviewer@example.com",
+            display_name="Thoughtful Viewer",
+            description="Likes deep philosophical conversations, matcha, and calm cafes.",
+        )
+        accepted_friend = self._create_profile(
+            username="partyfriend",
+            email="partyfriend@example.com",
+            display_name="Party Friend",
+            description="Likes loud parties and outdoor sports.",
+        )
+        semantic_match = self._create_profile(
+            username="calmmatch",
+            email="calmmatch@example.com",
+            display_name="Calm Match",
+            description="Enjoys reflective talks, tea rituals, and quiet cafe afternoons.",
+        )
+
+        self._set_feature_vector(
+            viewer,
+            extroversion=0.20,
+            prefers_small_groups=0.90,
+            conversation_depth=0.96,
+            activity_level=0.25,
+            adventure_comfort=0.20,
+            interest_arts=0.88,
+            interest_sports=0.12,
+            interest_nature=0.25,
+            listening_style=0.90,
+        )
+        self._set_feature_vector(
+            accepted_friend,
+            extroversion=0.95,
+            prefers_small_groups=0.10,
+            conversation_depth=0.22,
+            activity_level=0.94,
+            adventure_comfort=0.95,
+            interest_arts=0.15,
+            interest_sports=0.94,
+            interest_nature=0.92,
+            listening_style=0.25,
+        )
+        self._set_feature_vector(
+            semantic_match,
+            extroversion=0.30,
+            prefers_small_groups=0.85,
+            conversation_depth=0.92,
+            activity_level=0.32,
+            adventure_comfort=0.30,
+            interest_arts=0.83,
+            interest_sports=0.18,
+            interest_nature=0.30,
+            listening_style=0.86,
+        )
+
+        FriendRequest.objects.create(
+            from_profile=viewer,
+            to_profile=accepted_friend,
+            status=FriendRequest.Status.ACCEPTED,
+            responded_at=timezone.now(),
+        )
+        SocialEdge.upsert(viewer.elder_profile, accepted_friend.elder_profile, 0.34)
+
+        rows = recommend_profiles_for_viewer(viewer, limit=5)
+        self.assertEqual(rows[0]["user_id"], semantic_match.user_id)
+
+        rows_by_user_id = {item["user_id"]: item for item in rows}
+        friend_row = rows_by_user_id[accepted_friend.user_id]
+        semantic_row = rows_by_user_id[semantic_match.user_id]
+
+        self.assertGreater(semantic_row["score_components"]["semantic_similarity"], 0.70)
+        self.assertLess(friend_row["score_components"]["semantic_similarity"], 0.65)
+        self.assertGreater(friend_row["score_components"]["friendship_signal"], 0.0)
+        self.assertGreater(semantic_row["raw_score"], friend_row["raw_score"])
 
     def test_description_query_ranks_by_typed_persona(self):
         viewer = self._create_profile(
