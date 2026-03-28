@@ -11,14 +11,14 @@ import torch
 import torch.optim as optim
 
 from .feature_schema import (
+    FEATURE_NAMES,
     get_default_feature_vector,
     get_feature_groups,
     get_feature_names,
-    get_recommended_core_features,
 )
 from .feature_updater import compute_compatibility_score
 from .gat_model import create_model, cosine_similarity_matrix, top_k_recommendations
-from .graph_builder import build_graph, edge_pairs_from_index
+from .graph_builder import balance_feature_tensor, build_graph, edge_pairs_from_index
 
 _MODEL_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
 _MODEL_PATH = os.path.join(_MODEL_DIR, "elder_gat.pt")
@@ -110,25 +110,27 @@ def _augment_feature_tensor(base_x: torch.Tensor, selected_features: list[str]) 
                 if base_name not in base_indices:
                     continue
                 derived_column += base_x[:, base_indices[base_name]].unsqueeze(1) * weight
-            columns.append(derived_column.clamp(0.0, 1.0))
+            # Derived columns are useful context, but they should not fully duplicate
+            # the base traits they are computed from.
+            columns.append((derived_column.clamp(0.0, 1.0) * 0.7) + 0.15)
     if not columns:
-        return base_x
-    return torch.cat(columns, dim=1)
+        return balance_feature_tensor(base_x)
+    return balance_feature_tensor(torch.cat(columns, dim=1))
 
 
 def _normalize_enabled_features(enabled_features: list[str] | None) -> list[str]:
     feature_names = _all_search_feature_names()
     if not enabled_features:
-        return list(get_recommended_core_features())
+        return list(FEATURE_NAMES)
 
     enabled_set = set(enabled_features)
     normalized = [feature for feature in feature_names if feature in enabled_set]
-    return normalized or list(get_recommended_core_features())
+    return normalized or list(FEATURE_NAMES)
 
 
 def _default_graph_params() -> dict:
     return {
-        "use_social_edges": False,
+        "use_social_edges": True,
         "neighbor_k": 5,
         "min_similarity": 0.15,
     }
@@ -136,7 +138,7 @@ def _default_graph_params() -> dict:
 
 def _default_model_params() -> dict:
     return {
-        "model_family": "legacy_gat",
+        "model_family": "pyg_gatv2_ranker",
         "hidden_channels": 48,
         "out_channels": 16,
         "heads": 4,

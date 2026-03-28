@@ -1,9 +1,11 @@
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.test import TestCase
+from django.test.utils import override_settings
 from django.utils import timezone
 
 from recommendations.models import ElderProfile, SocialEdge
@@ -81,6 +83,99 @@ class AccountApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["profile"]["user_id"], profile.user_id)
         self.assertEqual(payload["profile"]["phone_number"], "+359888111999")
+
+    @override_settings(ACCOUNT_JWT_TTL_SECONDS=3600)
+    def test_issue_token_sets_expected_jwt_expiration_and_jti(self):
+        profile = self._create_profile(
+            username="jwt-expiry-user",
+            email="jwt-expiry@example.com",
+            phone_number="+359888111998",
+            display_name="JWT Expiry User",
+        )
+
+        with patch("apps.accounts.services.time.time", return_value=1_710_000_000):
+            token = issue_token(profile.user)
+
+        _, payload_segment, _ = token.key.split(".")
+        payload = json.loads(_base64url_decode(payload_segment).decode("utf-8"))
+
+        self.assertEqual(payload["user_id"], profile.user_id)
+        self.assertEqual(payload["phone_number"], "+359888111998")
+        self.assertEqual(payload["jti"], token.session_key)
+        self.assertEqual(payload["iat"], 1_710_000_000)
+        self.assertEqual(payload["exp"], 1_710_003_600)
+        self.assertEqual(payload["exp"] - payload["iat"], 3600)
+
+    def test_profile_for_token_rejects_tampered_signature(self):
+        profile = self._create_profile(
+            username="jwt-tamper-user",
+            email="jwt-tamper@example.com",
+            phone_number="+359888111997",
+            display_name="JWT Tamper User",
+        )
+        token = issue_token(profile.user)
+        header_segment, payload_segment, signature_segment = token.key.split(".")
+        tampered_payload = payload_segment[:-1] + ("A" if payload_segment[-1] != "A" else "B")
+        tampered_token = f"{header_segment}.{tampered_payload}.{signature_segment}"
+
+        self.assertIsNone(profile_for_token(tampered_token))
+
+        response = self.client.get(
+            "/api/accounts/me/",
+            **{"HTTP_AUTHORIZATION": f"Token {tampered_token}"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    @override_settings(ACCOUNT_JWT_TTL_SECONDS=60)
+    def test_profile_for_token_rejects_expired_jwt(self):
+        profile = self._create_profile(
+            username="jwt-expired-user",
+            email="jwt-expired@example.com",
+            phone_number="+359888111996",
+            display_name="JWT Expired User",
+        )
+
+        with patch("apps.accounts.services.time.time", return_value=2_000_000_000):
+            token = issue_token(profile.user)
+
+        with patch("apps.accounts.services.time.time", return_value=2_000_000_061):
+            self.assertIsNone(profile_for_token(token.key))
+
+    def test_profile_for_token_rejects_revoked_jti_session(self):
+        profile = self._create_profile(
+            username="jwt-revoked-user",
+            email="jwt-revoked@example.com",
+            phone_number="+359888111995",
+            display_name="JWT Revoked User",
+        )
+        token = issue_token(profile.user)
+        AccountToken.objects.filter(user=profile.user).delete()
+
+        self.assertIsNone(profile_for_token(token.key))
+
+    def test_profile_for_token_rejects_future_issued_at(self):
+        profile = self._create_profile(
+            username="jwt-future-user",
+            email="jwt-future@example.com",
+            phone_number="+359888111994",
+            display_name="JWT Future User",
+        )
+        issued = issue_token(profile.user)
+        future_iat = int(time.time()) + 300
+        forged_token = _encode_account_jwt(
+            {
+                "sub": str(profile.user.pk),
+                "user_id": profile.user.pk,
+                "phone_number": profile.phone_number,
+                "display_name": profile.display_name,
+                "jti": issued.session_key,
+                "iat": future_iat,
+                "exp": future_iat + 3600,
+                "token_type": "hello_again_access",
+            }
+        )
+
+        self.assertIsNone(profile_for_token(forged_token))
 
     @patch("apps.accounts.views.seed_social_graph_for_profile")
     @patch("apps.accounts.views.sync_profile_to_recommendations")
