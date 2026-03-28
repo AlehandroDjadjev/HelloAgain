@@ -1,9 +1,10 @@
 import json
 import sys
 from functools import lru_cache
+from urllib.parse import urlencode
 
-from django.http import HttpRequest, JsonResponse
-from django.shortcuts import render
+from django.http import HttpRequest, JsonResponse, HttpResponseRedirect
+from django.shortcuts import redirect, render
 from django.views.decorators.csrf import csrf_exempt
 
 from engine.qwen_worker_client import QwenWorkerClient
@@ -11,6 +12,10 @@ from engine.semi_agent_service import SemiAgentService
 
 qwen_client = QwenWorkerClient()
 semi_agent_service = SemiAgentService(qwen_client=qwen_client)
+
+
+class _HelloAgainAppRedirect(HttpResponseRedirect):
+    allowed_schemes = ["http", "https", "ftp", "helloagain"]
 
 
 @lru_cache(maxsize=1)
@@ -31,6 +36,16 @@ def _base_url(request: HttpRequest) -> str:
 
 
 def home_view(request: HttpRequest):
+    return render(
+        request,
+        "controller/navigation.html",
+        {
+            "initial_prompt": str(request.GET.get("prompt", "")).strip(),
+        },
+    )
+
+
+def console_view(request: HttpRequest):
     return render(request, "controller/home.html")
 
 
@@ -274,6 +289,46 @@ def agent_run_whitespace_view(request: HttpRequest, run_id: str):
     except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)
     return JsonResponse(result)
+
+
+@csrf_exempt
+def agent_navigation_view(request: HttpRequest):
+    if request.method not in {"GET", "POST"}:
+        return JsonResponse({"detail": "GET or POST required"}, status=405)
+
+    try:
+        payload = _parse_json_request(request) if request.method == "POST" else {}
+    except json.JSONDecodeError as exc:
+        return JsonResponse({"detail": f"invalid JSON body: {exc}"}, status=400)
+
+    prompt = str(
+        payload.get("prompt", "") if request.method == "POST" else request.GET.get("prompt", "")
+    ).strip()
+    if not prompt:
+        return JsonResponse({"detail": "prompt required"}, status=400)
+
+    query = urlencode({"prompt": prompt})
+    return redirect(f"/?{query}")
+
+
+@csrf_exempt
+def agent_phone_command_open_view(request: HttpRequest):
+    if request.method not in {"GET", "POST"}:
+        return JsonResponse({"detail": "GET or POST required"}, status=405)
+
+    try:
+        payload = _parse_json_request(request) if request.method == "POST" else {}
+    except json.JSONDecodeError as exc:
+        return JsonResponse({"detail": f"invalid JSON body: {exc}"}, status=400)
+
+    prompt = str(
+        payload.get("prompt", "") if request.method == "POST" else request.GET.get("prompt", "")
+    ).strip()
+    if not prompt:
+        return JsonResponse({"detail": "prompt required"}, status=400)
+
+    query = urlencode({"prompt": prompt})
+    return _HelloAgainAppRedirect(f"helloagain://phone-command?{query}")
 
 
 @csrf_exempt

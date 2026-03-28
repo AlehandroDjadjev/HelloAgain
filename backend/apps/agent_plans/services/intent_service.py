@@ -218,6 +218,45 @@ class IntentService:
             return fallback
 
     @staticmethod
+    def parse_navigation_only(transcript: str) -> IntentResult:
+        """
+        Deterministic navigation-only parser.
+
+        This intentionally bypasses the LLM/Qwen path and uses the keyword
+        fallback logic so navigator flows stay API-only and predictable.
+        """
+        fallback = _KeywordFallback().parse(transcript)
+        destination = str((fallback.entities or {}).get("destination", "")).strip()
+        is_valid_navigation = (
+            fallback.goal_type in ("navigate_to", "start_navigation")
+            and fallback.app_package == "com.google.android.apps.maps"
+            and destination != ""
+        )
+        if is_valid_navigation:
+            fallback.goal_type = "navigate_to"
+            fallback.target_app = "Google Maps"
+            fallback.risk_level = "medium"
+            fallback.confidence = max(fallback.confidence, 0.92)
+            fallback.ambiguity_flags = [
+                flag for flag in fallback.ambiguity_flags
+                if flag not in {"not_actionable_request"}
+            ]
+            fallback.raw_llm_response = "navigation_api_only"
+            return fallback
+
+        return IntentResult(
+            goal="No actionable navigation command",
+            goal_type="invalid_request",
+            app_package="",
+            target_app="",
+            entities={},
+            risk_level="low",
+            confidence=0.2,
+            ambiguity_flags=["not_navigation_request"],
+            raw_llm_response="navigation_api_only",
+        )
+
+    @staticmethod
     def parse(transcript: str) -> dict:
         """
         Legacy compatibility shim used by old views.
@@ -328,7 +367,22 @@ class _KeywordFallback:
         if any(w in lower for w in ("chrome", "browser", "open website", "go to website")) or has_url:
             goal_type = "open_website" if has_url else "search"
             return "com.android.chrome", "Chrome", goal_type, "medium"
-        if any(w in lower for w in ("maps", "navigate", "direction", "route", "get to")):
+        if any(
+            w in lower
+            for w in (
+                "maps",
+                "navigate",
+                "direction",
+                "route",
+                "get to",
+                "take me to",
+                "drive to",
+                "bring me to",
+                "заведи ме до",
+                "закарай ме до",
+                "отведи ме до",
+            )
+        ):
             return "com.google.android.apps.maps", "Google Maps", "navigate_to", "medium"
         if "brawl stars" in lower or "brawlstars" in lower or "brawl star" in lower:
             return "com.supercell.brawlstars", "Brawl Stars", "open_app", "low"
@@ -378,7 +432,19 @@ class _KeywordFallback:
                     if msg:
                         entities["message"] = msg
         if goal_type in ("navigate_to", "start_navigation"):
-            for kw in ("to ", "navigate to ", "go to ", "get to ", "directions to "):
+            for kw in (
+                "navigate to ",
+                "go to ",
+                "get to ",
+                "directions to ",
+                "take me to ",
+                "drive to ",
+                "bring me to ",
+                "заведи ме до ",
+                "закарай ме до ",
+                "отведи ме до ",
+                "to ",
+            ):
                 idx = lower.find(kw)
                 if idx != -1:
                     entities["destination"] = lower[idx + len(kw):].strip()

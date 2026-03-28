@@ -1,10 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:collection';
+import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_tts/flutter_tts.dart';
-import 'package:speech_to_text/speech_recognition_result.dart';
-import 'package:speech_to_text/speech_to_text.dart';
+import 'package:record/record.dart';
 
 class CapturedAudioTurn {
   const CapturedAudioTurn({
@@ -21,12 +22,19 @@ class CapturedAudioTurn {
 }
 
 class BrowserVoiceBridge {
-  final SpeechToText _speech = SpeechToText();
   final FlutterTts _tts = FlutterTts();
   final AudioPlayer _player = AudioPlayer();
+  final AudioRecorder _recorder = AudioRecorder();
+
+  static const int _sampleRate = 16000;
+  static const int _channels = 1;
+  static const double _speechThreshold = 0.045;
+  static const Duration _maxTurnLength = Duration(seconds: 18);
+  static const Duration _minTurnLength = Duration(milliseconds: 700);
+  static const Duration _silenceWindow = Duration(milliseconds: 1800);
+  static const int _preSpeechChunkLimit = 8;
 
   bool _initialized = false;
-  String _capturedWords = '';
 
   bool get isSpeechRecognitionSupported => true;
 
@@ -34,76 +42,125 @@ class BrowserVoiceBridge {
     String language = 'bg-BG',
   }) async {
     await _ensureInitialized(language);
-    _capturedWords = '';
+    if (!await _recorder.hasPermission()) {
+      throw StateError('Microphone permission was not granted.');
+    }
+
+    await _player.stop();
+    await _tts.stop();
+
+    final stream = await _recorder.startStream(
+      const RecordConfig(
+        encoder: AudioEncoder.pcm16bits,
+        sampleRate: _sampleRate,
+        numChannels: _channels,
+        echoCancel: true,
+        noiseSuppress: true,
+      ),
+    );
 
     final completer = Completer<CapturedAudioTurn>();
-    late final void Function(String status) onStatus;
-    onStatus = (status) {
+    final preSpeechChunks = ListQueue<Uint8List>();
+    final turnChunks = <Uint8List>[];
+    var speechDetected = false;
+    DateTime? speechStartedAt;
+    DateTime? lastVoiceAt;
+    StreamSubscription<Uint8List>? sub;
+
+    Future<void> finishCapture() async {
       if (completer.isCompleted) {
         return;
       }
-      if (status == 'done' || status == 'notListening') {
-        final transcript = _capturedWords.trim();
-        if (transcript.isEmpty) {
-          completer.completeError(StateError('No speech was captured.'));
+
+      await sub?.cancel();
+      sub = null;
+      try {
+        await _recorder.stop();
+      } catch (_) {}
+
+      final pcmBytes = _joinChunks(turnChunks);
+      if (speechStartedAt == null ||
+          DateTime.now().difference(speechStartedAt!) < _minTurnLength ||
+          pcmBytes.isEmpty) {
+        completer.completeError(StateError('No speech was captured.'));
+        return;
+      }
+
+      final wavBytes = _wrapPcmAsWav(
+        pcmBytes,
+        sampleRate: _sampleRate,
+        channels: _channels,
+      );
+      completer.complete(
+        CapturedAudioTurn(
+          audioBase64: base64Encode(wavBytes),
+          mimeType: 'audio/wav',
+          language: language,
+        ),
+      );
+    }
+
+    sub = stream.listen(
+      (chunk) {
+        if (completer.isCompleted) {
           return;
         }
-        completer.complete(
-          CapturedAudioTurn(
-            audioBase64: '',
-            mimeType: 'text/plain',
-            language: language,
-            transcript: transcript,
-          ),
-        );
-      }
-    };
 
-    final ready = await _speech.initialize(
-      onStatus: onStatus,
-      onError: (error) {
+        final level = _pcmLevel(chunk);
+        final now = DateTime.now();
+
+        if (speechDetected) {
+          turnChunks.add(chunk);
+          if (level >= _speechThreshold) {
+            lastVoiceAt = now;
+          }
+
+          if (speechStartedAt != null &&
+              now.difference(speechStartedAt!) >= _maxTurnLength) {
+            unawaited(finishCapture());
+          } else if (lastVoiceAt != null &&
+              now.difference(lastVoiceAt!) >= _silenceWindow) {
+            unawaited(finishCapture());
+          }
+          return;
+        }
+
+        preSpeechChunks.add(chunk);
+        while (preSpeechChunks.length > _preSpeechChunkLimit) {
+          preSpeechChunks.removeFirst();
+        }
+
+        if (level >= _speechThreshold) {
+          speechDetected = true;
+          speechStartedAt = now;
+          lastVoiceAt = now;
+          turnChunks
+            ..clear()
+            ..addAll(preSpeechChunks)
+            ..add(chunk);
+          preSpeechChunks.clear();
+        }
+      },
+      onError: (Object error, StackTrace stackTrace) async {
         if (!completer.isCompleted) {
-          completer.completeError(StateError(error.errorMsg));
+          await sub?.cancel();
+          sub = null;
+          try {
+            await _recorder.stop();
+          } catch (_) {}
+          completer.completeError(StateError(error.toString()));
         }
       },
+      cancelOnError: true,
     );
-    if (!ready) {
-      throw StateError('Speech recognition is unavailable on this device.');
-    }
-
-    final localeId = await _resolveLocale(language);
-    final started = await _speech.listen(
-      onResult: (SpeechRecognitionResult result) {
-        _capturedWords = result.recognizedWords;
-        if (result.finalResult && !completer.isCompleted) {
-          completer.complete(
-            CapturedAudioTurn(
-              audioBase64: '',
-              mimeType: 'text/plain',
-              language: localeId,
-              transcript: result.recognizedWords.trim(),
-            ),
-          );
-        }
-      },
-      // ignore: deprecated_member_use
-      partialResults: true,
-      // ignore: deprecated_member_use
-      cancelOnError: false,
-      localeId: localeId,
-      listenFor: const Duration(seconds: 20),
-      pauseFor: const Duration(seconds: 3),
-      // ignore: deprecated_member_use
-      listenMode: ListenMode.confirmation,
-    );
-    if (!started) {
-      throw StateError('Speech recognition could not start.');
-    }
 
     return completer.future.timeout(
       const Duration(seconds: 24),
       onTimeout: () async {
-        await _speech.stop();
+        await sub?.cancel();
+        try {
+          await _recorder.stop();
+        } catch (_) {}
         throw TimeoutException('Timed out while listening for speech.');
       },
     );
@@ -137,7 +194,7 @@ class BrowserVoiceBridge {
   }
 
   void stopRecognition() {
-    unawaited(_speech.stop());
+    unawaited(_recorder.stop());
   }
 
   void stopAudio() {
@@ -149,14 +206,12 @@ class BrowserVoiceBridge {
     if (_initialized) {
       return;
     }
-    await _speech.initialize();
     await _tts.awaitSpeakCompletion(true);
     await _tts.setSpeechRate(0.42);
     await _tts.setPitch(1.0);
     await _player.setReleaseMode(ReleaseMode.stop);
-    final localeId = await _resolveLocale(preferredLanguage);
     await _tts.setLanguage(
-      localeId.toLowerCase().startsWith('bg') ? 'bg-BG' : 'en-US',
+      preferredLanguage.toLowerCase().startsWith('bg') ? 'bg-BG' : 'en-US',
     );
     _initialized = true;
   }
@@ -175,16 +230,65 @@ class BrowserVoiceBridge {
     }
   }
 
-  Future<String> _resolveLocale(String preferredLanguage) async {
-    final preferred = preferredLanguage.replaceAll('-', '_');
-    final locales = await _speech.locales();
-    for (final candidate in [preferred, 'bg_BG', 'en_US', 'en_GB']) {
-      final match = locales.where((item) => item.localeId == candidate);
-      if (match.isNotEmpty) {
-        return candidate;
+  Uint8List _joinChunks(List<Uint8List> chunks) {
+    final builder = BytesBuilder(copy: false);
+    for (final chunk in chunks) {
+      builder.add(chunk);
+    }
+    return builder.takeBytes();
+  }
+
+  double _pcmLevel(Uint8List bytes) {
+    if (bytes.length < 2) {
+      return 0;
+    }
+
+    var maxAmplitude = 0.0;
+    for (var i = 0; i + 1 < bytes.length; i += 2) {
+      final sample = bytes[i] | (bytes[i + 1] << 8);
+      final signed = sample >= 0x8000 ? sample - 0x10000 : sample;
+      final amplitude = signed.abs() / 32768.0;
+      if (amplitude > maxAmplitude) {
+        maxAmplitude = amplitude;
       }
     }
-    return preferred;
+    return maxAmplitude;
+  }
+
+  Uint8List _wrapPcmAsWav(
+    Uint8List pcmBytes, {
+    required int sampleRate,
+    required int channels,
+  }) {
+    final byteRate = sampleRate * channels * 2;
+    final blockAlign = channels * 2;
+    final dataLength = pcmBytes.length;
+    final totalLength = 44 + dataLength;
+    final out = ByteData(totalLength);
+
+    void writeAscii(int offset, String value) {
+      for (var i = 0; i < value.length; i += 1) {
+        out.setUint8(offset + i, value.codeUnitAt(i));
+      }
+    }
+
+    writeAscii(0, 'RIFF');
+    out.setUint32(4, totalLength - 8, Endian.little);
+    writeAscii(8, 'WAVE');
+    writeAscii(12, 'fmt ');
+    out.setUint32(16, 16, Endian.little);
+    out.setUint16(20, 1, Endian.little);
+    out.setUint16(22, channels, Endian.little);
+    out.setUint32(24, sampleRate, Endian.little);
+    out.setUint32(28, byteRate, Endian.little);
+    out.setUint16(32, blockAlign, Endian.little);
+    out.setUint16(34, 16, Endian.little);
+    writeAscii(36, 'data');
+    out.setUint32(40, dataLength, Endian.little);
+
+    final wavBytes = out.buffer.asUint8List();
+    wavBytes.setRange(44, totalLength, pcmBytes);
+    return wavBytes;
   }
 }
 

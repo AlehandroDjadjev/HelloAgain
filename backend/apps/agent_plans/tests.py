@@ -98,6 +98,13 @@ class BrawlStarsSupportTests(SimpleTestCase):
         self.assertIn("not_actionable_request", result.ambiguity_flags)
         self.assertLess(result.confidence, 0.5)
 
+    def test_keyword_fallback_detects_take_me_to_as_navigation(self):
+        result = IntentService()._fallback_service.parse("Take me to Central Park")
+
+        self.assertEqual(result.goal_type, "navigate_to")
+        self.assertEqual(result.app_package, "com.google.android.apps.maps")
+        self.assertEqual(result.entities.get("destination"), "central park")
+
 
 class PlanServiceStoreIntentTests(TestCase):
     def test_store_intent_retries_after_sqlite_lock(self):

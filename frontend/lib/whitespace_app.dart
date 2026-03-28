@@ -12,6 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'browser_voice_bridge.dart';
 import 'src/config/backend_base_url.dart';
+import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
 
 Future<void> main() async {
@@ -1107,6 +1108,37 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     await _submitPrompt(message: message, triggeredBySpeech: false);
   }
 
+  Future<void> _openNavigationApiTestPage() async {
+    if (_isBusy || _isListening) return;
+
+    final prompt = _promptController.text.trim();
+    if (prompt.isEmpty) {
+      setState(() {
+        _statusText = 'Write a prompt first, then I will open the phone command page and run it immediately.';
+      });
+      return;
+    }
+
+    setState(() {
+      _statusText = 'Opening phone command with "$prompt"...';
+    });
+
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => NavigationLauncherScreen(
+          initialPrompt: prompt,
+          autoRunOnOpen: true,
+        ),
+      ),
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _statusText = 'Returned from the navigation run page.';
+    });
+  }
+
   void _toggleVoiceLoop() {
     if (_voiceLoopEnabled) {
       _stopVoiceLoop(
@@ -1665,6 +1697,44 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 ),
                               ),
                             ],
+                          ),
+                          const SizedBox(height: 10),
+                          GestureDetector(
+                            onTap: (_isBusy || _isListening)
+                                ? null
+                                : _openNavigationApiTestPage,
+                            child: Container(
+                              height: 50,
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF1F7A5A),
+                                borderRadius: BorderRadius.circular(18),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: const Color(0xFF1F7A5A).withValues(alpha: 0.24),
+                                    blurRadius: 18,
+                                    offset: const Offset(0, 10),
+                                  ),
+                                ],
+                              ),
+                              child: const Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  Icon(
+                                    Icons.map_outlined,
+                                    color: Colors.white,
+                                  ),
+                                  SizedBox(width: 10),
+                                  Text(
+                                    'Run Phone Command',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
                           ),
                         ],
                       ),

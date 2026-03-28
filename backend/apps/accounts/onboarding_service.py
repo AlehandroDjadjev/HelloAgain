@@ -170,12 +170,14 @@ class OnboardingService:
         if self._find_existing_profile(draft.normalized_phone_number) is not None:
             raise ValueError("This phone number already belongs to an existing account.")
 
+        display_name = self._resolved_display_name(draft)
+
         with transaction.atomic():
             user = User.objects.create_user(
-                username=build_voice_username(draft.display_name, draft.phone_number),
+                username=build_voice_username(display_name, draft.phone_number),
                 email="",
             )
-            first_name, last_name = split_display_name(draft.display_name)
+            first_name, last_name = split_display_name(display_name)
             user.first_name = first_name
             user.last_name = last_name
             user.set_unusable_password()
@@ -183,11 +185,11 @@ class OnboardingService:
 
             profile = AccountProfile.objects.create(
                 user=user,
-                display_name=draft.display_name,
+                display_name=display_name,
                 phone_number=draft.phone_number,
                 description=draft.dynamic_profile_summary,
                 dynamic_profile_summary=build_dynamic_profile_summary(
-                    display_name=draft.display_name,
+                    display_name=display_name,
                     description=draft.dynamic_profile_summary,
                     onboarding_answers={},
                 ),
@@ -412,13 +414,21 @@ class OnboardingService:
         dynamic_profile_summary: str,
     ) -> list[str]:
         missing: list[str] = []
-        if not str(display_name or "").strip():
-            missing.append("display_name")
         if not normalize_phone_number(phone_number):
             missing.append("phone_number")
         if not str(dynamic_profile_summary or "").strip():
             missing.append("dynamic_profile_summary")
         return missing
+
+    def _resolved_display_name(self, draft: OnboardingDraft) -> str:
+        display_name = str(draft.display_name or "").strip()
+        if display_name:
+            return display_name
+
+        digits = re.sub(r"\D+", "", draft.phone_number or "")
+        if digits:
+            return f"Friend {digits[-4:]}"
+        return "Friend"
 
     def _follow_up_for_missing(self, draft: OnboardingDraft, missing: list[str]) -> str:
         if "display_name" in missing:

@@ -42,7 +42,7 @@ class PipelineOrchestrator extends ChangeNotifier {
   bool get _cancelled => _cancelRequested;
   bool get hasPreparedCommand => sessionId != null && parsedIntent != null;
 
-  Future<void> run(String command, {String reasoningProvider = 'local'}) async {
+  Future<void> run(String command, {String reasoningProvider = 'openai'}) async {
     if (phase.isRunning) return;
 
     await prepare(command, reasoningProvider: reasoningProvider);
@@ -52,7 +52,7 @@ class PipelineOrchestrator extends ChangeNotifier {
 
   Future<void> prepare(
     String command, {
-    String reasoningProvider = 'local',
+    String reasoningProvider = 'openai',
   }) async {
     if (phase.isRunning) return;
 
@@ -61,12 +61,87 @@ class PipelineOrchestrator extends ChangeNotifier {
     _log('Reasoning provider: ${_reasoningProviderLabel(reasoningProvider)}');
 
     try {
+      await _discoverSupportedPackages();
       await _createSession(reasoningProvider);
       if (_cancelled) return;
 
       await _parseIntent(command);
       if (_cancelled) return;
 
+      _setPhase(PipelinePhase.idle);
+    } on AgentApiException catch (e) {
+      _fail('API error ${e.statusCode}: ${e.shortMessage}');
+    } catch (e) {
+      _fail(e.toString());
+    }
+  }
+
+  Future<void> prepareNavigation(String command) async {
+    if (phase.isRunning) return;
+
+    _reset();
+    _log('Starting navigation pipeline: "$command"');
+    _log('Navigation mode: API-only Google Maps plan');
+
+    try {
+      await _discoverSupportedPackages();
+      if (_cancelled) return;
+
+      _setPhase(PipelinePhase.creatingSession);
+      _log('Preparing navigation session...');
+      final resp = await client.prepareNavigation(
+        prompt: command,
+        deviceId: 'flutter-navigation',
+        supportedPackages: _supportedPackages,
+      );
+      sessionId = resp['session_id'] as String?;
+      parsedIntent = (resp['intent'] as Map?)?.cast<String, dynamic>() ?? {};
+      final destination =
+          ((parsedIntent?['entities'] as Map?)?['destination'] ?? '').toString();
+      if (destination.isNotEmpty) {
+        _log('Navigation ready for $destination.', level: LogLevel.success);
+      } else {
+        _log('Navigation session prepared.', level: LogLevel.success);
+      }
+      _setPhase(PipelinePhase.idle);
+    } on AgentApiException catch (e) {
+      _fail('API error ${e.statusCode}: ${e.shortMessage}');
+    } catch (e) {
+      _fail(e.toString());
+    }
+  }
+
+  Future<void> preparePhoneCommand(
+    String command, {
+    String reasoningProvider = 'openai',
+  }) async {
+    if (phase.isRunning) return;
+
+    _reset();
+    _log('Starting phone command pipeline: "$command"');
+    _log('Reasoning provider: ${_reasoningProviderLabel(reasoningProvider)}');
+
+    try {
+      await _discoverSupportedPackages();
+      if (_cancelled) return;
+
+      _setPhase(PipelinePhase.creatingSession);
+      _log('Submitting prompt through the one-shot phone command API...');
+      final resp = await client.startPhoneCommand(
+        prompt: command,
+        deviceId: 'flutter-phone-command',
+        inputMode: 'text',
+        reasoningProvider: reasoningProvider,
+        supportedPackages: _supportedPackages,
+      );
+      sessionId = resp['session_id'] as String?;
+      parsedIntent = (resp['intent'] as Map?)?.cast<String, dynamic>() ?? {};
+      final goal = (parsedIntent?['goal'] ?? '').toString().trim();
+      if (goal.isNotEmpty) {
+        _log('Phone command ready: $goal', level: LogLevel.success);
+      } else {
+        _log('Phone command session prepared.', level: LogLevel.success);
+      }
       _setPhase(PipelinePhase.idle);
     } on AgentApiException catch (e) {
       _fail('API error ${e.statusCode}: ${e.shortMessage}');
@@ -159,7 +234,7 @@ class PipelineOrchestrator extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _createSession(String reasoningProvider) async {
+  Future<void> _discoverSupportedPackages() async {
     _setPhase(PipelinePhase.creatingSession);
     _log('Discovering installed Android apps...');
     _supportedPackages = await _gateway.listLaunchablePackages();
@@ -173,7 +248,9 @@ class PipelineOrchestrator extends ChangeNotifier {
         'Discovered ${_supportedPackages.length} launchable apps on this device.',
       );
     }
+  }
 
+  Future<void> _createSession(String reasoningProvider) async {
     _log('Creating agent session...');
     final resp = await client.createSession(
       inputMode: 'text',
@@ -202,9 +279,9 @@ class PipelineOrchestrator extends ChangeNotifier {
   Future<void> _startAndroidSession() async {
     _log('Starting Android accessibility session...');
     final appPackage =
-        parsedIntent?['target_app'] as String? ??
         parsedIntent?['app_package'] as String? ??
-        '';
+        parsedIntent?['target_app'] as String? ??
+          '';
     final result = await _gateway.startSession(
       SessionConfig(
         sessionId: sessionId!,
@@ -240,8 +317,8 @@ class PipelineOrchestrator extends ChangeNotifier {
       gateway: _gateway,
       sessionId: sessionId!,
       expectedPackage:
-          parsedIntent?['target_app'] as String? ??
           parsedIntent?['app_package'] as String? ??
+          parsedIntent?['target_app'] as String? ??
           '',
       onStepStarted: (step) {
         _upsertStep(step, StepStatus.running);
@@ -396,8 +473,9 @@ class PipelineOrchestrator extends ChangeNotifier {
       case 'openai':
         return 'OpenAI API';
       case 'local':
-      default:
         return 'Local model';
+      default:
+        return provider;
     }
   }
 }
