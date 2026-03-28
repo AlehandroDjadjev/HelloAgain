@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 from .qwen_config import QwenConfig
 from .prompts import build_parser_step_one_system_prompt, build_parser_step_two_system_prompt
 from .qwen_worker_client import QwenWorkerClient
+from voice_gateway.services.providers import OpenAILLMProvider
 
 ParserConfig = QwenConfig
 PARSER_STEP_MAX_NEW_TOKENS = 384
@@ -30,9 +31,16 @@ BLOCKED_ATTRIBUTE_NAMES = {
 
 
 class QwenPromptParser:
-    def __init__(self, config: ParserConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ParserConfig | None = None,
+        *,
+        qwen_client: QwenWorkerClient | None = None,
+        llm_provider: OpenAILLMProvider | None = None,
+    ) -> None:
         self.config = config or ParserConfig()
-        self._client = QwenWorkerClient(self.config)
+        self._client = qwen_client or QwenWorkerClient(self.config)
+        self._llm_provider = llm_provider or OpenAILLMProvider()
 
     @staticmethod
     def _extract_json(raw_text: str) -> Dict[str, Any]:
@@ -228,6 +236,43 @@ class QwenPromptParser:
     @staticmethod
     def _clean_text(value: Any) -> str:
         return " ".join(str(value or "").strip().split())
+
+    def _generate_and_parse_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        step_label: str,
+    ) -> Dict[str, Any]:
+        errors: List[str] = []
+
+        try:
+            openai_result = self._llm_provider.generate_reply_with_messages(
+                system_prompt=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                session_id=f"graph_parser_{step_label}",
+                user_id="graph_parser",
+                include_history=False,
+                store_history=False,
+            )
+            return self._extract_json(openai_result.text)
+        except Exception as exc:
+            errors.append(f"openai: {exc}")
+
+        try:
+            qwen_raw = self._client.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                generation_overrides={
+                    "max_new_tokens": PARSER_STEP_MAX_NEW_TOKENS,
+                    "json_continuation_budget": PARSER_STEP_JSON_CONTINUATION_BUDGET,
+                },
+            )
+            return self._extract_json(qwen_raw)
+        except Exception as exc:
+            errors.append(f"qwen: {exc}")
+
+        raise RuntimeError("Graph parser generation failed. " + " | ".join(errors))
 
     @classmethod
     def _clean_attribute_name(cls, value: Any) -> str:
@@ -689,30 +734,22 @@ class QwenPromptParser:
         action_inventory_text: str,
     ) -> Dict[str, Any]:
         step_one_prompt = build_parser_step_one_system_prompt(mode, attribute_inventory_text)
-        step_one_raw_text = self._client.generate(
+        step_one_parsed = self._generate_and_parse_json(
             system_prompt=step_one_prompt,
             user_prompt=user_prompt,
-            generation_overrides={
-                "max_new_tokens": PARSER_STEP_MAX_NEW_TOKENS,
-                "json_continuation_budget": PARSER_STEP_JSON_CONTINUATION_BUDGET,
-            },
+            step_label="step_one",
         )
-        step_one_parsed = self._extract_json(step_one_raw_text)
 
         step_two_prompt = build_parser_step_two_system_prompt(
             mode,
             action_inventory_text,
             step_one_parsed,
         )
-        step_two_raw_text = self._client.generate(
+        step_two_parsed = self._generate_and_parse_json(
             system_prompt=step_two_prompt,
             user_prompt=user_prompt,
-            generation_overrides={
-                "max_new_tokens": PARSER_STEP_MAX_NEW_TOKENS,
-                "json_continuation_budget": PARSER_STEP_JSON_CONTINUATION_BUDGET,
-            },
+            step_label="step_two",
         )
-        step_two_parsed = self._extract_json(step_two_raw_text)
         combined = self._merge_step_payloads(step_one_parsed, step_two_parsed)
         normalized = self._normalize_plan(mode=mode, raw_plan=combined)
         normalized["raw_response"] = {

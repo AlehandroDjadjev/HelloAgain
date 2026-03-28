@@ -28,7 +28,12 @@ Future<void> main() async {
 }
 
 class AgentBoardApp extends StatelessWidget {
-  const AgentBoardApp({super.key});
+  const AgentBoardApp({
+    super.key,
+    this.launchConfig = const WhitespaceLaunchConfig.fromEnvironment(),
+  });
+
+  final WhitespaceLaunchConfig launchConfig;
 
   @override
   Widget build(BuildContext context) {
@@ -40,921 +45,208 @@ class AgentBoardApp extends StatelessWidget {
         seedColor: const Color(0xFFBB5A3C),
         surfaceColor: const Color(0xFFFFFBF7),
       ),
-      home: const HelloAgainShell(),
+      home: StandaloneWhitespaceShell(launchConfig: launchConfig),
     );
   }
 }
 
-enum HelloAgainStage { booting, intro, onboarding, board }
+class WhitespaceLaunchConfig {
+  const WhitespaceLaunchConfig({
+    this.userId = '',
+    this.accountToken = '',
+    this.displayName = '',
+    this.skipStoredSessionLookup = false,
+  });
 
-class HelloAgainShell extends StatefulWidget {
-  const HelloAgainShell({super.key});
+  const WhitespaceLaunchConfig.fromEnvironment()
+    : userId = const String.fromEnvironment('WHITESPACE_USER_ID'),
+      accountToken = const String.fromEnvironment('WHITESPACE_ACCOUNT_TOKEN'),
+      displayName = const String.fromEnvironment('WHITESPACE_DISPLAY_NAME'),
+      skipStoredSessionLookup = const bool.fromEnvironment(
+        'WHITESPACE_SKIP_STORED_SESSION_LOOKUP',
+        defaultValue: false,
+      );
 
-  @override
-  State<HelloAgainShell> createState() => _HelloAgainShellState();
+  final String userId;
+  final String accountToken;
+  final String displayName;
+  final bool skipStoredSessionLookup;
+
+  String? get resolvedUserId {
+    final value = userId.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  String? get resolvedAccountToken {
+    final value = accountToken.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  String? get resolvedDisplayName {
+    final value = displayName.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  bool get hasExplicitLaunchData =>
+      resolvedUserId != null ||
+      resolvedAccountToken != null ||
+      resolvedDisplayName != null;
 }
 
-class _HelloAgainShellState extends State<HelloAgainShell> {
+class StandaloneWhitespaceShell extends StatefulWidget {
+  const StandaloneWhitespaceShell({
+    super.key,
+    this.launchConfig = const WhitespaceLaunchConfig.fromEnvironment(),
+  });
+
+  final WhitespaceLaunchConfig launchConfig;
+
+  @override
+  State<StandaloneWhitespaceShell> createState() =>
+      _StandaloneWhitespaceShellState();
+}
+
+class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
   static const _tokenKey = 'hello_again.account_token';
 
   late final AgentBackendClient _backendClient;
-  late final BrowserVoiceBridge _voiceBridge;
-
-  SharedPreferences? _prefs;
-  HelloAgainStage _stage = HelloAgainStage.booting;
-  AppAccountSession? _session;
-  bool _showContinue = false;
-  bool _isListening = false;
-  bool _isWorking = false;
-  bool _isConfirming = false;
-  int _currentStepIndex = 0;
-  String _statusText = 'Подготвяме Hello Again...';
-  String _promptText = '';
-  String _transcriptPreview = '';
-  final Map<String, String> _answers = <String, String>{};
-
-  static const List<_RegistrationStep> _steps = [
-    _RegistrationStep(
-      id: 'name',
-      title: 'Вашето име',
-      prompt:
-          'Здравейте. Кажете ми как искате приложението да Ви нарича.',
-    ),
-    _RegistrationStep(
-      id: 'phone_number',
-      title: 'Телефонен номер',
-      prompt:
-          'Сега кажете телефонния си номер бавно, цифра по цифра, за да създам профила Ви.',
-    ),
-    _RegistrationStep(
-      id: 'description',
-      title: 'Няколко думи за Вас',
-      prompt:
-          'Разкажете ми с няколко спокойни изречения какъв човек сте, за да Ви опозная.',
-    ),
-    _RegistrationStep(
-      id: 'ideal_company',
-      title: 'Приятна компания',
-      prompt:
-          'С какви хора се чувствате най-спокойно и приятно да прекарвате време?',
-    ),
-    _RegistrationStep(
-      id: 'favorite_things',
-      title: 'Любими теми',
-      prompt:
-          'За какво най-много обичате да говорите или какво обичате да правите напоследък?',
-    ),
-    _RegistrationStep(
-      id: 'good_meetup',
-      title: 'Хубава среща',
-      prompt:
-          'Какво прави една среща топла, спокойна и успешна за Вас?',
-    ),
-  ];
+  _ResolvedWhitespaceLaunch? _launch;
 
   @override
   void initState() {
     super.initState();
     _backendClient = AgentBackendClient();
-    _voiceBridge = createBrowserVoiceBridge();
     unawaited(_bootstrap());
-  }
-
-  @override
-  void dispose() {
-    _voiceBridge.stopRecognition();
-    _voiceBridge.stopAudio();
-    super.dispose();
   }
 
   Future<void> _bootstrap() async {
     final prefs = await SharedPreferences.getInstance();
-    AppAccountSession? session;
-    final storedToken = prefs.getString(_tokenKey) ?? '';
-    if (storedToken.isNotEmpty) {
-      try {
-        session = await _backendClient.fetchCurrentSession(token: storedToken);
-      } catch (_) {
-        await prefs.remove(_tokenKey);
-      }
-    }
+    final launch = await _resolveLaunch(prefs);
 
     if (!mounted) return;
     setState(() {
-      _prefs = prefs;
-      _session = session;
-      _stage = HelloAgainStage.intro;
-      _statusText = session == null
-          ? 'Спокойното начало е готово.'
-          : 'Добре дошли отново. Отварям Вашето място.';
+      _launch = launch;
     });
   }
 
-  void _handleIntroFinished() {
-    if (_session != null) {
-      setState(() {
-        _stage = HelloAgainStage.board;
-      });
-      return;
+  Future<_ResolvedWhitespaceLaunch> _resolveLaunch(
+    SharedPreferences prefs,
+  ) async {
+    final explicitLaunch = await _resolveExplicitLaunch();
+    if (explicitLaunch != null) {
+      return explicitLaunch;
     }
-    setState(() {
-      _showContinue = true;
-      _statusText = 'Натиснете „Продължи“ и ще Ви преведа през регистрацията.';
-    });
-  }
 
-  Future<void> _startRegistration() async {
-    if (_isWorking) return;
-    setState(() {
-      _showContinue = false;
-      _stage = HelloAgainStage.onboarding;
-      _currentStepIndex = 0;
-      _answers.clear();
-      _transcriptPreview = '';
-      _isConfirming = false;
-    });
-    await _runCurrentStep();
-  }
-
-  Future<void> _runCurrentStep() async {
-    final step = _steps[_currentStepIndex];
-    if (!mounted) return;
-    setState(() {
-      _promptText = step.prompt;
-      _statusText = 'Сега ще Ви задам въпроса на глас.';
-      _transcriptPreview = '';
-      _isWorking = true;
-      _isListening = false;
-      _isConfirming = false;
-    });
-
-    try {
-      while (mounted) {
-        await _speakOnboardingText(step.prompt);
-        if (!mounted) return;
-        setState(() {
-          _isListening = true;
-          _isConfirming = false;
-          _statusText = 'Слушам Ви внимателно...';
-        });
-
-        final capturedTurn = await _voiceBridge.captureAudioTurn(
-          language: 'bg-BG',
-        );
-        final transcript = await _resolveCapturedTranscript(capturedTurn);
-        final normalized = _normalizeAnswer(step.id, transcript);
-
-        if (normalized.isEmpty) {
-          await _speakOnboardingText(
-            'Не успях да Ви чуя добре. Ще повторя въпроса.',
+    if (!widget.launchConfig.skipStoredSessionLookup) {
+      final storedToken = (prefs.getString(_tokenKey) ?? '').trim();
+      if (storedToken.isNotEmpty) {
+        try {
+          final session = await _backendClient.fetchCurrentSession(
+            token: storedToken,
           );
-          if (!mounted) return;
-          setState(() {
-            _isListening = false;
-            _statusText = 'Не успях да чуя отговора ясно. Повтарям въпроса.';
-          });
-          continue;
+          return _ResolvedWhitespaceLaunch.fromSession(session);
+        } catch (_) {
+          await prefs.remove(_tokenKey);
         }
-
-        if (!mounted) return;
-        setState(() {
-          _transcriptPreview = normalized;
-          _isListening = false;
-          _isConfirming = true;
-          _statusText =
-              'Чух: „$normalized“. Кажете „да“ за потвърждение или „не“ за повторение.';
-        });
-
-        final confirmed = await _confirmTranscript(normalized);
-        if (!mounted) return;
-        if (!confirmed) {
-          setState(() {
-            _isConfirming = false;
-            _statusText = 'Добре, ще задам въпроса отново.';
-          });
-          continue;
-        }
-
-        _answers[step.id] = normalized;
-        break;
       }
-
-      if (!mounted) return;
-      setState(() {
-        _isConfirming = false;
-      });
-
-      if (_currentStepIndex == _steps.length - 1) {
-        await _submitRegistration();
-        return;
-      }
-
-      setState(() {
-        _currentStepIndex += 1;
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 260));
-      await _runCurrentStep();
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _isListening = false;
-        _isConfirming = false;
-        _isWorking = false;
-        _statusText =
-            'Не успях да чуя ясно. Натиснете веднъж и ще повторя текущия въпрос.';
-      });
     }
-  }
 
-  Future<bool> _confirmTranscript(String transcript) async {
-    await _speakOnboardingText(
-      'Чух: $transcript. Ако това е правилно, кажете да. Ако не е правилно, кажете не и ще повторя въпроса.',
+    return _ResolvedWhitespaceLaunch.guest(
+      userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+      displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
+      welcomeText:
+          'Whitespace board launched directly. Login and registration are skipped in this target.',
     );
-
-    while (mounted) {
-      setState(() {
-        _isListening = true;
-        _statusText = 'Моля, кажете само „да“ или „не“.';
-      });
-
-      final capturedTurn = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
-      final confirmation = await _resolveCapturedTranscript(capturedTurn);
-      final normalized = _normalizeConfirmationAnswer(confirmation);
-      if (normalized != null) {
-        setState(() {
-          _isListening = false;
-        });
-        return normalized;
-      }
-
-      setState(() {
-        _isListening = false;
-        _statusText = 'Не разбрах потвърждението. Ще попитам отново.';
-      });
-      await _speakOnboardingText('Не разбрах. Моля кажете само да или не.');
-    }
-
-    return false;
   }
 
-  Future<String> _resolveCapturedTranscript(CapturedAudioTurn capturedTurn) async {
-    final directTranscript = (capturedTurn.transcript ?? '').trim();
-    if (directTranscript.isNotEmpty) {
-      return directTranscript;
-    }
-    final payload = await _backendClient.transcribeSpeechTurn(
-      audioBase64: capturedTurn.audioBase64,
-      audioMimeType: capturedTurn.mimeType,
-      userId: 'hello_again_registration',
-      sessionId: 'registration_${DateTime.now().millisecondsSinceEpoch}',
-      language: capturedTurn.language,
-    );
-    return (payload['transcript'] ?? payload['message'] ?? '').toString().trim();
-  }
-
-  String _normalizeAnswer(String stepId, String transcript) {
-    final clean = transcript.trim();
-    if (stepId != 'phone_number') {
-      return clean;
+  Future<_ResolvedWhitespaceLaunch?> _resolveExplicitLaunch() async {
+    if (!widget.launchConfig.hasExplicitLaunchData) {
+      return null;
     }
 
-    final digitWords = <String, String>{
-      'zero': '0',
-      'oh': '0',
-      'one': '1',
-      'two': '2',
-      'three': '3',
-      'four': '4',
-      'for': '4',
-      'five': '5',
-      'six': '6',
-      'seven': '7',
-      'eight': '8',
-      'nine': '9',
-      'plus': '+',
-      'нула': '0',
-      'едно': '1',
-      'две': '2',
-      'два': '2',
-      'три': '3',
-      'четири': '4',
-      'пет': '5',
-      'шест': '6',
-      'седем': '7',
-      'осем': '8',
-      'девет': '9',
-    };
-
-    digitWords.addAll(const {
-      'нула': '0',
-      'едно': '1',
-      'две': '2',
-      'два': '2',
-      'три': '3',
-      'четири': '4',
-      'пет': '5',
-      'шест': '6',
-      'седем': '7',
-      'осем': '8',
-      'девет': '9',
-      'плюс': '+',
-    });
-
-    final pieces = clean
-        .toLowerCase()
-        .replaceAll('-', ' ')
-        .split(RegExp(r'\s+'))
-        .where((item) => item.trim().isNotEmpty);
-
-    final buffer = StringBuffer();
-    for (final piece in pieces) {
-      if (digitWords.containsKey(piece)) {
-        buffer.write(digitWords[piece]);
-      } else {
-        buffer.write(piece.replaceAll(RegExp(r'[^0-9+]'), ''));
-      }
-    }
-    return buffer.toString().trim();
-  }
-
-  bool? _normalizeConfirmationAnswer(String transcript) {
-    final words = transcript
-        .trim()
-        .toLowerCase()
-        .replaceAll(RegExp(r'[^a-zа-я0-9\s]+', caseSensitive: false), ' ')
-        .split(RegExp(r'\s+'))
-        .where((item) => item.isNotEmpty)
-        .toList();
-
-    const yesWords = {
-      'да',
-      'yes',
-      'yep',
-      'correct',
-      'правилно',
-      'точно',
-      'добре',
-      'става',
-    };
-    const noWords = {
-      'не',
-      'no',
-      'wrong',
-      'грешно',
-      'повтори',
-      'отново',
-    };
-
-    if (words.any(yesWords.contains)) {
-      return true;
-    }
-    if (words.any(noWords.contains)) {
-      return false;
-    }
-    return null;
-  }
-
-  Future<void> _speakOnboardingText(String text) async {
-    try {
-      final payload = await _backendClient.speakText(
-        text: text,
-        language: 'bg-BG',
-      );
-      final audioBase64 = (payload['audio_base64'] ?? '').toString().trim();
-      final mimeType =
-          (payload['audio_mime_type'] ?? 'audio/wav').toString().trim();
-      if (audioBase64.isNotEmpty) {
-        await _voiceBridge.playBase64Audio(
-          audioBase64: audioBase64,
-          mimeType: mimeType.isEmpty ? 'audio/wav' : mimeType,
+    final explicitToken = widget.launchConfig.resolvedAccountToken;
+    if (explicitToken != null) {
+      try {
+        final session = await _backendClient.fetchCurrentSession(
+          token: explicitToken,
         );
-        return;
+        return _ResolvedWhitespaceLaunch.fromSession(
+          session.copyWith(
+            displayName:
+                widget.launchConfig.resolvedDisplayName ?? session.displayName,
+            userId:
+                int.tryParse(widget.launchConfig.resolvedUserId ?? '') ??
+                session.userId,
+          ),
+        );
+      } catch (_) {
+        return _ResolvedWhitespaceLaunch(
+          userId:
+              widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+          accountToken: explicitToken,
+          welcomeText:
+              'The provided token could not be verified at startup, but the whitespace board was launched directly.',
+        );
       }
-    } catch (_) {}
-
-    await _voiceBridge.playText(text);
-  }
-
-  Future<void> _submitRegistration() async {
-    if (!mounted) return;
-    setState(() {
-      _statusText = 'Създавам Вашия профил...';
-      _isWorking = true;
-      _isConfirming = false;
-    });
-
-    final onboardingAnswers = <String, String>{
-      'ideal_company': _answers['ideal_company'] ?? '',
-      'favorite_things': _answers['favorite_things'] ?? '',
-      'good_meetup': _answers['good_meetup'] ?? '',
-    };
-
-    try {
-      final session = await _backendClient.registerVoiceProfile(
-        name: _answers['name'] ?? '',
-        phoneNumber: _answers['phone_number'] ?? '',
-        description: _answers['description'] ?? '',
-        onboardingAnswers: onboardingAnswers,
-      );
-      await _prefs?.setString(_tokenKey, session.token);
-      if (!mounted) return;
-      setState(() {
-        _session = session;
-        _stage = HelloAgainStage.board;
-        _isWorking = false;
-      });
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _isWorking = false;
-        _statusText =
-            'Регистрацията не можа да завърши. Натиснете веднъж и ще повторя текущата стъпка. ${error.toString()}';
-      });
     }
+
+    return _ResolvedWhitespaceLaunch.guest(
+      userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+      displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
+      welcomeText:
+          'Whitespace board launched with an explicit local user identity and no login flow.',
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    switch (_stage) {
-      case HelloAgainStage.booting:
-        return const Scaffold(
-          body: Center(child: CircularProgressIndicator()),
-        );
-      case HelloAgainStage.intro:
-        return IntroOnboardingScreen(
-          showContinue: _showContinue,
-          statusText: _statusText,
-          onFinished: _handleIntroFinished,
-          onContinue: _startRegistration,
-        );
-      case HelloAgainStage.onboarding:
-        final step = _steps[_currentStepIndex];
-        return RegistrationScreen(
-          title: step.title,
-          prompt: _promptText,
-          statusText: _statusText,
-          transcript: _transcriptPreview,
-          isListening: _isListening,
-          isWorking: _isWorking,
-          isConfirming: _isConfirming,
-          stepNumber: _currentStepIndex + 1,
-          stepCount: _steps.length,
-          onRetry: _runCurrentStep,
-        );
-      case HelloAgainStage.board:
-        final session = _session;
-        return AgentBoardScreen(
-          userId: session?.userId.toString() ?? 'whitespace_frontend',
-          accountToken: session?.token,
-          welcomeText: session == null
-              ? null
-              : 'Добре дошли, ${session.displayName}. Вашето място е готово.',
-        );
+    final launch = _launch;
+    if (launch == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
+
+    return AgentBoardScreen(
+      userId: launch.userId,
+      accountToken: launch.accountToken,
+      welcomeText: launch.welcomeText,
+    );
   }
 }
 
-class IntroOnboardingScreen extends StatefulWidget {
-  const IntroOnboardingScreen({
-    super.key,
-    required this.showContinue,
-    required this.statusText,
-    required this.onFinished,
-    required this.onContinue,
+class _ResolvedWhitespaceLaunch {
+  const _ResolvedWhitespaceLaunch({
+    required this.userId,
+    this.accountToken,
+    required this.welcomeText,
   });
 
-  final bool showContinue;
-  final String statusText;
-  final VoidCallback onFinished;
-  final Future<void> Function() onContinue;
+  final String userId;
+  final String? accountToken;
+  final String welcomeText;
 
-  @override
-  State<IntroOnboardingScreen> createState() => _IntroOnboardingScreenState();
-}
-
-class _IntroOnboardingScreenState extends State<IntroOnboardingScreen>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
-  bool _finished = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1400),
-    )..forward();
-    _controller.addStatusListener((status) {
-      if (!_finished && status == AnimationStatus.completed) {
-        _finished = true;
-        widget.onFinished();
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final slide = Tween<Offset>(
-      begin: const Offset(0, 1.4),
-      end: Offset.zero,
-    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic));
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFF4EDE3),
-      body: _WarmPaperBackground(
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 30),
-            child: Column(
-              children: [
-                const Spacer(),
-                SlideTransition(
-                  position: slide,
-                  child: const Text(
-                    'Hello Again',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 48,
-                      fontWeight: FontWeight.w700,
-                      color: Color(0xFF3C2A20),
-                      letterSpacing: -1.2,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 18),
-                Text(
-                  widget.statusText,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontSize: 17,
-                    height: 1.45,
-                    color: Color(0xFF6A5447),
-                  ),
-                ),
-                const Spacer(),
-                AnimatedOpacity(
-                  opacity: widget.showContinue ? 1 : 0,
-                  duration: const Duration(milliseconds: 420),
-                  curve: Curves.easeOut,
-                  child: AnimatedSlide(
-                    offset: widget.showContinue
-                        ? Offset.zero
-                        : const Offset(0, 0.16),
-                    duration: const Duration(milliseconds: 420),
-                    curve: Curves.easeOutCubic,
-                    child: IgnorePointer(
-                      ignoring: !widget.showContinue,
-                      child: SizedBox(
-                        width: double.infinity,
-                        child: FilledButton(
-                          onPressed: widget.onContinue,
-                          style: FilledButton.styleFrom(
-                            backgroundColor: const Color(0xFFB56B4D),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 18),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(22),
-                            ),
-                          ),
-                          child: const Text(
-                            'Продължи',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
+  factory _ResolvedWhitespaceLaunch.fromSession(AppAccountSession session) {
+    return _ResolvedWhitespaceLaunch(
+      userId: session.userId.toString(),
+      accountToken: session.token,
+      welcomeText:
+          'Welcome back, ${session.displayName}. The whitespace board is ready.',
     );
   }
-}
 
-class RegistrationScreen extends StatelessWidget {
-  const RegistrationScreen({
-    super.key,
-    required this.title,
-    required this.prompt,
-    required this.statusText,
-    required this.transcript,
-    required this.isListening,
-    required this.isWorking,
-    required this.isConfirming,
-    required this.stepNumber,
-    required this.stepCount,
-    required this.onRetry,
-  });
-
-  final String title;
-  final String prompt;
-  final String statusText;
-  final String transcript;
-  final bool isListening;
-  final bool isWorking;
-  final bool isConfirming;
-  final int stepNumber;
-  final int stepCount;
-  final Future<void> Function() onRetry;
-
-  @override
-  Widget build(BuildContext context) {
-    final progress = stepCount == 0 ? 0.0 : stepNumber / stepCount;
-    final indicatorColor = isListening
-        ? const Color(0xFFB56B4D)
-        : isConfirming
-        ? const Color(0xFF7A8B67)
-        : const Color(0xFFC8B6A1);
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFF4EDE3),
-      body: _WarmPaperBackground(
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
-            child: Column(
-              children: [
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.82),
-                    borderRadius: BorderRadius.circular(28),
-                    border: Border.all(
-                      color: const Color(0xFFE5D6C7),
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF8B6A55).withValues(alpha: 0.09),
-                        blurRadius: 26,
-                        offset: const Offset(0, 12),
-                      ),
-                    ],
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Стъпка $stepNumber от $stepCount',
-                        style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                          color: Color(0xFF8E725F),
-                          letterSpacing: 0.2,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(999),
-                        child: LinearProgressIndicator(
-                          value: progress.clamp(0, 1),
-                          minHeight: 6,
-                          backgroundColor: const Color(0xFFE9DDD1),
-                          valueColor: const AlwaysStoppedAnimation<Color>(
-                            Color(0xFFB56B4D),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 22),
-                      Text(
-                        title,
-                        style: const TextStyle(
-                          fontSize: 28,
-                          height: 1.1,
-                          fontWeight: FontWeight.w700,
-                          color: Color(0xFF2F241D),
-                        ),
-                      ),
-                      const SizedBox(height: 14),
-                      Text(
-                        prompt,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          height: 1.48,
-                          color: Color(0xFF625247),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Expanded(
-                  child: Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(20),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.70),
-                      borderRadius: BorderRadius.circular(28),
-                      border: Border.all(
-                        color: const Color(0xFFE8DCCF),
-                      ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        AnimatedContainer(
-                          duration: const Duration(milliseconds: 220),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: indicatorColor.withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Container(
-                                width: 10,
-                                height: 10,
-                                decoration: BoxDecoration(
-                                  color: indicatorColor,
-                                  shape: BoxShape.circle,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                isListening
-                                    ? 'Слушам'
-                                    : isConfirming
-                                    ? 'Чакам потвърждение'
-                                    : 'Вашият отговор',
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w700,
-                                  color: indicatorColor,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
-                        Text(
-                          transcript.isEmpty
-                              ? 'Говорете спокойно. Ще попълня отговора вместо Вас.'
-                              : transcript,
-                          style: const TextStyle(
-                            fontSize: 24,
-                            height: 1.42,
-                            color: Color(0xFF312620),
-                          ),
-                        ),
-                        const Spacer(),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFF8F1E8),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Text(
-                            statusText,
-                            style: const TextStyle(
-                              fontSize: 15,
-                              height: 1.45,
-                              color: Color(0xFF6D5A4E),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 14),
-                SizedBox(
-                  width: double.infinity,
-                  child: OutlinedButton(
-                    onPressed: isWorking ? null : onRetry,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: const Color(0xFF6B5444),
-                      side: const BorderSide(color: Color(0xFFD6C4B2)),
-                      backgroundColor: Colors.white.withValues(alpha: 0.60),
-                      padding: const EdgeInsets.symmetric(vertical: 18),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(22),
-                      ),
-                    ),
-                    child: Text(
-                      isListening ? 'Слушам...' : 'Повтори въпроса',
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
+  factory _ResolvedWhitespaceLaunch.guest({
+    required String userId,
+    required String displayName,
+    required String welcomeText,
+  }) {
+    final cleanDisplayName = displayName.trim();
+    final fallbackWelcome = cleanDisplayName.isEmpty
+        ? 'Whitespace board ready.'
+        : 'Welcome, $cleanDisplayName. The whitespace board is ready.';
+    return _ResolvedWhitespaceLaunch(
+      userId: userId,
+      welcomeText: welcomeText.isEmpty ? fallbackWelcome : welcomeText,
     );
   }
-}
-
-class _WarmPaperBackground extends StatelessWidget {
-  const _WarmPaperBackground({required this.child});
-
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        const ColoredBox(color: Color(0xFFF4EDE3)),
-        Positioned(
-          top: -28,
-          right: -10,
-          child: _BackdropOrb(
-            diameter: 180,
-            color: const Color(0xFFE8D7C6),
-          ),
-        ),
-        Positioned(
-          top: 120,
-          left: -46,
-          child: _BackdropOrb(
-            diameter: 128,
-            color: const Color(0xFFE3D4C3),
-          ),
-        ),
-        Positioned(
-          bottom: -44,
-          right: 18,
-          child: _BackdropOrb(
-            diameter: 168,
-            color: const Color(0xFFDDCBB8),
-          ),
-        ),
-        Positioned.fill(
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.06),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.22),
-              ),
-            ),
-          ),
-        ),
-        child,
-      ],
-    );
-  }
-}
-
-class _BackdropOrb extends StatelessWidget {
-  const _BackdropOrb({
-    required this.diameter,
-    required this.color,
-  });
-
-  final double diameter;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: diameter,
-      height: diameter,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: color.withValues(alpha: 0.42),
-        boxShadow: [
-          BoxShadow(
-            color: color.withValues(alpha: 0.22),
-            blurRadius: 48,
-            spreadRadius: 8,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _RegistrationStep {
-  const _RegistrationStep({
-    required this.id,
-    required this.title,
-    required this.prompt,
-  });
-
-  final String id;
-  final String title;
-  final String prompt;
 }
 
 class AppAccountSession {
@@ -967,6 +259,18 @@ class AppAccountSession {
   final String token;
   final int userId;
   final String displayName;
+
+  AppAccountSession copyWith({
+    String? token,
+    int? userId,
+    String? displayName,
+  }) {
+    return AppAccountSession(
+      token: token ?? this.token,
+      userId: userId ?? this.userId,
+      displayName: displayName ?? this.displayName,
+    );
+  }
 }
 
 class AgentBoardScreen extends StatefulWidget {
@@ -991,6 +295,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   late final BrowserVoiceBridge _voiceBridge;
   final TextEditingController _promptController = TextEditingController();
   late final String _sessionId;
+  _ActiveUserPopup? _activeUserPopup;
   String _lastSpeech =
       'The board is ready for the whitespace conversation pipeline.';
   String _statusText = 'Loading saved board memory...';
@@ -1030,17 +335,17 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     try {
       final payload = await _backendClient.fetchBoardMemory(
         token: widget.accountToken,
+        userId: widget.userId,
       );
       final boardState = Map<String, dynamic>.from(
         payload['board_state'] as Map? ?? const {},
       );
       final objects = (boardState['objects'] as List?) ?? const [];
-      if (objects.isNotEmpty) {
-        await _sceneController.executeCommandMap({
-          'action': 'hydrateScene',
-          'objects': objects,
-        });
-      }
+      await _sceneController.executeCommandMap({
+        'action': 'hydrateScene',
+        'objects': objects,
+      });
+      _closePopupIfObjectMissing();
       if (!mounted) return;
       setState(() {
         _statusText = objects.isEmpty
@@ -1067,16 +372,27 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       final payload = await _backendClient.openObject(
         object: object.toJson(),
         userId: widget.userId,
+        token: widget.accountToken,
       );
       await _applyCommands(payload['board_commands']);
       final viewer = Map<String, dynamic>.from(
         payload['viewer'] as Map? ?? const {},
       );
       if (mounted && viewer.isNotEmpty) {
-        await showDialog<void>(
-          context: context,
-          builder: (context) => AgentResultDialog(viewer: viewer),
-        );
+        final widgetType = (viewer['widget_type'] ?? '').toString();
+        if (widgetType == 'user_connection') {
+          setState(() {
+            _activeUserPopup = _ActiveUserPopup(
+              objectName: object.name,
+              viewer: viewer,
+            );
+          });
+        } else {
+          await showDialog<void>(
+            context: context,
+            builder: (context) => AgentResultDialog(viewer: viewer),
+          );
+        }
       }
       if (!mounted) return;
       setState(() {
@@ -1349,7 +665,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
               .catchError((_) {}),
         );
       } else if (speechText.isNotEmpty) {
-        _trackSpeechPlayback(_voiceBridge.playText(speechText).catchError((_) {}));
+        _trackSpeechPlayback(
+          _voiceBridge.playText(speechText).catchError((_) {}),
+        );
       }
       return;
     }
@@ -1389,6 +707,184 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         Map<String, dynamic>.from(rawCommand),
       );
     }
+    _closePopupIfObjectMissing();
+  }
+
+  Future<void> _removeBoardObject(SceneObjectData object) async {
+    await _sceneController.executeCommandMap({
+      'action': 'delete',
+      'name': object.name,
+    });
+  }
+
+  Future<void> _persistDeletedBoardObject(SceneObjectData object) async {
+    try {
+      final boardState = _sceneController.exportStateSnapshot();
+      final token = (widget.accountToken ?? '').trim();
+      if (token.isNotEmpty) {
+        await _backendClient.persistBoardMemory(
+          token: token,
+          boardState: boardState,
+          removedResultId: object.resultId,
+        );
+      } else {
+        await _backendClient.persistAnonymousBoardMemory(
+          userId: widget.userId,
+          boardState: boardState,
+          removedResultId: object.resultId,
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _statusText = 'Removed ${object.text} from the saved board state.';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _statusText =
+            'Removed ${object.text} locally, but could not save the board update. ${_formatError(error)}';
+      });
+    }
+  }
+
+  void _dismissUserPopup() {
+    if (!mounted) return;
+    setState(() {
+      _activeUserPopup = null;
+    });
+  }
+
+  void _closePopupIfObjectMissing() {
+    final popup = _activeUserPopup;
+    if (popup == null) return;
+    if (_sceneController.objects.containsKey(popup.objectName)) {
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _activeUserPopup = null;
+    });
+  }
+
+  Future<void> _persistBoardStateSilently() async {
+    final token = (widget.accountToken ?? '').trim();
+    try {
+      if (token.isNotEmpty) {
+        await _backendClient.persistBoardMemory(
+          token: token,
+          boardState: _sceneController.exportStateSnapshot(),
+        );
+      } else {
+        await _backendClient.persistAnonymousBoardMemory(
+          userId: widget.userId,
+          boardState: _sceneController.exportStateSnapshot(),
+        );
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _refreshBoardStateAndPopup({
+    bool closePopup = false,
+    Map<String, dynamic>? viewer,
+  }) async {
+    if (closePopup) {
+      _dismissUserPopup();
+    } else if (viewer != null && _activeUserPopup != null && mounted) {
+      setState(() {
+        _activeUserPopup = _activeUserPopup!.copyWith(viewer: viewer);
+      });
+    }
+    await _hydrateBoardFromBackend();
+  }
+
+  Future<void> _sendThreadMessage(int threadId, String message) async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      throw StateError(
+        'A logged-in account token is required to send messages.',
+      );
+    }
+    final payload = await _backendClient.sendThreadMessage(
+      threadId: threadId,
+      message: message,
+      token: token,
+    );
+    await _refreshBoardStateAndPopup(
+      viewer: Map<String, dynamic>.from(payload['viewer'] as Map? ?? const {}),
+    );
+  }
+
+  Future<void> _applyThreadFriendshipAction(
+    int threadId,
+    String action, {
+    String message = '',
+  }) async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      throw StateError(
+        'A logged-in account token is required for friendship actions.',
+      );
+    }
+    final payload = await _backendClient.applyThreadFriendshipAction(
+      threadId: threadId,
+      action: action,
+      token: token,
+      message: message,
+    );
+    await _refreshBoardStateAndPopup(
+      closePopup: (payload['removed'] ?? false) == true,
+      viewer: Map<String, dynamic>.from(payload['viewer'] as Map? ?? const {}),
+    );
+  }
+
+  Future<void> _rejectThread(int threadId) async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      throw StateError(
+        'A logged-in account token is required to reject a chat.',
+      );
+    }
+    await _backendClient.rejectThread(threadId: threadId, token: token);
+    await _refreshBoardStateAndPopup(closePopup: true);
+  }
+
+  Widget _buildUserPopup({
+    required Size boardSize,
+    required SceneObjectData object,
+    required Map<String, dynamic> viewer,
+  }) {
+    const popupWidth = 360.0;
+    const popupHeight = 430.0;
+    const gap = 18.0;
+    final width = math.min(popupWidth, math.max(280.0, boardSize.width - 24.0));
+    final height = math.min(
+      popupHeight,
+      math.max(260.0, boardSize.height - 140.0),
+    );
+    final prefersRight =
+        object.x + object.width + gap + width <= boardSize.width;
+    final dx = prefersRight
+        ? object.x + object.width + gap
+        : math.max(12.0, object.x - width - gap);
+    final dy = (object.y - 12.0)
+        .clamp(12.0, math.max(12.0, boardSize.height - height - 96.0))
+        .toDouble();
+
+    return Positioned(
+      left: dx,
+      top: dy,
+      child: SizedBox(
+        width: width,
+        height: height,
+        child: UserConnectionPopup(
+          viewer: viewer,
+          onClose: _dismissUserPopup,
+          onSendMessage: _sendThreadMessage,
+          onFriendshipAction: _applyThreadFriendshipAction,
+          onRejectChat: _rejectThread,
+        ),
+      ),
+    );
   }
 
   void _fillPromptFromTranscript(String transcript) {
@@ -1480,6 +976,10 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                   constraints.maxWidth,
                   constraints.maxHeight,
                 );
+                final activePopup = _activeUserPopup;
+                final activePopupObject = activePopup == null
+                    ? null
+                    : _sceneController.objects[activePopup.objectName];
                 _sceneController.setBoardSize(boardSize);
 
                 return Stack(
@@ -1513,8 +1013,14 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 key: ValueKey(object.name),
                                 data: object,
                                 onTap: () => _openObjectResult(object),
-                                onDeleteComplete: () => _sceneController
-                                    .finalizeDelete(object.name),
+                                onRemovePressed: () {
+                                  unawaited(_removeBoardObject(object));
+                                },
+                                onDeleteComplete: () {
+                                  _sceneController.finalizeDelete(object.name);
+                                  _closePopupIfObjectMissing();
+                                  unawaited(_persistDeletedBoardObject(object));
+                                },
                                 onDragPositionChanged: (x, y) {
                                   _sceneController.setObjectPositionFromDrag(
                                     object.name,
@@ -1522,12 +1028,26 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                     y,
                                   );
                                 },
+                                onDragEnded: _persistBoardStateSilently,
                               ),
                             ),
                           ],
                         ),
                       ),
                     ),
+                    if (activePopup != null && activePopupObject != null) ...[
+                      Positioned.fill(
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onTap: _dismissUserPopup,
+                        ),
+                      ),
+                      _buildUserPopup(
+                        boardSize: boardSize,
+                        object: activePopupObject,
+                        viewer: activePopup.viewer,
+                      ),
+                    ],
                     Positioned(
                       top: topInset,
                       left: horizontalPadding,
@@ -1571,8 +1091,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                               decoration: InputDecoration(
                                 hintText: _isListening
                                     ? (kIsWeb
-                                        ? 'Listening in the browser...'
-                                        : 'Listening on your phone...')
+                                          ? 'Listening in the browser...'
+                                          : 'Listening on your phone...')
                                     : _voiceLoopEnabled
                                     ? 'Voice mode is on. Speak your next request...'
                                     : 'Write a prompt or use the mic...',
@@ -1604,14 +1124,17 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                       borderRadius: BorderRadius.circular(20),
                                       boxShadow: [
                                         BoxShadow(
-                                          color: const Color(0xFFB85A40).withValues(alpha: 0.26),
+                                          color: const Color(
+                                            0xFFB85A40,
+                                          ).withValues(alpha: 0.26),
                                           blurRadius: 18,
                                           offset: const Offset(0, 10),
                                         ),
                                       ],
                                     ),
                                     child: Row(
-                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
                                       children: [
                                         Icon(
                                           (_isListening || _voiceLoopEnabled)
@@ -1621,7 +1144,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                         ),
                                         const SizedBox(width: 10),
                                         Text(
-                                          _voiceLoopEnabled ? 'Voice On' : 'Voice',
+                                          _voiceLoopEnabled
+                                              ? 'Voice On'
+                                              : 'Voice',
                                           style: const TextStyle(
                                             color: Colors.white,
                                             fontSize: 15,
@@ -1636,14 +1161,20 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                               const SizedBox(width: 12),
                               Expanded(
                                 child: GestureDetector(
-                                  onTap: (_isBusy || _isListening) ? null : _sendPrompt,
+                                  onTap: (_isBusy || _isListening)
+                                      ? null
+                                      : _sendPrompt,
                                   child: Container(
                                     height: 54,
                                     decoration: BoxDecoration(
-                                      color: Colors.white.withValues(alpha: 0.88),
+                                      color: Colors.white.withValues(
+                                        alpha: 0.88,
+                                      ),
                                       borderRadius: BorderRadius.circular(20),
                                       border: Border.all(
-                                        color: Colors.black.withValues(alpha: 0.08),
+                                        color: Colors.black.withValues(
+                                          alpha: 0.08,
+                                        ),
                                         width: 0.8,
                                       ),
                                     ),
@@ -1655,7 +1186,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                             ? 'Listening'
                                             : 'Send Prompt',
                                         style: TextStyle(
-                                          color: Colors.black.withValues(alpha: 0.74),
+                                          color: Colors.black.withValues(
+                                            alpha: 0.74,
+                                          ),
                                           fontSize: 14,
                                           fontWeight: FontWeight.w700,
                                         ),
@@ -1752,6 +1285,438 @@ class AgentResponseCard extends StatelessWidget {
   }
 }
 
+class _ActiveUserPopup {
+  const _ActiveUserPopup({required this.objectName, required this.viewer});
+
+  final String objectName;
+  final Map<String, dynamic> viewer;
+
+  _ActiveUserPopup copyWith({
+    String? objectName,
+    Map<String, dynamic>? viewer,
+  }) {
+    return _ActiveUserPopup(
+      objectName: objectName ?? this.objectName,
+      viewer: viewer ?? this.viewer,
+    );
+  }
+}
+
+class UserConnectionPopup extends StatefulWidget {
+  const UserConnectionPopup({
+    super.key,
+    required this.viewer,
+    required this.onClose,
+    required this.onSendMessage,
+    required this.onFriendshipAction,
+    required this.onRejectChat,
+  });
+
+  final Map<String, dynamic> viewer;
+  final VoidCallback onClose;
+  final Future<void> Function(int threadId, String message) onSendMessage;
+  final Future<void> Function(int threadId, String action, {String message})
+  onFriendshipAction;
+  final Future<void> Function(int threadId) onRejectChat;
+
+  @override
+  State<UserConnectionPopup> createState() => _UserConnectionPopupState();
+}
+
+class _UserConnectionPopupState extends State<UserConnectionPopup> {
+  final TextEditingController _messageController = TextEditingController();
+  bool _isSending = false;
+  String _errorText = '';
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _runAction(Future<void> Function() action) async {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _isSending = true;
+      _errorText = '';
+    });
+    try {
+      await action();
+      if (!mounted) return;
+      _messageController.clear();
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorText = error.toString().trim();
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isSending = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final user = Map<String, dynamic>.from(
+      widget.viewer['user'] as Map? ?? const {},
+    );
+    final thread = Map<String, dynamic>.from(
+      widget.viewer['thread'] as Map? ?? const {},
+    );
+    final counterparty = Map<String, dynamic>.from(
+      thread['counterparty'] as Map? ?? const {},
+    );
+    final messages = (thread['messages'] as List?) ?? const [];
+    final friendStatus = (thread['friend_status'] ?? 'none').toString();
+    final threadId = int.tryParse((thread['id'] ?? '').toString()) ?? 0;
+    final phoneNumber =
+        (counterparty['phone_number'] ?? user['phone_number'] ?? '').toString();
+    final description =
+        (counterparty['description'] ?? user['description'] ?? '').toString();
+    final sharedInterests =
+        ((user['match_summary'] as Map?)?['shared_interests'] as List?) ??
+        const [];
+
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.97),
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(
+            color: Colors.black.withValues(alpha: 0.08),
+            width: 0.9,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.18),
+              blurRadius: 28,
+              offset: const Offset(0, 18),
+            ),
+          ],
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        (user['display_name'] ?? 'User').toString(),
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        phoneNumber.isEmpty
+                            ? 'No phone available'
+                            : phoneNumber,
+                        style: TextStyle(
+                          color: Colors.black.withValues(alpha: 0.58),
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  onPressed: _isSending ? null : widget.onClose,
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                _PopupChip(
+                  text: friendStatus.replaceAll('_', ' '),
+                  color: friendStatus == 'accepted'
+                      ? const Color(0xFF356B46)
+                      : const Color(0xFF8D5B22),
+                ),
+                if (sharedInterests.isNotEmpty)
+                  _PopupChip(
+                    text: sharedInterests.take(2).join(' / '),
+                    color: const Color(0xFF4B647A),
+                  ),
+              ],
+            ),
+            if (description.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(
+                description,
+                style: TextStyle(
+                  color: Colors.black.withValues(alpha: 0.76),
+                  height: 1.28,
+                ),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ],
+            const SizedBox(height: 14),
+            Expanded(
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF7F0E7),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+                child: messages.isEmpty
+                    ? Center(
+                        child: Text(
+                          'No messages yet. Say hi and see where it goes.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            color: Colors.black.withValues(alpha: 0.52),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      )
+                    : ListView.separated(
+                        itemCount: messages.length,
+                        separatorBuilder: (_, _) => const SizedBox(height: 10),
+                        itemBuilder: (context, index) {
+                          final message = Map<String, dynamic>.from(
+                            messages[index] as Map? ?? const {},
+                          );
+                          final isMe = message['is_me'] == true;
+                          return Align(
+                            alignment: isMe
+                                ? Alignment.centerRight
+                                : Alignment.centerLeft,
+                            child: Container(
+                              constraints: const BoxConstraints(maxWidth: 230),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isMe
+                                    ? const Color(0xFFB85A40)
+                                    : Colors.white,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Text(
+                                (message['text'] ?? '').toString(),
+                                style: TextStyle(
+                                  color: isMe ? Colors.white : Colors.black87,
+                                  height: 1.24,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                if (friendStatus == 'none')
+                  _PopupActionButton(
+                    label: 'Add friend',
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () => widget.onFriendshipAction(threadId, 'send'),
+                          ),
+                  ),
+                if (friendStatus == 'incoming_pending')
+                  _PopupActionButton(
+                    label: 'Accept friend',
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () => widget.onFriendshipAction(threadId, 'accept'),
+                          ),
+                  ),
+                if (friendStatus == 'incoming_pending')
+                  _PopupActionButton(
+                    label: 'Decline request',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () =>
+                                widget.onFriendshipAction(threadId, 'decline'),
+                          ),
+                  ),
+                if (friendStatus == 'outgoing_pending')
+                  _PopupActionButton(
+                    label: 'Cancel request',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () => widget.onFriendshipAction(threadId, 'cancel'),
+                          ),
+                  ),
+                if (friendStatus == 'accepted')
+                  _PopupActionButton(
+                    label: 'Unfriend',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(
+                            () =>
+                                widget.onFriendshipAction(threadId, 'unfriend'),
+                          ),
+                  ),
+                if (friendStatus != 'accepted')
+                  _PopupActionButton(
+                    label: 'Reject chat',
+                    tone: _PopupButtonTone.soft,
+                    onPressed: (_isSending || threadId <= 0)
+                        ? null
+                        : () => _runAction(() => widget.onRejectChat(threadId)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Container(
+              decoration: BoxDecoration(
+                color: const Color(0xFFF4E8D9),
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: TextField(
+                controller: _messageController,
+                enabled: !_isSending && threadId > 0,
+                minLines: 1,
+                maxLines: 3,
+                decoration: const InputDecoration(
+                  hintText: 'Send a message...',
+                  border: InputBorder.none,
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 14,
+                  ),
+                ),
+                onSubmitted: (value) {
+                  final text = value.trim();
+                  if (text.isEmpty || _isSending || threadId <= 0) return;
+                  _runAction(() => widget.onSendMessage(threadId, text));
+                },
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _errorText,
+                    style: const TextStyle(
+                      color: Color(0xFF9F3A24),
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: (_isSending || threadId <= 0)
+                      ? null
+                      : () {
+                          final text = _messageController.text.trim();
+                          if (text.isEmpty) return;
+                          _runAction(
+                            () => widget.onSendMessage(threadId, text),
+                          );
+                        },
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFFB85A40),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 13,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  child: Text(_isSending ? 'Sending' : 'Send'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _PopupChip extends StatelessWidget {
+  const _PopupChip({required this.text, required this.color});
+
+  final String text;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 11,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+    );
+  }
+}
+
+enum _PopupButtonTone { primary, soft }
+
+class _PopupActionButton extends StatelessWidget {
+  const _PopupActionButton({
+    required this.label,
+    this.tone = _PopupButtonTone.primary,
+    this.onPressed,
+  });
+
+  final String label;
+  final _PopupButtonTone tone;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    final isSoft = tone == _PopupButtonTone.soft;
+    return TextButton(
+      onPressed: onPressed,
+      style: TextButton.styleFrom(
+        backgroundColor: isSoft
+            ? const Color(0xFFF1E2D4)
+            : const Color(0xFFE7C4B4),
+        foregroundColor: const Color(0xFF70331F),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      ),
+      child: Text(label, style: const TextStyle(fontWeight: FontWeight.w800)),
+    );
+  }
+}
+
 class AgentResultDialog extends StatelessWidget {
   const AgentResultDialog({super.key, required this.viewer});
 
@@ -1833,7 +1798,8 @@ class AgentUserProfileView extends StatelessWidget {
         ? Map<String, dynamic>.from(user['match_summary'] as Map)
         : null;
     final whyTheyMatch = (matchSummary?['why_they_match'] as List?) ?? const [];
-    final sharedInterests = (matchSummary?['shared_interests'] as List?) ?? const [];
+    final sharedInterests =
+        (matchSummary?['shared_interests'] as List?) ?? const [];
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -1844,15 +1810,9 @@ class AgentUserProfileView extends StatelessWidget {
           value: (user['display_name'] ?? user['username'] ?? 'Unknown user')
               .toString(),
         ),
-        _UserSectionLabel(
-          text: 'Friend status',
-          value: friendStatus,
-        ),
+        _UserSectionLabel(text: 'Friend status', value: friendStatus),
         if (description.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Description',
-            value: description,
-          ),
+          _UserSectionLabel(text: 'Description', value: description),
         if (topTraits.isNotEmpty)
           _UserSectionLabel(
             text: 'Top traits',
@@ -1875,25 +1835,16 @@ class AgentUserProfileView extends StatelessWidget {
             value: whyTheyMatch.map((item) => item.toString()).join(' '),
           ),
         if (email != null && email.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Email',
-            value: email,
-          ),
+          _UserSectionLabel(text: 'Email', value: email),
         if (phoneNumber != null && phoneNumber.isNotEmpty)
-          _UserSectionLabel(
-            text: 'Phone',
-            value: phoneNumber,
-          ),
+          _UserSectionLabel(text: 'Phone', value: phoneNumber),
       ],
     );
   }
 }
 
 class _UserSectionLabel extends StatelessWidget {
-  const _UserSectionLabel({
-    required this.text,
-    required this.value,
-  });
+  const _UserSectionLabel({required this.text, required this.value});
 
   final String text;
   final String value;
@@ -2012,9 +1963,7 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> completeOnboarding({
-    required String sessionId,
-  }) {
+  Future<Map<String, dynamic>> completeOnboarding({required String sessionId}) {
     return _postJson('/api/accounts/onboarding/complete/', {
       'session_id': sessionId,
       'microphone_permission_granted': true,
@@ -2022,8 +1971,41 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> fetchBoardMemory({String? token}) {
-    return _getJson('/api/agent/board-memory/', token: token);
+  Future<Map<String, dynamic>> fetchBoardMemory({String? token, String? userId}) {
+    final cleanToken = (token ?? '').trim();
+    if (cleanToken.isNotEmpty) {
+      return _getJson('/api/accounts/me/board-state/', token: cleanToken);
+    }
+    final cleanUserId = (userId ?? '').trim();
+    final path = cleanUserId.isEmpty
+        ? '/api/agent/board-memory/'
+        : '/api/agent/board-memory/?user_id=${Uri.encodeQueryComponent(cleanUserId)}';
+    return _getJson(path, token: token);
+  }
+
+  Future<Map<String, dynamic>> persistBoardMemory({
+    required String token,
+    required Map<String, dynamic> boardState,
+    String? removedResultId,
+  }) {
+    return _postJson('/api/accounts/me/board-state/', {
+      'board_state': boardState,
+      if ((removedResultId ?? '').trim().isNotEmpty)
+        'removed_result_id': removedResultId!.trim(),
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> persistAnonymousBoardMemory({
+    required String userId,
+    required Map<String, dynamic> boardState,
+    String? removedResultId,
+  }) {
+    return _postJson('/api/agent/board-memory/', {
+      'user_id': userId,
+      'board_state': boardState,
+      if ((removedResultId ?? '').trim().isNotEmpty)
+        'removed_result_id': removedResultId!.trim(),
+    });
   }
 
   Future<Map<String, dynamic>> transcribeSpeechTurn({
@@ -2046,10 +2028,7 @@ class AgentBackendClient {
     required String text,
     String language = 'bg-BG',
   }) {
-    return _postJson('/api/voice/speak/', {
-      'text': text,
-      'language': language,
-    });
+    return _postJson('/api/voice/speak/', {'text': text, 'language': language});
   }
 
   Future<Map<String, dynamic>> startAgentRun({
@@ -2079,11 +2058,45 @@ class AgentBackendClient {
   Future<Map<String, dynamic>> openObject({
     required Map<String, dynamic> object,
     required String userId,
+    String? token,
   }) {
     return _postJson('/api/agent/open-object/', {
       'object': object,
       'user_id': userId,
-    });
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> sendThreadMessage({
+    required int threadId,
+    required String message,
+    required String token,
+  }) {
+    return _postJson('/api/accounts/threads/$threadId/messages/', {
+      'message': message,
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> applyThreadFriendshipAction({
+    required int threadId,
+    required String action,
+    required String token,
+    String message = '',
+  }) {
+    return _postJson('/api/accounts/threads/$threadId/friendship/', {
+      'action': action,
+      if (message.trim().isNotEmpty) 'message': message.trim(),
+    }, token: token);
+  }
+
+  Future<Map<String, dynamic>> rejectThread({
+    required int threadId,
+    required String token,
+  }) {
+    return _postJson(
+      '/api/accounts/threads/$threadId/reject/',
+      const {},
+      token: token,
+    );
   }
 
   Future<Map<String, dynamic>> _getJson(String path, {String? token}) async {
@@ -2102,9 +2115,9 @@ class AgentBackendClient {
 
   Future<Map<String, dynamic>> _postJson(
     String path,
-    Map<String, dynamic> payload,
-    {String? token}
-  ) async {
+    Map<String, dynamic> payload, {
+    String? token,
+  }) async {
     final response = await _sendWithTimeout(
       () => http.post(
         _baseUri.resolve(path),
@@ -2166,14 +2179,14 @@ class SceneController extends ChangeNotifier {
   Map<String, SceneObjectData> get objects => _objects;
 
   static const List<Color> _mainColors = [
-    Color(0xFFD36E6A),
-    Color(0xFF6E9ACC),
-    Color(0xFF6EA886),
-    Color(0xFFD59667),
-    Color(0xFF9A77B7),
-    Color(0xFFD7C46C),
-    Color(0xFF5FA39A),
-    Color(0xFFC4749C),
+    Color(0xFFB8928D),
+    Color(0xFF8FA6B6),
+    Color(0xFF93AA9A),
+    Color(0xFFB8A18E),
+    Color(0xFFA596B3),
+    Color(0xFFC0B792),
+    Color(0xFF8EA9A6),
+    Color(0xFFB39AA7),
   ];
 
   void setBoardSize(Size size) {
@@ -2546,7 +2559,7 @@ class SceneController extends ChangeNotifier {
   Color _randomMainColor() {
     return _desaturateColor(
       _mainColors[_random.nextInt(_mainColors.length)],
-      0.20,
+      0.42,
     );
   }
 
@@ -2558,7 +2571,7 @@ class SceneController extends ChangeNotifier {
     if (value == null) return null;
 
     if (value is int) {
-      return _desaturateColor(Color(value), 0.20);
+      return _desaturateColor(Color(value), 0.42);
     }
 
     final raw = value.toString().trim();
@@ -2567,14 +2580,14 @@ class SceneController extends ChangeNotifier {
     final lower = raw.toLowerCase();
 
     const byName = <String, Color>{
-      'red': Color(0xFFD36E6A),
-      'blue': Color(0xFF6E9ACC),
-      'green': Color(0xFF6EA886),
-      'orange': Color(0xFFD59667),
-      'purple': Color(0xFF9A77B7),
-      'yellow': Color(0xFFD7C46C),
-      'teal': Color(0xFF5FA39A),
-      'pink': Color(0xFFC4749C),
+      'red': Color(0xFFB8928D),
+      'blue': Color(0xFF8FA6B6),
+      'green': Color(0xFF93AA9A),
+      'orange': Color(0xFFB8A18E),
+      'purple': Color(0xFFA596B3),
+      'yellow': Color(0xFFC0B792),
+      'teal': Color(0xFF8EA9A6),
+      'pink': Color(0xFFB39AA7),
       'random': Color(0x00000000),
     };
 
@@ -2583,7 +2596,7 @@ class SceneController extends ChangeNotifier {
     }
 
     if (byName.containsKey(lower)) {
-      return _desaturateColor(byName[lower]!, 0.20);
+      return _desaturateColor(byName[lower]!, 0.42);
     }
 
     final clean = lower.replaceFirst('#', '');
@@ -2591,7 +2604,7 @@ class SceneController extends ChangeNotifier {
     final parsed = int.tryParse(hex, radix: 16);
     if (parsed == null) return null;
 
-    return _desaturateColor(Color(parsed), 0.20);
+    return _desaturateColor(Color(parsed), 0.42);
   }
 
   double _readDouble(dynamic value, {required double fallback}) {
@@ -2675,6 +2688,18 @@ class SceneObjectData {
   final List<String> tags;
   final Map<String, dynamic> extraData;
 
+  bool get isUserObject {
+    final kind = (extraData['kind'] ?? '').toString().trim().toLowerCase();
+    if (kind == 'user' || kind == 'user_chat') {
+      return true;
+    }
+
+    return tags.any((tag) {
+      final normalized = tag.trim().toLowerCase();
+      return normalized == 'type:user' || normalized == 'entity:user';
+    });
+  }
+
   SceneObjectData copyWith({
     String? name,
     String? text,
@@ -2738,14 +2763,18 @@ class BoardObjectWidget extends StatefulWidget {
     super.key,
     required this.data,
     required this.onTap,
+    required this.onRemovePressed,
     required this.onDeleteComplete,
     required this.onDragPositionChanged,
+    required this.onDragEnded,
   });
 
   final SceneObjectData data;
   final VoidCallback onTap;
+  final VoidCallback onRemovePressed;
   final VoidCallback onDeleteComplete;
   final void Function(double x, double y) onDragPositionChanged;
+  final Future<void> Function() onDragEnded;
 
   @override
   State<BoardObjectWidget> createState() => _BoardObjectWidgetState();
@@ -2892,7 +2921,6 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
 
     final motionEffect = _isDragging ? 1.0 : _motionEffectProgress(moveRaw);
     final motionScale = lerpDouble(1.0, 0.8, motionEffect)!;
-    final saturation = lerpDouble(1.0, 0.0, motionEffect)!;
 
     final scaleValue = _scaleController.isAnimating
         ? _computeScalePopValue(
@@ -2904,18 +2932,12 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
 
     final opacity = _computeDeleteOpacity(_deleteController.value);
     final visualScale = scaleValue * motionScale;
-
-    final innerSize = math
-        .max(
-          12.0,
-          math.min(widget.data.width, widget.data.height) -
-              (widget.data.innerInset * 2),
-        )
-        .toDouble();
-
-    final textBoxWidth = (innerSize * 0.72)
-        .clamp(36.0, widget.data.width)
-        .toDouble();
+    final borderRadius = BorderRadius.circular(
+      (math.min(widget.data.width, widget.data.height) * 0.18)
+          .clamp(18.0, 26.0)
+          .toDouble(),
+    );
+    final canRemove = !widget.data.isUserObject;
 
     return Positioned(
       left: livePosition.dx,
@@ -2925,176 +2947,107 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
         alignment: Alignment.center,
         child: Opacity(
           opacity: opacity,
-          child: ColorFiltered(
-            colorFilter: ColorFilter.matrix(_saturationMatrix(saturation)),
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: widget.onTap,
-              onPanStart: (details) {
-                final box = context.findRenderObject() as RenderBox?;
-                if (box == null) return;
-                _dragPointerOffset = box.globalToLocal(details.globalPosition);
-                setState(() {
-                  _isDragging = true;
-                });
-              },
-              onPanUpdate: (details) {
-                final board = context
-                    .findAncestorRenderObjectOfType<RenderBox>();
-                final dragOffset = _dragPointerOffset;
-                if (board == null || dragOffset == null) return;
-                final localOnBoard = board.globalToLocal(
-                  details.globalPosition,
-                );
-                widget.onDragPositionChanged(
-                  localOnBoard.dx - dragOffset.dx,
-                  localOnBoard.dy - dragOffset.dy,
-                );
-              },
-              onPanEnd: (_) {
-                setState(() {
-                  _isDragging = false;
-                  _dragPointerOffset = null;
-                });
-              },
-              onPanCancel: () {
-                setState(() {
-                  _isDragging = false;
-                  _dragPointerOffset = null;
-                });
-              },
-              child: SizedBox(
-                width: widget.data.width,
-                height: widget.data.height,
-                child: Stack(
-                  children: [
-                    Container(
-                      width: widget.data.width,
-                      height: widget.data.height,
-                      decoration: BoxDecoration(
-                        color: widget.data.color,
-                        border: Border.all(
-                          color: Colors.black.withValues(alpha: 0.08),
-                          width: 1,
-                        ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: widget.data.color.withValues(alpha: 0.22),
-                            blurRadius: 22,
-                            spreadRadius: 2,
-                            offset: const Offset(0, 6),
-                          ),
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.12),
-                            blurRadius: 24,
-                            spreadRadius: 0.5,
-                            offset: const Offset(0, 8),
-                          ),
-                        ],
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: widget.onTap,
+            onPanStart: (details) {
+              final box = context.findRenderObject() as RenderBox?;
+              if (box == null) return;
+              _dragPointerOffset = box.globalToLocal(details.globalPosition);
+              setState(() {
+                _isDragging = true;
+              });
+            },
+            onPanUpdate: (details) {
+              final board = context.findAncestorRenderObjectOfType<RenderBox>();
+              final dragOffset = _dragPointerOffset;
+              if (board == null || dragOffset == null) return;
+              final localOnBoard = board.globalToLocal(details.globalPosition);
+              widget.onDragPositionChanged(
+                localOnBoard.dx - dragOffset.dx,
+                localOnBoard.dy - dragOffset.dy,
+              );
+            },
+            onPanEnd: (_) {
+              setState(() {
+                _isDragging = false;
+                _dragPointerOffset = null;
+              });
+              unawaited(widget.onDragEnded());
+            },
+            onPanCancel: () {
+              setState(() {
+                _isDragging = false;
+                _dragPointerOffset = null;
+              });
+              unawaited(widget.onDragEnded());
+            },
+            child: SizedBox(
+              width: widget.data.width,
+              height: widget.data.height,
+              child: Stack(
+                children: [
+                  Container(
+                    width: widget.data.width,
+                    height: widget.data.height,
+                    decoration: BoxDecoration(
+                      color: widget.data.color,
+                      borderRadius: borderRadius,
+                      border: Border.all(
+                        color: Colors.black.withValues(alpha: 0.08),
+                        width: 1,
                       ),
                     ),
-                    Positioned.fill(
-                      child: Center(
-                        child: Container(
-                          width: innerSize,
-                          height: innerSize,
-                          decoration: BoxDecoration(
-                            color: _darken(widget.data.color, 0.22),
-                          ),
-                        ),
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 14,
+                    ),
+                    child: Text(
+                      widget.data.text,
+                      textAlign: TextAlign.center,
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: _bestTextColor(widget.data.color),
+                        fontWeight: FontWeight.w700,
+                        fontSize:
+                            (math.min(widget.data.width, widget.data.height) *
+                                    0.18)
+                                .clamp(14.0, 22.0)
+                                .toDouble(),
+                        height: 1.1,
                       ),
                     ),
+                  ),
+                  if (canRemove)
                     Positioned(
                       top: 8,
-                      left: 8,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 8,
-                          vertical: 4,
-                        ),
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.10),
-                          border: Border.all(
-                            color: Colors.black.withValues(alpha: 0.14),
-                            width: 0.7,
-                          ),
-                        ),
-                        child: Text(
-                          widget.data.memoryType,
-                          style: TextStyle(
-                            color: _bestTextColor(widget.data.color),
-                            fontSize: 10,
-                            fontWeight: FontWeight.w700,
-                            letterSpacing: 0.3,
-                          ),
-                        ),
-                      ),
-                    ),
-                    if (widget.data.deleteAfterClick)
-                      Positioned(
-                        top: 8,
-                        right: 8,
+                      right: 8,
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: widget.onRemovePressed,
                         child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 4,
-                          ),
+                          width: 24,
+                          height: 24,
+                          alignment: Alignment.center,
                           decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.16),
-                            border: Border.all(
-                              color: Colors.black.withValues(alpha: 0.18),
-                              width: 0.7,
-                            ),
+                            color: Colors.black.withValues(alpha: 0.12),
+                            shape: BoxShape.circle,
                           ),
                           child: Text(
-                            'one tap',
+                            'x',
                             style: TextStyle(
                               color: _bestTextColor(widget.data.color),
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ),
-                    Positioned.fill(
-                      child: Center(
-                        child: Container(
-                          width: textBoxWidth,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: 0.10),
-                            border: Border.all(
-                              color: Colors.black.withValues(alpha: 0.18),
-                              width: 0.7,
-                            ),
-                          ),
-                          child: Text(
-                            widget.data.text,
-                            textAlign: TextAlign.center,
-                            maxLines: 3,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: _bestTextColor(widget.data.color),
+                              fontSize: 12,
                               fontWeight: FontWeight.w700,
-                              fontSize: math.max(
-                                12,
-                                math.min(
-                                      widget.data.width,
-                                      widget.data.height,
-                                    ) *
-                                    0.14,
-                              ),
-                              height: 1.05,
+                              height: 1,
                             ),
                           ),
                         ),
                       ),
                     ),
-                  ],
-                ),
+                ],
               ),
             ),
           ),
@@ -3288,49 +3241,10 @@ class _GridLayer {
   final List<double> horizontalPositions;
 }
 
-List<double> _saturationMatrix(double saturation) {
-  final s = saturation.clamp(0.0, 1.0).toDouble();
-  final inv = 1 - s;
-  const rw = 0.2126;
-  const gw = 0.7152;
-  const bw = 0.0722;
-
-  return <double>[
-    inv * rw + s,
-    inv * gw,
-    inv * bw,
-    0,
-    0,
-    inv * rw,
-    inv * gw + s,
-    inv * bw,
-    0,
-    0,
-    inv * rw,
-    inv * gw,
-    inv * bw + s,
-    0,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-  ];
-}
-
 Color _desaturateColor(Color color, double amount) {
   final hsl = HSLColor.fromColor(color);
   final next = hsl.withSaturation(
     (hsl.saturation * (1 - amount)).clamp(0.0, 1.0).toDouble(),
-  );
-  return next.toColor();
-}
-
-Color _darken(Color color, double amount) {
-  final hsl = HSLColor.fromColor(color);
-  final next = hsl.withLightness(
-    (hsl.lightness - amount).clamp(0.0, 1.0).toDouble(),
   );
   return next.toColor();
 }

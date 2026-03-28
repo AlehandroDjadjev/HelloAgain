@@ -7,7 +7,13 @@ from django.test import TestCase
 
 from recommendations.models import ElderProfile
 
-from .models import AccountProfile, OnboardingDraft, RecommendationActivity
+from .models import (
+    AccountProfile,
+    ConnectionThread,
+    FriendRequest,
+    OnboardingDraft,
+    RecommendationActivity,
+)
 from .services import issue_token
 
 
@@ -645,4 +651,165 @@ class AccountApiTests(TestCase):
             payload["board_object"]["extra_data"]["description"],
             sporty.description,
         )
+        self.assertTrue(payload["user"]["thread_id"])
+
+        sporty.refresh_from_db()
+        sporty_objects = sporty.whiteboard_state.get("objects", [])
+        self.assertEqual(len(sporty_objects), 1)
+        self.assertEqual(
+            sporty_objects[0]["extraData"]["user_id"],
+            viewer.user_id,
+        )
         mock_activity.assert_called_once()
+
+    def test_me_board_state_endpoint_persists_state(self):
+        viewer = self._create_profile(
+            username="board-user",
+            email="board@example.com",
+            display_name="Board User",
+            description="Keeps notes on the board.",
+        )
+
+        response = self.client.post(
+            "/api/accounts/me/board-state/",
+            data=json.dumps(
+                {
+                    "board_state": {
+                        "board": {"width": 800, "height": 600},
+                        "objects": [
+                            {
+                                "name": "note_1",
+                                "text": "Board note",
+                                "x": 42,
+                                "y": 64,
+                                "width": 180,
+                                "height": 140,
+                                "memoryType": "memory",
+                            }
+                        ],
+                    }
+                }
+            ),
+            content_type="application/json",
+            **self._auth_headers(viewer.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        get_response = self.client.get(
+            "/api/accounts/me/board-state/",
+            **self._auth_headers(viewer.user),
+        )
+        self.assertEqual(get_response.status_code, 200)
+        payload = get_response.json()
+        self.assertEqual(payload["board_state"]["objects"][0]["name"], "note_1")
+
+    def test_connection_thread_message_and_friendship_flow(self):
+        alice = self._create_profile(
+            username="alice-thread",
+            email="alice-thread@example.com",
+            display_name="Alice Thread",
+            phone_number="+359888100100",
+            description="Open and thoughtful.",
+        )
+        bob = self._create_profile(
+            username="bob-thread",
+            email="bob-thread@example.com",
+            display_name="Bob Thread",
+            phone_number="+359888100200",
+            description="Friendly and active.",
+        )
+        thread = ConnectionThread.objects.create(
+            participant_low=alice,
+            participant_high=bob,
+            created_by=alice,
+        )
+
+        send_message_response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/messages/",
+            data=json.dumps({"message": "Hey Bob, want to chat?"}),
+            content_type="application/json",
+            **self._auth_headers(alice.user),
+        )
+        self.assertEqual(send_message_response.status_code, 200)
+        self.assertEqual(
+            send_message_response.json()["thread"]["messages"][0]["text"],
+            "Hey Bob, want to chat?",
+        )
+
+        send_request_response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/friendship/",
+            data=json.dumps({"action": "send", "message": "Let us be friends"}),
+            content_type="application/json",
+            **self._auth_headers(alice.user),
+        )
+        self.assertEqual(send_request_response.status_code, 200)
+        self.assertEqual(
+            send_request_response.json()["thread"]["friend_status"],
+            "outgoing_pending",
+        )
+
+        accept_response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/friendship/",
+            data=json.dumps({"action": "accept"}),
+            content_type="application/json",
+            **self._auth_headers(bob.user),
+        )
+        self.assertEqual(accept_response.status_code, 200)
+        self.assertEqual(
+            accept_response.json()["thread"]["friend_status"],
+            "accepted",
+        )
+
+        alice.refresh_from_db()
+        bob.refresh_from_db()
+        alice_object = alice.whiteboard_state["objects"][0]
+        bob_object = bob.whiteboard_state["objects"][0]
+        self.assertTrue(alice_object["extraData"]["is_friend"])
+        self.assertTrue(bob_object["extraData"]["is_friend"])
+        self.assertEqual(
+            FriendRequest.objects.filter(status=FriendRequest.Status.ACCEPTED).count(),
+            1,
+        )
+
+    def test_reject_thread_removes_chat_for_both_users(self):
+        alice = self._create_profile(
+            username="reject-a",
+            email="reject-a@example.com",
+            display_name="Reject A",
+            description="Likes calm chats.",
+        )
+        bob = self._create_profile(
+            username="reject-b",
+            email="reject-b@example.com",
+            display_name="Reject B",
+            description="Also likes calm chats.",
+        )
+        thread = ConnectionThread.objects.create(
+            participant_low=alice,
+            participant_high=bob,
+            created_by=alice,
+        )
+        alice.whiteboard_state = {
+            "board": {"width": 1000, "height": 700},
+            "objects": [{"name": f"connection_thread_{thread.id}", "text": "Reject B"}],
+        }
+        alice.save(update_fields=["whiteboard_state"])
+        bob.whiteboard_state = {
+            "board": {"width": 1000, "height": 700},
+            "objects": [{"name": f"connection_thread_{thread.id}", "text": "Reject A"}],
+        }
+        bob.save(update_fields=["whiteboard_state"])
+
+        response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/reject/",
+            data=json.dumps({}),
+            content_type="application/json",
+            **self._auth_headers(alice.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(ConnectionThread.objects.filter(pk=thread.id).exists())
+        alice.refresh_from_db()
+        bob.refresh_from_db()
+        self.assertEqual(alice.whiteboard_state["objects"], [])
+        self.assertEqual(bob.whiteboard_state["objects"], [])

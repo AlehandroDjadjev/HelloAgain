@@ -18,6 +18,7 @@ from .semi_agent_prompts import (
     build_step_one_mcp_prompt,
     build_step_two_board_prompt,
 )
+from .user_context import ActiveUserTracker, TemporaryChatHistoryStore
 from .whiteboard_memory import WhiteboardMemoryStore
 from voice_gateway.services.providers import OpenAILLMProvider, PiperTTSProvider
 
@@ -26,15 +27,6 @@ if TYPE_CHECKING:
 
 
 class SemiAgentService:
-    SUPPORTED_MCP_TOOLS = {
-        "gnn_actions": {"add_action", "fetch_action", "conversation"},
-        "connections": {"update_profile", "find_connection"},
-    }
-    SUPPORTED_TOOL_NAMES = {
-        tool_name
-        for tool_names in SUPPORTED_MCP_TOOLS.values()
-        for tool_name in tool_names
-    }
     BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS = 256
     BOARD_PIPELINE_JSON_CONTINUATION_BUDGET = 0
     RUN_JOB_TTL_SECONDS = 900
@@ -54,6 +46,8 @@ class SemiAgentService:
         llm_provider: OpenAILLMProvider | None = None,
         tts_provider: PiperTTSProvider | None = None,
         connections_service: Any | None = None,
+        user_tracker: ActiveUserTracker | None = None,
+        speech_history_store: TemporaryChatHistoryStore | None = None,
     ) -> None:
         self.graph_service = graph_service
         self.qwen_client = qwen_client or QwenWorkerClient()
@@ -61,10 +55,15 @@ class SemiAgentService:
         self.board_memory = board_memory or WhiteboardMemoryStore()
         self.llm_provider = llm_provider or OpenAILLMProvider()
         self.tts_provider = tts_provider or PiperTTSProvider()
+        self.user_tracker = user_tracker or ActiveUserTracker()
+        self.speech_history_store = speech_history_store or TemporaryChatHistoryStore()
         if connections_service is None:
             from apps.accounts.agent_service import ConnectionsAgentService
 
-            connections_service = ConnectionsAgentService(qwen_client=self.qwen_client)
+            connections_service = ConnectionsAgentService(
+                qwen_client=self.qwen_client,
+                user_tracker=self.user_tracker,
+            )
         self.connections_service = connections_service
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
@@ -74,8 +73,378 @@ class SemiAgentService:
         if self.graph_service is None:
             from .graph_service import GraphService
 
-            self.graph_service = GraphService()
+            self.graph_service = GraphService(user_tracker=self.user_tracker)
         return self.graph_service
+
+    def _build_mcp_tool_catalog(self) -> Dict[str, Any]:
+        registry_payload = self.get_registry_payload()
+        catalog = {
+            "protocol": registry_payload.get("protocol"),
+            "version": registry_payload.get("version"),
+            "mcps": [],
+        }
+        for item in registry_payload.get("mcps", []):
+            if not isinstance(item, dict):
+                continue
+            mcp_id = self._clean_text(item.get("id"))
+            if not mcp_id:
+                continue
+            try:
+                descriptor = self.get_descriptor_payload(mcp_id)
+            except Exception:
+                descriptor = {}
+            tools: List[Dict[str, Any]] = []
+            for tool in descriptor.get("tools", []):
+                if not isinstance(tool, dict):
+                    continue
+                tool_name = self._normalize_tool_name(tool.get("name"))
+                if not tool_name:
+                    continue
+                tools.append(
+                    {
+                        "name": tool_name,
+                        "description": self._clean_text(tool.get("description")),
+                        "method": self._clean_text(tool.get("method")),
+                        "path": self._clean_text(tool.get("path")),
+                        "body_schema": self._clean_jsonish(tool.get("body_schema"))
+                        if isinstance(tool.get("body_schema"), dict)
+                        else {},
+                    }
+                )
+            catalog["mcps"].append(
+                {
+                    "id": mcp_id,
+                    "name": self._clean_text(item.get("name") or mcp_id),
+                    "description": self._clean_text(item.get("description")),
+                    "notes": item.get("notes") if isinstance(item.get("notes"), list) else [],
+                    "tools": tools,
+                }
+            )
+        return catalog
+
+    def _supported_mcp_tools(self) -> Dict[str, set[str]]:
+        return {
+            self._clean_text(mcp.get("id")): {
+                self._normalize_tool_name(tool.get("name"))
+                for tool in mcp.get("tools", [])
+                if isinstance(tool, dict) and self._normalize_tool_name(tool.get("name"))
+            }
+            for mcp in self._build_mcp_tool_catalog().get("mcps", [])
+            if isinstance(mcp, dict) and self._clean_text(mcp.get("id"))
+        }
+
+    def _infer_mcp_id_from_tool_name(self, tool_name: str) -> str:
+        clean_tool_name = self._normalize_tool_name(tool_name)
+        if not clean_tool_name:
+            return ""
+        matches = [
+            mcp_id
+            for mcp_id, tool_names in self._supported_mcp_tools().items()
+            if clean_tool_name in tool_names
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return ""
+
+    def _json_schema_for_body_type(self, raw_type: Any) -> Dict[str, Any]:
+        clean_type = self._clean_text(raw_type).lower()
+        if clean_type in {"integer", "int"}:
+            return {"type": "integer"}
+        if clean_type in {"number", "float"}:
+            return {"type": "number"}
+        if clean_type in {"boolean", "bool"}:
+            return {"type": "boolean"}
+        if clean_type in {"array", "list"}:
+            return {"type": "array", "items": {"type": "string"}}
+        if clean_type == "object":
+            return {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+                "required": [],
+            }
+        return {"type": "string"}
+
+    def _strict_openai_schema(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = deepcopy(schema)
+        schema_type = self._clean_text(normalized.get("type")).lower()
+        if schema_type == "object":
+            properties = normalized.get("properties")
+            normalized["properties"] = properties if isinstance(properties, dict) else {}
+            normalized["additionalProperties"] = False
+            original_required = normalized.get("required")
+            required_names = (
+                {
+                    self._clean_text(item)
+                    for item in original_required
+                    if self._clean_text(item)
+                }
+                if isinstance(original_required, list)
+                else set()
+            )
+            for property_name, property_schema in list(normalized["properties"].items()):
+                if isinstance(property_schema, dict):
+                    strict_property_schema = self._strict_openai_schema(property_schema)
+                    if property_name not in required_names:
+                        strict_property_schema = self._make_schema_nullable(strict_property_schema)
+                    normalized["properties"][property_name] = strict_property_schema
+            normalized["required"] = list(normalized["properties"].keys())
+        elif schema_type == "array" and isinstance(normalized.get("items"), dict):
+            normalized["items"] = self._strict_openai_schema(normalized["items"])
+
+        for keyword in ("anyOf", "oneOf", "allOf"):
+            if not isinstance(normalized.get(keyword), list):
+                continue
+            normalized[keyword] = [
+                self._strict_openai_schema(item) if isinstance(item, dict) else item
+                for item in normalized[keyword]
+            ]
+        return normalized
+
+    def _make_schema_nullable(self, schema: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = deepcopy(schema)
+        raw_type = normalized.get("type")
+        if isinstance(raw_type, str):
+            if raw_type != "null":
+                normalized["type"] = [raw_type, "null"]
+        elif isinstance(raw_type, list):
+            if "null" not in raw_type:
+                normalized["type"] = [*raw_type, "null"]
+        elif isinstance(normalized.get("anyOf"), list):
+            if not any(
+                isinstance(item, dict) and self._clean_text(item.get("type")).lower() == "null"
+                for item in normalized["anyOf"]
+            ):
+                normalized["anyOf"] = [*normalized["anyOf"], {"type": "null"}]
+        else:
+            normalized["type"] = ["string", "null"]
+        if isinstance(normalized.get("enum"), list) and None not in normalized["enum"]:
+            normalized["enum"] = [*normalized["enum"], None]
+        return normalized
+
+    def _build_mcp_call_arguments_schema(self, tool_catalog: Dict[str, Any]) -> Dict[str, Any]:
+        properties: Dict[str, Any] = {}
+        for mcp in tool_catalog.get("mcps", []):
+            if not isinstance(mcp, dict):
+                continue
+            for tool in mcp.get("tools", []):
+                if not isinstance(tool, dict):
+                    continue
+                body_schema = tool.get("body_schema") if isinstance(tool.get("body_schema"), dict) else {}
+                for field_name, field_type in body_schema.items():
+                    clean_name = self._clean_text(field_name)
+                    if not clean_name or clean_name in properties:
+                        continue
+                    properties[clean_name] = self._json_schema_for_body_type(field_type)
+        if "prompt" not in properties:
+            properties["prompt"] = {"type": "string"}
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties,
+            "required": ["prompt"],
+        }
+
+    def _build_mcp_call_response_schema(self, tool_catalog: Dict[str, Any]) -> Dict[str, Any]:
+        mcp_ids = sorted(
+            {
+                self._clean_text(mcp.get("id"))
+                for mcp in tool_catalog.get("mcps", [])
+                if isinstance(mcp, dict) and self._clean_text(mcp.get("id"))
+            }
+        )
+        tool_names = sorted(
+            {
+                self._normalize_tool_name(tool.get("name"))
+                for mcp in tool_catalog.get("mcps", [])
+                if isinstance(mcp, dict)
+                for tool in mcp.get("tools", [])
+                if isinstance(tool, dict) and self._normalize_tool_name(tool.get("name"))
+            }
+        )
+        call_schema: Dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "call_id": {"type": "string"},
+                "mcp_id": {"type": "string"},
+                "tool_name": {"type": "string"},
+                "arguments": self._build_mcp_call_arguments_schema(tool_catalog),
+                "why": {"type": "string"},
+            },
+            "required": ["call_id", "mcp_id", "tool_name", "arguments", "why"],
+        }
+        if mcp_ids:
+            call_schema["properties"]["mcp_id"]["enum"] = mcp_ids
+        if tool_names:
+            call_schema["properties"]["tool_name"]["enum"] = tool_names
+        return self._strict_openai_schema(call_schema)
+
+    def _build_step_one_response_format(self, tool_catalog: Dict[str, Any]) -> Dict[str, Any] | None:
+        if not tool_catalog.get("mcps"):
+            return None
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "semi_agent_step_one_mcp",
+                "strict": True,
+                "schema": self._strict_openai_schema({
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "stage": {"type": "string", "enum": ["step_1_mcp"]},
+                        "step_number": {"type": "integer", "enum": [1]},
+                        "chain_position": {"type": "string", "enum": ["mcp layer"]},
+                        "needs_mcps": {"type": "boolean"},
+                        "request_kind": {"type": "string", "enum": ["mechanical", "profile", "mixed"]},
+                        "memory_hint": {"type": "string", "enum": ["instant", "ram", "memory"]},
+                        "reasoning_summary": {"type": "string"},
+                        "why_this_is_part_of_the_chain": {"type": "string"},
+                        "board_intent": {"type": "string"},
+                        "speech_intent": {"type": "string"},
+                        "mcp_calls": {
+                            "type": "array",
+                            "items": self._build_mcp_call_response_schema(tool_catalog),
+                        },
+                    },
+                    "required": [
+                        "stage",
+                        "step_number",
+                        "chain_position",
+                        "needs_mcps",
+                        "request_kind",
+                        "memory_hint",
+                        "reasoning_summary",
+                        "why_this_is_part_of_the_chain",
+                        "board_intent",
+                        "speech_intent",
+                        "mcp_calls",
+                    ],
+                }),
+            },
+        }
+
+    def _build_step_two_response_format(self, tool_catalog: Dict[str, Any]) -> Dict[str, Any] | None:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "semi_agent_step_two_board",
+                "strict": True,
+                "schema": self._strict_openai_schema({
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "stage": {"type": "string", "enum": ["step_2_board"]},
+                        "step_number": {"type": "integer", "enum": [2]},
+                        "chain_position": {"type": "string", "enum": ["board interaction"]},
+                        "cycle_back_to_step_one": {"type": "boolean"},
+                        "reasoning_summary": {"type": "string"},
+                        "board_explanation": {"type": "string"},
+                        "memory_plan": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "default_memory_type": {"type": "string", "enum": ["instant", "ram", "memory"]},
+                                "why": {"type": "string"},
+                            },
+                            "required": ["default_memory_type", "why"],
+                        },
+                        "focus_object": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "name": {"type": "string"},
+                                "text": {"type": "string"},
+                                "width": {"type": "number"},
+                                "height": {"type": "number"},
+                                "memory_type": {"type": "string", "enum": ["instant", "ram", "memory"]},
+                                "delete_after_click": {"type": "boolean"},
+                                "linked_call_ids": {"type": "array", "items": {"type": "string"}},
+                                "result_title": {"type": "string"},
+                                "result_summary": {"type": "string"},
+                            },
+                            "required": [
+                                "name",
+                                "text",
+                                "width",
+                                "height",
+                                "memory_type",
+                                "delete_after_click",
+                                "linked_call_ids",
+                                "result_title",
+                                "result_summary",
+                            ],
+                        },
+                        "additional_mcp_calls": {
+                            "type": "array",
+                            "items": self._build_mcp_call_response_schema(tool_catalog),
+                        },
+                        "board_commands": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["create", "move", "enlarge", "shrink", "delete", "click"],
+                                    },
+                                    "name": {"type": "string"},
+                                    "x": {"type": "number"},
+                                    "y": {"type": "number"},
+                                    "factor": {"type": "number"},
+                                    "width": {"type": "number"},
+                                    "height": {"type": "number"},
+                                    "text": {"type": "string"},
+                                    "memoryType": {"type": "string", "enum": ["instant", "ram", "memory"]},
+                                    "deleteAfterClick": {"type": "boolean"},
+                                    "color": {"type": "string"},
+                                    "innerInset": {"type": "number"},
+                                    "tags": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["action", "name"],
+                            },
+                        },
+                        "result_bindings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "object_name": {"type": "string"},
+                                    "linked_call_ids": {"type": "array", "items": {"type": "string"}},
+                                    "memory_type": {"type": "string", "enum": ["instant", "ram", "memory"]},
+                                    "delete_after_click": {"type": "boolean"},
+                                    "result_title": {"type": "string"},
+                                    "result_summary": {"type": "string"},
+                                },
+                                "required": [
+                                    "object_name",
+                                    "linked_call_ids",
+                                    "memory_type",
+                                    "delete_after_click",
+                                    "result_title",
+                                    "result_summary",
+                                ],
+                            },
+                        },
+                    },
+                    "required": [
+                        "stage",
+                        "step_number",
+                        "chain_position",
+                        "cycle_back_to_step_one",
+                        "reasoning_summary",
+                        "board_explanation",
+                        "memory_plan",
+                        "focus_object",
+                        "additional_mcp_calls",
+                        "board_commands",
+                        "result_bindings",
+                    ],
+                }),
+            },
+        }
 
     def get_registry_payload(self, *, base_url: str = "") -> Dict[str, Any]:
         return self.registry.load_registry(base_url=base_url)
@@ -89,6 +458,20 @@ class SemiAgentService:
             "board_state": self.board_memory.load_persistent_board_state(),
         }
 
+    def save_board_memory_state(
+        self,
+        *,
+        board_state: Dict[str, Any] | None,
+        removed_result_id: str | None = None,
+    ) -> Dict[str, Any]:
+        if removed_result_id:
+            self.board_memory.remove_result_binding(removed_result_id)
+        persisted = self.board_memory.save_persistent_board_state(board_state or {})
+        return {
+            "ok": True,
+            "board_state": persisted,
+        }
+
     def run(
         self,
         *,
@@ -97,7 +480,7 @@ class SemiAgentService:
         largest_empty_space: Dict[str, Any] | None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
-        reasoning_provider: str = "qwen",
+        reasoning_provider: str = "openai",
     ) -> Dict[str, Any]:
         context = self._prepare_run_context(
             prompt=prompt,
@@ -113,7 +496,7 @@ class SemiAgentService:
             step_one=context["step_one"],
             mcp_results=context["mcp_results"],
             registry_payload=context["mcp_registry"],
-            user_id=user_id,
+            user_context=context["user_context"],
             session_id=session_id,
         )
         board_payload = self._run_board_stage(
@@ -124,13 +507,15 @@ class SemiAgentService:
             mcp_results=context["mcp_results"],
             chain_history=context["chain_history"],
             registry_payload=context["mcp_registry"],
-            user_id=user_id,
+            tool_catalog=context["mcp_tool_catalog"],
+            user_id=context["effective_user_id"],
             session_id=session_id,
             reasoning_provider=context["reasoning_provider"],
         )
         speech_payload = speech_future.result()
         return {
             **board_payload,
+            "user_context": context["user_context"],
             "reasoning_provider": context["reasoning_provider"],
             "speech_response": self._clean_text(speech_payload.get("assistant_text")),
             "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
@@ -147,7 +532,7 @@ class SemiAgentService:
         largest_empty_space: Dict[str, Any] | None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
-        reasoning_provider: str = "qwen",
+        reasoning_provider: str = "openai",
     ) -> Dict[str, Any]:
         self._prune_run_jobs()
         context = self._prepare_run_context(
@@ -165,7 +550,7 @@ class SemiAgentService:
             step_one=context["step_one"],
             mcp_results=context["mcp_results"],
             registry_payload=context["mcp_registry"],
-            user_id=user_id,
+            user_context=context["user_context"],
             session_id=session_id,
         )
         whitespace_future = self._executor.submit(
@@ -177,7 +562,8 @@ class SemiAgentService:
             mcp_results=context["mcp_results"],
             chain_history=context["chain_history"],
             registry_payload=context["mcp_registry"],
-            user_id=user_id,
+            tool_catalog=context["mcp_tool_catalog"],
+            user_id=context["effective_user_id"],
             session_id=session_id,
             reasoning_provider=context["reasoning_provider"],
         )
@@ -186,6 +572,7 @@ class SemiAgentService:
                 "created_at": time.time(),
                 "prompt": context["prompt"],
                 "reasoning_provider": context["reasoning_provider"],
+                "user_context": context["user_context"],
                 "speech_future": speech_future,
                 "whitespace_future": whitespace_future,
             }
@@ -193,6 +580,7 @@ class SemiAgentService:
             "ok": True,
             "run_id": run_id,
             "prompt": context["prompt"],
+            "user_context": context["user_context"],
             "reasoning_provider": context["reasoning_provider"],
             "step_one": context["step_one"],
             "mcp_results": context["mcp_results"],
@@ -230,6 +618,8 @@ class SemiAgentService:
         normalized_reasoning_provider = self._normalize_reasoning_provider(
             reasoning_provider,
         )
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        effective_user_id = user_context["resolved_user_id"]
 
         normalized_board_state = self.board_memory.normalize_board_state(board_state)
         empty_space_payload = (
@@ -240,17 +630,21 @@ class SemiAgentService:
 
         chain_history: List[Dict[str, Any]] = []
         registry_payload = self.get_registry_payload()
+        tool_catalog = self._build_mcp_tool_catalog()
 
         step_one_raw = self._generate_json(
             system_prompt=build_step_one_mcp_prompt(
                 registry=registry_payload,
+                tool_catalog=tool_catalog,
                 chain_history=chain_history,
                 board_state=normalized_board_state,
             ),
             user_prompt=clean_prompt,
             default_payload=self._default_step_one_plan(clean_prompt),
+            response_format=self._build_step_one_response_format(tool_catalog),
+            allow_default_fallback=False,
             reasoning_provider=normalized_reasoning_provider,
-            user_id=user_id,
+            user_id=effective_user_id,
             session_id=session_id,
         )
         step_one = self._normalize_step_one_plan(step_one_raw, clean_prompt)
@@ -259,7 +653,7 @@ class SemiAgentService:
         mcp_results = self._execute_mcp_calls(
             step_one.get("mcp_calls", []),
             clean_prompt,
-            user_id=user_id,
+            user_id=effective_user_id,
             board_state=normalized_board_state,
         )
         if mcp_results:
@@ -271,6 +665,9 @@ class SemiAgentService:
             "largest_empty_space": empty_space_payload,
             "chain_history": chain_history,
             "mcp_registry": registry_payload,
+            "mcp_tool_catalog": tool_catalog,
+            "user_context": user_context,
+            "effective_user_id": effective_user_id,
             "reasoning_provider": normalized_reasoning_provider,
             "step_one": step_one,
             "mcp_results": mcp_results,
@@ -286,6 +683,7 @@ class SemiAgentService:
         mcp_results: List[Dict[str, Any]],
         chain_history: List[Dict[str, Any]],
         registry_payload: Dict[str, Any],
+        tool_catalog: Dict[str, Any],
         user_id: str,
         session_id: str,
         reasoning_provider: str,
@@ -297,6 +695,7 @@ class SemiAgentService:
             step_one=step_one,
             mcp_results=mcp_results,
             chain_history=chain_history,
+            tool_catalog=tool_catalog,
             user_id=user_id,
             session_id=session_id,
             reasoning_provider=reasoning_provider,
@@ -314,7 +713,12 @@ class SemiAgentService:
         )
         self._attach_bindings_to_commands(final_board_commands, registered_bindings)
         self.board_memory.register_result_bindings(registered_bindings)
-        persisted_board_state = self.board_memory.save_persistent_board_state(final_board_state)
+        persisted_board_state = self.connections_service.save_board_state_for_user(
+            user_id,
+            final_board_state,
+        )
+        if persisted_board_state is None:
+            persisted_board_state = self.board_memory.save_persistent_board_state(final_board_state)
 
         return {
             "ok": True,
@@ -346,11 +750,17 @@ class SemiAgentService:
         step_one: Dict[str, Any],
         mcp_results: List[Dict[str, Any]],
         registry_payload: Dict[str, Any],
-        user_id: str,
+        user_context: Dict[str, str],
         session_id: str,
     ) -> Dict[str, Any]:
         warnings: List[str] = []
         llm_result = None
+        history_key = self._clean_text(user_context.get("history_key")) or "anonymous"
+        clean_session_id = self._clean_text(session_id) or "default_session"
+        recent_history = self.speech_history_store.get_messages(
+            history_key=history_key,
+            session_id=clean_session_id,
+        )
         try:
             llm_result = self.llm_provider.generate_reply_with_messages(
                 system_prompt=self._build_parallel_speech_system_prompt(),
@@ -362,14 +772,14 @@ class SemiAgentService:
                             step_one=step_one,
                             mcp_results=mcp_results,
                             registry_payload=registry_payload,
+                            recent_history=recent_history,
                         ),
                     }
                 ],
-                session_id=self._clean_text(session_id) or "default_session",
-                user_id=self._clean_text(user_id) or "anonymous",
-                include_history=True,
-                history_prompt=clean_prompt,
-                store_history=True,
+                session_id=clean_session_id,
+                user_id=self._clean_text(user_context.get("resolved_user_id")) or "anonymous",
+                include_history=False,
+                store_history=False,
             )
             assistant_text = llm_result.text
             warnings.extend(llm_result.warnings)
@@ -378,6 +788,13 @@ class SemiAgentService:
             assistant_text = self._fallback_parallel_speech_response(clean_prompt)
             warnings.append(f"llm_fallback={exc}")
             llm_source = "fallback"
+
+        self.speech_history_store.append_turn(
+            history_key=history_key,
+            session_id=clean_session_id,
+            user_text=clean_prompt,
+            assistant_text=assistant_text,
+        )
 
         assistant_audio_base64 = ""
         assistant_audio_mime_type = ""
@@ -414,6 +831,9 @@ class SemiAgentService:
             "so be tolerant, explanatory, patient, and helpful. Use the MCP context "
             "only when it helps the answer. This reply will go directly into text to "
             "speech, so keep it natural and easy to say aloud. "
+            "If an MCP already completed the concrete action, keep the reply semi-short: "
+            "briefly acknowledge what was done, mention where the result now lives when relevant, "
+            "and do not repeat the full operational payload because the MCP or board object is handling that part. "
             "THIS IS EXTREMELY IMPORTANT: you MUST answer in Bulgarian written in "
             "Bulgarian Cyrillic. Do not answer in English unless the user explicitly "
             "asks you to switch languages."
@@ -426,20 +846,26 @@ class SemiAgentService:
         step_one: Dict[str, Any],
         mcp_results: List[Dict[str, Any]],
         registry_payload: Dict[str, Any],
+        recent_history: List[Dict[str, str]],
     ) -> str:
+        used_mcp_context = self._build_used_mcp_context(
+            mcp_results=mcp_results,
+            registry_payload=registry_payload,
+        )
         context_payload = {
             "original_user_request": clean_prompt,
+            "recent_chat_history": recent_history,
             "step_one_plan": step_one,
-            "used_mcp_context": self._build_used_mcp_context(
-                mcp_results=mcp_results,
-                registry_payload=registry_payload,
-            ),
+            "used_mcp_context": used_mcp_context,
+            "used_mcp_count": len(used_mcp_context),
         }
         return (
             "Hold a helpful conversation with the user about their request. "
             "The agent has already completed the stage 1 MCP work below, so you can "
             "use it as factual context while answering. Respond directly to the user. "
             "Be warm and explanatory when the request is unclear or difficult. "
+            "If `used_mcp_count` is above 0, keep the reply semi-short and mostly acknowledge the completed tool work. "
+            "Let the MCP result or whiteboard object carry the detailed action payload, and explicitly mention that the action/result is already prepared when that helps the user. "
             "THIS IS EXTREMELY IMPORTANT: the final answer must be in Bulgarian.\n\n"
             f"{json.dumps(context_payload, ensure_ascii=False, indent=2)}"
         )
@@ -503,6 +929,7 @@ class SemiAgentService:
                 "kind": kind,
                 "status": "running",
                 "prompt": job.get("prompt", ""),
+                "user_context": job.get("user_context", {}),
                 "reasoning_provider": job.get("reasoning_provider", "qwen"),
             }
 
@@ -520,6 +947,7 @@ class SemiAgentService:
         return {
             "run_id": run_id,
             "kind": kind,
+            "user_context": job.get("user_context", {}),
             "reasoning_provider": job.get("reasoning_provider", "qwen"),
             **payload,
         }
@@ -545,9 +973,13 @@ class SemiAgentService:
         user_id: str = "anonymous",
         board_state: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        effective_user_id = user_context["resolved_user_id"]
         clean_mcp_id = self._clean_text(mcp_id)
         clean_tool_name = self._normalize_tool_name(tool_name)
-        supported_tools = self.SUPPORTED_MCP_TOOLS.get(clean_mcp_id)
+        if not clean_mcp_id:
+            clean_mcp_id = self._infer_mcp_id_from_tool_name(clean_tool_name)
+        supported_tools = self._supported_mcp_tools().get(clean_mcp_id)
         if supported_tools is None:
             raise ValueError(f"Unsupported MCP '{clean_mcp_id}'.")
         if clean_tool_name not in supported_tools:
@@ -563,12 +995,13 @@ class SemiAgentService:
             tool_name=clean_tool_name,
             prompt=tool_prompt,
             arguments=arguments,
-            user_id=user_id,
+            user_id=effective_user_id,
             board_state=board_state,
         )
         summary = self._summarize_mcp_result(clean_mcp_id, clean_tool_name, result)
         return {
             "ok": True,
+            "user_context": user_context,
             "mcp_id": clean_mcp_id,
             "tool_name": clean_tool_name,
             "arguments": {
@@ -585,6 +1018,8 @@ class SemiAgentService:
         object_payload: Dict[str, Any] | None,
         user_id: str = "anonymous",
     ) -> Dict[str, Any]:
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        effective_user_id = user_context["resolved_user_id"]
         object_payload = object_payload if isinstance(object_payload, dict) else {}
         object_name = self._clean_text(object_payload.get("name"))
         result_id = self._clean_text(object_payload.get("resultId") or object_payload.get("result_id"))
@@ -595,6 +1030,28 @@ class SemiAgentService:
         )
 
         binding = self.board_memory.resolve_result_binding(result_id)
+        target_user_id = self._extract_target_user_id(
+            object_payload,
+            binding if isinstance(binding, dict) else {},
+        )
+        if target_user_id is not None:
+            try:
+                viewer = self.connections_service.build_user_widget_payload(
+                    agent_user_id=effective_user_id,
+                    target_user_id=target_user_id,
+                )
+            except Exception:
+                viewer = None
+            if isinstance(viewer, dict):
+                return {
+                    "ok": True,
+                    "found": True,
+                    "object_name": object_name,
+                    "message": "Opened the user connection widget.",
+                    "board_commands": [],
+                    "viewer": viewer,
+                }
+
         if binding is None:
             return {
                 "ok": True,
@@ -609,6 +1066,17 @@ class SemiAgentService:
             if object_name:
                 board_commands.append({"action": "delete", "name": object_name})
             self.board_memory.remove_result_binding(result_id)
+            persisted_board_state = self.connections_service.apply_board_commands_for_user(
+                effective_user_id,
+                board_commands,
+            )
+            if persisted_board_state is None:
+                current_persistent_state = self.board_memory.load_persistent_board_state()
+                updated_persistent_state = self.board_memory.apply_commands(
+                    current_persistent_state,
+                    board_commands,
+                )
+                self.board_memory.save_persistent_board_state(updated_persistent_state)
 
         title = self._clean_text(binding.get("result_title") or binding.get("resultTitle") or object_name or "Board result")
         summary = self._clean_text(binding.get("result_summary") or binding.get("resultSummary"))
@@ -619,16 +1087,60 @@ class SemiAgentService:
             default_title=title,
             default_summary=summary,
             default_payload=payload,
-            user_id=user_id,
+            user_id=effective_user_id,
         )
 
         return {
             "ok": True,
+            "user_context": user_context,
             "found": True,
             "object_name": object_name,
             "board_commands": board_commands,
             "speech_response": summary or f"I opened {title}.",
             "viewer": viewer,
+        }
+
+    def delete_board_object(
+        self,
+        *,
+        object_payload: Dict[str, Any] | None,
+        user_id: str = "anonymous",
+    ) -> Dict[str, Any]:
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        effective_user_id = user_context["resolved_user_id"]
+        object_payload = object_payload if isinstance(object_payload, dict) else {}
+        object_name = self._clean_text(object_payload.get("name"))
+        if not object_name:
+            raise ValueError("Object name is required.")
+
+        result_id = self._clean_text(
+            object_payload.get("resultId") or object_payload.get("result_id")
+        )
+        board_commands: List[Dict[str, Any]] = [{"action": "delete", "name": object_name}]
+
+        if result_id:
+            self.board_memory.remove_result_binding(result_id)
+
+        persisted_board_state = self.connections_service.apply_board_commands_for_user(
+            effective_user_id,
+            board_commands,
+        )
+        if persisted_board_state is None:
+            current_persistent_state = self.board_memory.load_persistent_board_state()
+            updated_persistent_state = self.board_memory.apply_commands(
+                current_persistent_state,
+                board_commands,
+            )
+            persisted_board_state = self.board_memory.save_persistent_board_state(
+                updated_persistent_state
+            )
+
+        return {
+            "ok": True,
+            "user_context": user_context,
+            "object_name": object_name,
+            "board_commands": board_commands,
+            "persisted_board_state": persisted_board_state,
         }
 
     def _run_step_two_loop(
@@ -640,6 +1152,7 @@ class SemiAgentService:
         step_one: Dict[str, Any],
         mcp_results: List[Dict[str, Any]],
         chain_history: List[Dict[str, Any]],
+        tool_catalog: Dict[str, Any],
         user_id: str,
         session_id: str,
         reasoning_provider: str,
@@ -655,10 +1168,13 @@ class SemiAgentService:
                     largest_empty_space=largest_empty_space,
                     step_one_plan=step_one,
                     mcp_results=current_results,
+                    tool_catalog=tool_catalog,
                     chain_history=current_history,
                 ),
                 user_prompt=prompt,
                 default_payload=step_two,
+                response_format=self._build_step_two_response_format(tool_catalog),
+                allow_default_fallback=False,
                 reasoning_provider=reasoning_provider,
                 user_id=user_id,
                 session_id=session_id,
@@ -749,7 +1265,7 @@ class SemiAgentService:
         board_state: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         if mcp_id == "gnn_actions":
-            return self._dispatch_gnn_tool(tool_name, prompt)
+            return self._dispatch_gnn_tool(tool_name, prompt, user_id=user_id)
         if mcp_id == "connections":
             return self._dispatch_connections_tool(
                 tool_name=tool_name,
@@ -760,13 +1276,20 @@ class SemiAgentService:
             )
         raise ValueError(f"Unsupported MCP '{mcp_id}'.")
 
-    def _dispatch_gnn_tool(self, tool_name: str, prompt: str) -> Dict[str, Any]:
+    def _dispatch_gnn_tool(
+        self,
+        tool_name: str,
+        prompt: str,
+        *,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        graph_service = self._get_graph_service()
         if tool_name == "add_action":
-            return self.graph_service.add_action_flow(prompt)
+            return graph_service.add_action_flow(prompt, user_id=user_id)
         if tool_name == "fetch_action":
-            return self.graph_service.fetch_action_flow(prompt)
+            return graph_service.fetch_action_flow(prompt, user_id=user_id)
         if tool_name == "conversation":
-            return self.graph_service.conversation_flow(prompt)
+            return graph_service.conversation_flow(prompt, user_id=user_id)
         raise ValueError(f"Unsupported tool '{tool_name}'.")
 
     def _dispatch_connections_tool(
@@ -907,6 +1430,11 @@ class SemiAgentService:
                     "object": deepcopy(object_state),
                 },
             }
+            if self._extract_target_user_id(object_state, binding) is not None:
+                binding["memory_type"] = "memory"
+                binding["delete_after_click"] = False
+                object_state["memoryType"] = "memory"
+                object_state["deleteAfterClick"] = False
             prepared.append(binding)
         return prepared
 
@@ -1061,15 +1589,24 @@ class SemiAgentService:
 
     def _normalize_step_one_plan(self, raw: Dict[str, Any], prompt: str) -> Dict[str, Any]:
         raw = raw if isinstance(raw, dict) else {}
-        calls = self._normalize_mcp_calls(raw.get("mcp_calls"))
-        needs_mcps = self._to_bool(raw.get("needs_mcps"), default=bool(calls))
+        calls = self._normalize_mcp_calls(
+            raw.get("mcp_calls")
+            or raw.get("calls")
+            or raw.get("tool_calls")
+            or raw.get("selected_tools")
+            or raw.get("selected_tool")
+            or raw.get("call")
+        )
         request_kind = self._clean_text(raw.get("request_kind")).lower()
         if request_kind not in {"mechanical", "profile", "mixed"}:
             request_kind = self._default_request_kind(prompt)
+        needs_mcps = self._to_bool(raw.get("needs_mcps"), default=bool(calls))
         memory_hint = self._normalize_memory_type(raw.get("memory_hint") or self._default_memory_type(prompt, request_kind))
 
         if request_kind == "mechanical" and not calls:
             needs_mcps = False
+        if needs_mcps and not calls:
+            raise ValueError("Step 1 planning returned needs_mcps=true without any valid MCP calls.")
 
         return {
             "stage": "step_1_mcp",
@@ -1385,15 +1922,51 @@ class SemiAgentService:
 
     def _normalize_mcp_calls(self, payload: Any) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
-        items = payload if isinstance(payload, list) else []
+        items: List[Any] = []
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict):
+            if any(payload.get(key) is not None for key in ("mcp_id", "mcp", "tool_name", "tool", "action")):
+                items = [payload]
+            else:
+                for key in ("mcp_calls", "calls", "tool_calls", "tools", "actions"):
+                    value = payload.get(key)
+                    if isinstance(value, list):
+                        items = value
+                        break
+                    if isinstance(value, dict):
+                        items = [value]
+                        break
+        supported_tools = self._supported_mcp_tools()
         for index, item in enumerate(items, start=1):
             if not isinstance(item, dict):
                 continue
             mcp_id = self._clean_text(item.get("mcp_id") or item.get("mcp"))
-            tool_name = self._normalize_tool_name(item.get("tool_name") or item.get("tool"))
-            if tool_name not in self.SUPPORTED_MCP_TOOLS.get(mcp_id, set()):
+            tool_name = self._normalize_tool_name(
+                item.get("tool_name")
+                or item.get("tool")
+                or item.get("action")
+                or item.get("name")
+            )
+            if not mcp_id:
+                mcp_id = self._infer_mcp_id_from_tool_name(tool_name)
+            if tool_name not in supported_tools.get(mcp_id, set()):
                 continue
-            arguments = self._clean_jsonish(item.get("arguments")) if isinstance(item.get("arguments"), dict) else {}
+            raw_arguments = (
+                item.get("arguments")
+                if isinstance(item.get("arguments"), dict)
+                else item.get("args")
+                if isinstance(item.get("args"), dict)
+                else item.get("body")
+                if isinstance(item.get("body"), dict)
+                else item.get("tool_input")
+                if isinstance(item.get("tool_input"), dict)
+                else {}
+            )
+            arguments = self._clean_jsonish(raw_arguments) if isinstance(raw_arguments, dict) else {}
+            inline_prompt = self._clean_text(item.get("prompt"))
+            if inline_prompt and not self._clean_text(arguments.get("prompt")):
+                arguments["prompt"] = inline_prompt
             prompt = self._clean_text(arguments.get("prompt"))
             if prompt:
                 arguments["prompt"] = prompt
@@ -1512,23 +2085,15 @@ class SemiAgentService:
         system_prompt: str,
         user_prompt: str,
         default_payload: Dict[str, Any],
+        response_format: Dict[str, Any] | None = None,
+        allow_default_fallback: bool = True,
         reasoning_provider: str = "qwen",
         user_id: str = "anonymous",
         session_id: str = "default_session",
     ) -> Dict[str, Any]:
         normalized_provider = self._normalize_reasoning_provider(reasoning_provider)
         try:
-            if normalized_provider == "openai":
-                llm_result = self.llm_provider.generate_reply_with_messages(
-                    system_prompt=system_prompt,
-                    messages=[{"role": "user", "content": user_prompt}],
-                    session_id=f"{self._clean_text(session_id) or 'default_session'}_planner",
-                    user_id=self._clean_text(user_id) or "anonymous",
-                    include_history=False,
-                    store_history=False,
-                )
-                raw = llm_result.text
-            else:
+            if normalized_provider == "qwen":
                 raw = self.qwen_client.generate(
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
@@ -1537,18 +2102,60 @@ class SemiAgentService:
                         "json_continuation_budget": self.BOARD_PIPELINE_JSON_CONTINUATION_BUDGET,
                     },
                 )
+            else:
+                raw = self._generate_openai_reasoning_text(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response_format=response_format,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
             return QwenPromptParser._extract_json(raw)
         except Exception:
+            if normalized_provider == "qwen":
+                try:
+                    raw = self._generate_openai_reasoning_text(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        response_format=response_format,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                    return QwenPromptParser._extract_json(raw)
+                except Exception:
+                    pass
+            if not allow_default_fallback:
+                raise
             return deepcopy(default_payload)
 
     def _normalize_reasoning_provider(self, value: Any) -> str:
-        normalized = self._clean_text(value).lower() or "qwen"
+        normalized = self._clean_text(value).lower() or "openai"
         if normalized not in self.SUPPORTED_REASONING_PROVIDERS:
             raise ValueError(
                 f"Unsupported reasoning_provider '{value}'. "
                 f"Supported: {', '.join(sorted(self.SUPPORTED_REASONING_PROVIDERS))}."
             )
         return normalized
+
+    def _generate_openai_reasoning_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_format: Dict[str, Any] | None,
+        user_id: str,
+        session_id: str,
+    ) -> str:
+        llm_result = self.llm_provider.generate_reply_with_messages(
+            system_prompt=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            session_id=f"{self._clean_text(session_id) or 'default_session'}_planner",
+            user_id=self._clean_text(user_id) or "anonymous",
+            include_history=False,
+            store_history=False,
+            response_format=response_format,
+        )
+        return llm_result.text
 
     def _generate_text(self, *, system_prompt: str, user_prompt: str, fallback: str) -> str:
         try:
@@ -1570,14 +2177,14 @@ class SemiAgentService:
             "stage": "step_1_mcp",
             "step_number": 1,
             "chain_position": "mcp layer",
-            "needs_mcps": request_kind != "mechanical",
+            "needs_mcps": False,
             "request_kind": request_kind,
             "memory_hint": self._default_memory_type(prompt, request_kind),
             "reasoning_summary": "Fallback step 1 plan.",
             "why_this_is_part_of_the_chain": "This is the MCP decision layer.",
             "board_intent": "Create one active board focus for the request.",
             "speech_intent": "Explain what was done in one shared response.",
-            "mcp_calls": self._default_mcp_calls(prompt, request_kind),
+            "mcp_calls": [],
         }
 
     def _default_step_two_plan(self, prompt: str, step_one: Dict[str, Any], current_results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1612,63 +2219,63 @@ class SemiAgentService:
         }
 
     def _default_mcp_calls(self, prompt: str, request_kind: str) -> List[Dict[str, Any]]:
-        if request_kind == "mechanical":
-            return []
+        return []
+
+    def _looks_like_new_action_memory_request(self, prompt: str) -> bool:
         lowered = prompt.lower()
-        if any(
-            keyword in lowered
-            for keyword in {
-                "connect",
-                "connection",
-                "closest user",
-                "find someone",
-                "someone like",
-                "person like",
-                "friend for",
-                "recommend a person",
+        activity_markers = {
+            "i went",
+            "i did",
+            "i tried",
+            "i started",
+            "i took",
+            "i had a",
+            "i have been going",
+            "today i",
+            "after i",
+            "went on a",
+            "went for a",
+            "hike",
+            "walk",
+            "run",
+            "gym",
+            "exercise",
+            "worked out",
+            "went outside",
+            "outdoors",
+        }
+        memory_markers = {
+            "remember",
+            "memory",
+            "profile",
+            "update",
+            "this helped",
+            "felt better after",
+            "made me feel",
+            "uplift",
+            "energized after",
+            "happy after",
+        }
+        has_activity = any(marker in lowered for marker in activity_markers)
+        has_memory_signal = any(marker in lowered for marker in memory_markers)
+        return has_activity and (has_memory_signal or "today" in lowered or "after" in lowered)
+
+    def _looks_like_fetch_request(self, prompt: str) -> bool:
+        lowered = prompt.lower()
+        return any(
+            marker in lowered
+            for marker in {
+                "what should i do",
+                "what can i do",
+                "recommend",
+                "suggest",
+                "help me",
+                "need something",
+                "what fits",
+                "what would help",
+                "give me something",
             }
-        ):
-            return [
-                {
-                    "call_id": "connections.find_connection.1",
-                    "mcp_id": "connections",
-                    "tool_name": "find_connection",
-                    "arguments": {"prompt": prompt},
-                    "why": "Fallback connection search based on the request wording.",
-                }
-            ]
-        if any(
-            keyword in lowered
-            for keyword in {
-                "remember that i",
-                "i am",
-                "i'm",
-                "i enjoy",
-                "i like",
-                "about me",
-                "update my profile",
-                "update my description",
-            }
-        ):
-            return [
-                {
-                    "call_id": "connections.update_profile.1",
-                    "mcp_id": "connections",
-                    "tool_name": "update_profile",
-                    "arguments": {"prompt": prompt},
-                    "why": "Fallback durable profile update based on first-person user details.",
-                }
-            ]
-        tool_name = "conversation" if request_kind == "profile" else "fetch_action"
-        return [
-            {
-                "call_id": f"gnn_actions.{tool_name}.1",
-                "mcp_id": "gnn_actions",
-                "tool_name": tool_name,
-                "arguments": {"prompt": prompt},
-                "why": "Fallback MCP call based on request type.",
-            }
-        ]
+        )
 
     def _default_request_kind(self, prompt: str) -> str:
         lowered = prompt.lower()
@@ -1678,9 +2285,15 @@ class SemiAgentService:
             "emotion",
             "emotional",
             "sad",
+            "depressed",
+            "depression",
             "happy",
             "lonely",
             "anxious",
+            "energy",
+            "energized",
+            "uplift",
+            "hike",
             "friend",
             "memory",
             "remember",

@@ -117,6 +117,7 @@ venv/
 **/.env.*
 !**/.env.example
 backend/sqlite_export.json
+backend/runtime/
 .env.example
 
 # Exceptions to above rules.

@@ -2,6 +2,7 @@ from django.urls import path
 from .views import (
     add_action_view,
     agent_board_memory_view,
+    agent_object_delete_view,
     agent_mcp_descriptor_view,
     agent_mcp_invoke_view,
     agent_mcp_registry_view,
@@ -35,4 +36,5 @@ urlpatterns = [
     path("api/agent/run/<str:run_id>/speech/", agent_run_speech_view, name="agent_run_speech"),
     path("api/agent/run/<str:run_id>/whitespace/", agent_run_whitespace_view, name="agent_run_whitespace"),
     path("api/agent/open-object/", agent_object_open_view, name="agent_object_open"),
+    path("api/agent/delete-object/", agent_object_delete_view, name="agent_object_delete"),
 ]

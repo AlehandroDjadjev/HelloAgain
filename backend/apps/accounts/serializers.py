@@ -166,3 +166,25 @@ class RecommendationActivitySerializer(serializers.Serializer):
     )
     query_text = serializers.CharField(required=False, allow_blank=True)
     metadata = serializers.DictField(required=False, default=dict)
+
+
+class BoardStateSerializer(serializers.Serializer):
+    board_state = serializers.DictField()
+    removed_result_id = serializers.CharField(required=False, allow_blank=True)
+
+
+class ConnectionThreadMessageSerializer(serializers.Serializer):
+    message = serializers.CharField(max_length=1000)
+
+    def validate_message(self, value: str) -> str:
+        value = " ".join(value.split()).strip()
+        if not value:
+            raise serializers.ValidationError("Please enter a message.")
+        return value
+
+
+class ConnectionThreadFriendshipActionSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(
+        choices=["send", "accept", "decline", "cancel", "unfriend"]
+    )
+    message = serializers.CharField(required=False, allow_blank=True, max_length=280)

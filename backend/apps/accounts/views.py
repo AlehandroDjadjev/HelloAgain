@@ -20,6 +20,9 @@ from recommendations.services.intake_clarification import (
 from .models import AccountProfile, FriendRequest, ImportedContact, normalize_email, normalize_phone_number
 from .serializers import (
     AccountProfileUpdateSerializer,
+    BoardStateSerializer,
+    ConnectionThreadFriendshipActionSerializer,
+    ConnectionThreadMessageSerializer,
     ContactsImportSerializer,
     DiscoveryQuerySerializer,
     FriendRequestCreateSerializer,
@@ -57,10 +60,12 @@ from .services import (
     split_display_name,
     sync_profile_to_recommendations,
 )
+from .whiteboard_service import AccountWhiteboardService
 
 
 connections_agent_service = ConnectionsAgentService()
 onboarding_service = OnboardingService()
+whiteboard_service = AccountWhiteboardService()
 
 
 def _json_ok(data: dict, status: int = 200) -> JsonResponse:
@@ -542,6 +547,146 @@ def user_detail(request, user_id: int):
                 matched_contact_ids=matched_contact_ids,
                 graph_score=float(graph_scores.get(target.elder_profile_id or -1, 0.3)),
             )
+        }
+    )
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def me_board_state_view(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    if request.method == "GET":
+        return _json_ok({"board_state": whiteboard_service.load_board_state_for_profile(viewer)})
+
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = BoardStateSerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Board state update failed.")
+
+    board_state = whiteboard_service.save_board_state_for_profile(
+        viewer,
+        serializer.validated_data["board_state"],
+    )
+    removed_result_id = str(
+        serializer.validated_data.get("removed_result_id") or ""
+    ).strip()
+    if removed_result_id:
+        whiteboard_service.memory_store.remove_result_binding(removed_result_id)
+    return _json_ok({"board_state": board_state})
+
+
+def _thread_viewer_payload(viewer: AccountProfile, thread_id: int) -> dict:
+    thread = whiteboard_service.get_thread_for_profile(viewer, thread_id)
+    counterparty = thread.counterparty_for(viewer)
+    return {
+        "thread": whiteboard_service.build_thread_payload(viewer, thread),
+        "viewer": connections_agent_service.build_user_widget_payload(
+            agent_user_id=str(viewer.user_id),
+            target_user_id=counterparty.user_id,
+        ),
+    }
+
+
+@require_http_methods(["GET"])
+def connection_thread_detail_view(request, thread_id: int):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    try:
+        payload = _thread_viewer_payload(viewer, thread_id)
+    except ValueError as exc:
+        return _json_error(str(exc), status=404)
+    return _json_ok(payload)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def connection_thread_message_view(request, thread_id: int):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = ConnectionThreadMessageSerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Message send failed.")
+
+    try:
+        thread = whiteboard_service.get_thread_for_profile(viewer, thread_id)
+        whiteboard_service.send_message(
+            viewer,
+            thread,
+            message=serializer.validated_data["message"],
+        )
+        payload = _thread_viewer_payload(viewer, thread_id)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+    return _json_ok(payload)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def connection_thread_reject_view(request, thread_id: int):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    try:
+        thread = whiteboard_service.get_thread_for_profile(viewer, thread_id)
+        whiteboard_service.reject_thread(viewer, thread)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+    return _json_ok({"removed": True, "thread_id": thread_id})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def connection_thread_friendship_action_view(request, thread_id: int):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    try:
+        body = _parse_body(request)
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON body.")
+
+    serializer = ConnectionThreadFriendshipActionSerializer(data=body)
+    if not serializer.is_valid():
+        return _json_validation_error(serializer.errors, message="Friendship action failed.")
+
+    try:
+        thread = whiteboard_service.get_thread_for_profile(viewer, thread_id)
+        payload = whiteboard_service.handle_friendship_action(
+            viewer,
+            thread,
+            action=serializer.validated_data["action"],
+            message=serializer.validated_data.get("message", ""),
+        )
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    if payload is None:
+        return _json_ok({"removed": True, "thread_id": thread_id})
+    return _json_ok(
+        {
+            "thread": payload,
+            "viewer": connections_agent_service.build_user_widget_payload(
+                agent_user_id=str(viewer.user_id),
+                target_user_id=payload["counterparty"]["user_id"],
+            ),
         }
     )
 
