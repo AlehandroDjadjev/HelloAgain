@@ -17,6 +17,7 @@ from config.cors import LocalDevCorsMiddleware
 from engine.custom_mcp_registry import CustomMcpRegistry
 from engine.graph_service import GraphService
 from engine.llm_parser import QwenPromptParser
+from engine.semi_agent_prompts import build_step_one_mcp_prompt
 from engine.semi_agent_service import SemiAgentService
 from engine.user_context import ActiveUserTracker, TemporaryChatHistoryStore
 from engine.whiteboard_memory import WhiteboardMemoryStore
@@ -63,6 +64,27 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertEqual(len(phone_command_descriptor["tools"]), 1)
         self.assertTrue(phone_command_descriptor["invoke_url"].endswith("/api/agent/mcps/phone_command/invoke/"))
         self.assertEqual(phone_command_descriptor["tools"][0]["path"], "/api/agent/mcps/phone_command/invoke/")
+
+    def test_step_one_prompt_explicitly_teaches_phone_command_tool_usage(self) -> None:
+        registry = CustomMcpRegistry()
+        service = SemiAgentService(
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+        )
+
+        prompt = build_step_one_mcp_prompt(
+            registry=registry.load_registry(base_url="http://localhost:8000"),
+            tool_catalog=service._build_mcp_tool_catalog(),
+            chain_history=[],
+            board_state={},
+        )
+
+        self.assertIn("PHONE TOOL CHOICE RULES", prompt)
+        self.assertIn("phone_command.open_phone_command", prompt)
+        self.assertIn("operating the phone", prompt)
 
     def test_service_builds_tool_catalog_from_registry_descriptors(self) -> None:
         with TemporaryDirectory() as temp_dir:

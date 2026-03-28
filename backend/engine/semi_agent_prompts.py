@@ -35,6 +35,15 @@ This is step 1.
 - Do not invent a default MCP choice when you are unsure. If no MCP is justified, return `needs_mcps=false` and an empty `mcp_calls` array.
 - Requests about finding, matching, or connecting with a real person should prefer a people / connection tool over an emotion or action-memory tool.
 
+CONNECTION TOOL CHOICE RULES:
+- Use `connections.find_connection` when the user wants to find, match with, or connect to a real person.
+- Use `connections.update_profile` when the user reveals durable personal facts or preferences that should update their social profile.
+
+PHONE TOOL CHOICE RULES:
+- Use `phone_command.open_phone_command` when the request is about operating the phone, launching a phone flow, opening an app through the phone, or creating a clickable launcher object for a navigation / phone command prompt.
+- Prefer `phone_command.open_phone_command` over the social or GNN tools when the desired result is a phone-action launcher rather than memory, emotional analysis, or a real-person connection.
+- Pass the user's phone prompt through as the `prompt` argument with minimal rewriting.
+
 GNN TOOL CHOICE RULES:
 - Use `gnn_actions.add_action` when the user describes a concrete activity, behavior, or coping thing they did and it should become remembered action memory.
 - Use `gnn_actions.fetch_action` when the user needs a recommendation, what-fits-now suggestion, or action retrieval.
@@ -58,8 +67,8 @@ JSON shape:
   "mcp_calls": [
     {{
       "call_id": "gnn_actions.fetch_action.1",
-      "mcp_id": "gnn_actions",
-      "tool_name": "add_action|fetch_action|conversation",
+      "mcp_id": "gnn_actions|connections|phone_command",
+      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command",
       "arguments": {{
         "prompt": "prompt to send to the tool"
       }},
