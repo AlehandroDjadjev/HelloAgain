@@ -14,13 +14,31 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val VOICE_SERVICE_CHANNEL = "com.example.frontend/voice_service"
         private const val PHONE_HINT_CHANNEL = "hello_again/phone_hint"
-        private const val PHONE_HINT_REQUEST_CODE = 40421
+        private const val DEEP_LINK_CHANNEL = "hello_again/deep_link"
+        private const val PHONE_HINT_REQUEST_CODE = 4842
     }
 
     private var pendingPhoneHintResult: MethodChannel.Result? = null
+    private var pendingDeepLink: String? = null
+    private var deepLinkChannel: MethodChannel? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        deepLinkChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            DEEP_LINK_CHANNEL,
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "consumeInitialDeepLink" -> {
+                        result.success(pendingDeepLink ?: intent?.dataString)
+                        pendingDeepLink = null
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -48,57 +66,16 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        pendingDeepLink = intent?.dataString ?: pendingDeepLink
     }
 
-    private fun requestPhoneNumberHint(result: MethodChannel.Result) {
-        if (pendingPhoneHintResult != null) {
-            result.error(
-                "PHONE_HINT_IN_PROGRESS",
-                "A phone-number hint request is already running.",
-                null,
-            )
-            return
-        }
-
-        val request = GetPhoneNumberHintIntentRequest.builder().build()
-        Identity.getSignInClient(this)
-            .getPhoneNumberHintIntent(request)
-            .addOnSuccessListener { pendingIntent ->
-                try {
-                    pendingPhoneHintResult = result
-                    startIntentSenderForResult(
-                        pendingIntent.intentSender,
-                        PHONE_HINT_REQUEST_CODE,
-                        null,
-                        0,
-                        0,
-                        0,
-                    )
-                } catch (error: Exception) {
-                    pendingPhoneHintResult = null
-                    result.error(
-                        "PHONE_HINT_LAUNCH_FAILED",
-                        error.message ?: "Could not open the Android phone-number picker.",
-                        null,
-                    )
-                }
-            }
-            .addOnFailureListener { error ->
-                result.error(
-                    "PHONE_HINT_REQUEST_FAILED",
-                    error.message ?: "Android could not prepare the phone-number picker.",
-                    null,
-                )
-            }
-    }
-
-    private fun startVoiceService() {
-        val intent = Intent(this, VoiceAssistantForegroundService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val deepLink = intent.dataString ?: return
+        pendingDeepLink = deepLink
+        deepLinkChannel?.invokeMethod("onDeepLink", deepLink)
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -125,6 +102,58 @@ class MainActivity : FlutterActivity() {
                 error.message ?: "Could not extract phone number from Android hint result.",
                 null,
             )
+        }
+    }
+
+    private fun requestPhoneNumberHint(result: MethodChannel.Result) {
+        if (pendingPhoneHintResult != null) {
+            result.error(
+                "PHONE_HINT_IN_PROGRESS",
+                "A phone-number hint request is already running.",
+                null,
+            )
+            return
+        }
+
+        val request = GetPhoneNumberHintIntentRequest.builder().build()
+        Identity.getSignInClient(this)
+            .getPhoneNumberHintIntent(request)
+            .addOnSuccessListener { pendingIntent ->
+                try {
+                    pendingPhoneHintResult = result
+                    startIntentSenderForResult(
+                        pendingIntent.intentSender,
+                        PHONE_HINT_REQUEST_CODE,
+                        null,
+                        0,
+                        0,
+                        0,
+                        null,
+                    )
+                } catch (error: Exception) {
+                    pendingPhoneHintResult = null
+                    result.error(
+                        "PHONE_HINT_LAUNCH_FAILED",
+                        error.message ?: "Could not open the Android phone-number picker.",
+                        null,
+                    )
+                }
+            }
+            .addOnFailureListener { error ->
+                result.error(
+                    "PHONE_HINT_REQUEST_FAILED",
+                    error.message ?: "Android could not prepare the phone-number picker.",
+                    null,
+                )
+            }
+    }
+
+    private fun startVoiceService() {
+        val intent = Intent(this, VoiceAssistantForegroundService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
         }
     }
 }

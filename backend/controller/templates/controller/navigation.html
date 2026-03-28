@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hello Again Navigation</title>
+  <style>
+    :root {
+      --bg: #f4ede3;
+      --panel: rgba(255, 250, 242, 0.94);
+      --ink: #18242b;
+      --muted: #60707a;
+      --line: rgba(24, 36, 43, 0.10);
+      --accent: #1f7a5a;
+      --accent-soft: rgba(31, 122, 90, 0.14);
+      --warm: #c9793a;
+      --shadow: 0 24px 56px rgba(28, 34, 40, 0.10);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(201, 121, 58, 0.16), transparent 30%),
+        radial-gradient(circle at top right, rgba(31, 122, 90, 0.16), transparent 34%),
+        linear-gradient(180deg, #fbf7f1 0%, var(--bg) 100%);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+    }
+
+    .shell {
+      width: min(760px, calc(100% - 28px));
+      margin: 42px auto;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      padding: 28px;
+    }
+
+    h1, h2 {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    h1 { font-size: clamp(2rem, 5vw, 3.2rem); }
+    h2 { font-size: 1.15rem; }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .intro {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+
+    .prompt-box {
+      display: grid;
+      gap: 14px;
+      margin-top: 18px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 150px;
+      resize: vertical;
+      border-radius: 22px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.82);
+      padding: 18px 20px;
+      color: var(--ink);
+      font: inherit;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.88);
+    }
+
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    button {
+      border: none;
+      border-radius: 999px;
+      padding: 13px 20px;
+      font: inherit;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 140ms ease, opacity 140ms ease, box-shadow 140ms ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:disabled { cursor: wait; opacity: 0.7; }
+
+    .primary {
+      background: var(--accent);
+      color: #f8fffc;
+      box-shadow: 0 16px 30px rgba(31, 122, 90, 0.24);
+    }
+
+    .ghost {
+      background: rgba(255, 255, 255, 0.74);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+
+    .status {
+      margin-top: 18px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--line);
+      color: var(--ink);
+    }
+
+    .status.error {
+      border-color: rgba(169, 63, 54, 0.22);
+      background: rgba(169, 63, 54, 0.10);
+      color: #7e2d24;
+    }
+
+    .progress-wrap {
+      display: none;
+      margin-top: 22px;
+      padding: 18px;
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.7);
+      border: 1px solid var(--line);
+    }
+
+    .progress-track {
+      position: relative;
+      height: 14px;
+      width: 100%;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(31, 122, 90, 0.10);
+      margin-top: 10px;
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, var(--warm), var(--accent));
+      transition: width 220ms ease;
+    }
+
+    .progress-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 0.95rem;
+      color: var(--muted);
+    }
+
+    .result {
+      display: none;
+      margin-top: 22px;
+      gap: 14px;
+    }
+
+    .result-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-top: 14px;
+    }
+
+    .card {
+      padding: 16px;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.82);
+    }
+
+    .eyebrow {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    .value {
+      font-size: 1.05rem;
+      font-weight: 600;
+      word-break: break-word;
+    }
+
+    .hint {
+      margin-top: 12px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: var(--accent-soft);
+      color: #184e3b;
+    }
+
+    @media (max-width: 640px) {
+      .shell { width: min(100% - 18px, 760px); margin: 20px auto; }
+      .panel { padding: 20px; border-radius: 22px; }
+      textarea { min-height: 130px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel">
+      <div class="intro">
+        <h1>Navigation</h1>
+        <p>Type where you want to go and Hello Again will prepare the navigation request through the prompt-driven agent API. This page is focused only on route setup, without the controller debug panels.</p>
+      </div>
+
+      <div class="prompt-box">
+        <label for="prompt"><h2>Destination Request</h2></label>
+        <textarea id="prompt" placeholder="Take me to Central Park using Google Maps.">{{ initial_prompt }}</textarea>
+        <div class="actions">
+          <button id="run-btn" class="primary" type="button">Prepare Navigation</button>
+          <button id="clear-btn" class="ghost" type="button">Clear</button>
+        </div>
+      </div>
+
+      <div id="status" class="status">Ready to prepare a route.</div>
+
+      <section id="progress-wrap" class="progress-wrap" aria-live="polite">
+        <div class="progress-meta">
+          <span id="progress-stage">Reading your destination</span>
+          <span id="progress-percent">0%</span>
+        </div>
+        <div class="progress-track">
+          <div id="progress-bar" class="progress-bar"></div>
+        </div>
+      </section>
+
+      <section id="result" class="result">
+        <div>
+          <h2>Prepared Navigation</h2>
+          <p id="result-copy">The route plan is ready to be handed off to the navigation stack.</p>
+        </div>
+        <div class="result-grid">
+          <article class="card">
+            <span class="eyebrow">Goal</span>
+            <div id="goal-value" class="value">-</div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">Destination</span>
+            <div id="destination-value" class="value">-</div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">App</span>
+            <div id="app-value" class="value">-</div>
+          </article>
+          <article class="card">
+            <span class="eyebrow">Session</span>
+            <div id="session-value" class="value">-</div>
+          </article>
+        </div>
+        <div class="hint">Navigation preparation is complete. The prompt has been parsed into a route-ready agent session without exposing the old debug console.</div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const promptInput = document.getElementById('prompt');
+    const runBtn = document.getElementById('run-btn');
+    const clearBtn = document.getElementById('clear-btn');
+    const statusEl = document.getElementById('status');
+    const progressWrap = document.getElementById('progress-wrap');
+    const progressBar = document.getElementById('progress-bar');
+    const progressStage = document.getElementById('progress-stage');
+    const progressPercent = document.getElementById('progress-percent');
+    const resultEl = document.getElementById('result');
+    const goalValue = document.getElementById('goal-value');
+    const destinationValue = document.getElementById('destination-value');
+    const appValue = document.getElementById('app-value');
+    const sessionValue = document.getElementById('session-value');
+    const resultCopy = document.getElementById('result-copy');
+
+    const stages = [
+      { until: 18, label: 'Reading your destination' },
+      { until: 48, label: 'Understanding the route request' },
+      { until: 78, label: 'Developing the navigation plan' },
+      { until: 94, label: 'Preparing the session handoff' },
+      { until: 100, label: 'Navigation request ready' },
+    ];
+
+    let progressTimer = null;
+
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.className = isError ? 'status error' : 'status';
+    }
+
+    function setBusy(isBusy) {
+      runBtn.disabled = isBusy;
+      clearBtn.disabled = isBusy;
+      promptInput.disabled = isBusy;
+    }
+
+    function updateProgress(value) {
+      const normalized = Math.max(0, Math.min(100, Math.round(value)));
+      progressBar.style.width = `${normalized}%`;
+      progressPercent.textContent = `${normalized}%`;
+      const current = stages.find((stage) => normalized <= stage.until) || stages[stages.length - 1];
+      progressStage.textContent = current.label;
+    }
+
+    function startProgress() {
+      if (progressTimer) window.clearInterval(progressTimer);
+      progressWrap.style.display = 'block';
+      resultEl.style.display = 'none';
+      let value = 6;
+      updateProgress(value);
+      progressTimer = window.setInterval(() => {
+        value = Math.min(92, value + (value < 48 ? 8 : value < 78 ? 4 : 2));
+        updateProgress(value);
+      }, 240);
+    }
+
+    function finishProgress() {
+      if (progressTimer) {
+        window.clearInterval(progressTimer);
+        progressTimer = null;
+      }
+      updateProgress(100);
+    }
+
+    function resetPage() {
+      promptInput.value = '';
+      resultEl.style.display = 'none';
+      progressWrap.style.display = 'none';
+      setStatus('Ready to prepare a route.');
+      history.replaceState({}, '', '/');
+    }
+
+    async function runNavigationPlan(prompt) {
+      setBusy(true);
+      startProgress();
+      setStatus('Preparing your navigation request...');
+      resultEl.style.display = 'none';
+      history.replaceState({}, '', `/?prompt=${encodeURIComponent(prompt)}`);
+
+      try {
+        const response = await fetch('/api/agent/command/', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            device_id: 'navigation-page',
+            input_mode: 'text',
+            reasoning_provider: 'local',
+            supported_packages: ['com.google.android.apps.maps']
+          })
+        });
+
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.detail || 'Could not prepare the navigation request.');
+        }
+
+        finishProgress();
+        const intent = payload.intent || {};
+        const destination = intent.entities?.destination || intent.entities?.query || prompt;
+        goalValue.textContent = intent.goal || prompt;
+        destinationValue.textContent = destination;
+        appValue.textContent = intent.target_app || intent.app_package || 'Google Maps';
+        sessionValue.textContent = payload.session_id || '-';
+        resultCopy.textContent = payload.execution_ready
+          ? 'The navigation request is prepared and the session is ready for execution.'
+          : 'The navigation request was parsed, but execution still needs a follow-up step.';
+        resultEl.style.display = 'grid';
+        setStatus('Navigation request prepared successfully.');
+      } catch (error) {
+        if (progressTimer) {
+          window.clearInterval(progressTimer);
+          progressTimer = null;
+        }
+        updateProgress(0);
+        setStatus(error.message || 'Navigation preparation failed.', true);
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    runBtn.addEventListener('click', () => {
+      const prompt = promptInput.value.trim();
+      if (!prompt) {
+        setStatus('Enter a destination first.', true);
+        return;
+      }
+      runNavigationPlan(prompt);
+    });
+
+    clearBtn.addEventListener('click', resetPage);
+
+    if (promptInput.value.trim()) {
+      runNavigationPlan(promptInput.value.trim());
+    }
+  </script>
+</body>
+</html>

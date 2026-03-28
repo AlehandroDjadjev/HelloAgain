@@ -7,6 +7,8 @@ import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'src/theme/app_theme.dart';
+import 'src/screens/navigation_launcher_screen.dart';
+import 'src/services/deep_link_bridge.dart';
 import 'android_phone_number_hint.dart';
 import 'browser_voice_bridge.dart';
 import 'meetup_screen.dart';
@@ -28,14 +30,75 @@ Future<void> main() async {
   runApp(const HelloAgainApp());
 }
 
-class HelloAgainApp extends StatelessWidget {
+class HelloAgainApp extends StatefulWidget {
   const HelloAgainApp({super.key});
+
+  @override
+  State<HelloAgainApp> createState() => _HelloAgainAppState();
+}
+
+class _HelloAgainAppState extends State<HelloAgainApp> {
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+  StreamSubscription<Uri>? _deepLinkSub;
+  Uri? _pendingDeepLink;
+
+  @override
+  void initState() {
+    super.initState();
+    _deepLinkSub = DeepLinkBridge.instance.links.listen(_handleDeepLink);
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      final uri = await DeepLinkBridge.instance.consumeInitialLink();
+      if (!mounted || uri == null) {
+        return;
+      }
+      _handleDeepLink(uri);
+    });
+  }
+
+  @override
+  void dispose() {
+    _deepLinkSub?.cancel();
+    super.dispose();
+  }
+
+  void _handleDeepLink(Uri uri) {
+    if (uri.scheme != 'helloagain' || uri.host != 'phone-command') {
+      return;
+    }
+    final prompt = (uri.queryParameters['prompt'] ?? '').trim();
+    if (prompt.isEmpty) {
+      return;
+    }
+
+    final navigator = _navigatorKey.currentState;
+    if (navigator == null) {
+      _pendingDeepLink = uri;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final pending = _pendingDeepLink;
+        _pendingDeepLink = null;
+        if (pending != null && mounted) {
+          _handleDeepLink(pending);
+        }
+      });
+      return;
+    }
+
+    navigator.push(
+      MaterialPageRoute(
+        builder: (_) => NavigationLauncherScreen(
+          initialPrompt: prompt,
+          autoRunOnOpen: true,
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Hello Again',
       debugShowCheckedModeBanner: false,
+      navigatorKey: _navigatorKey,
       theme: buildHelloAgainTheme(
         scaffoldBackgroundColor: const Color(0xFFF4EDE3),
         seedColor: const Color(0xFFB56B4D),
@@ -72,6 +135,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   bool _isListening = false;
   bool _isWorking = false;
   bool _isConfirming = false;
+  bool _requestingPhoneNumberHint = false;
+  bool _waitingForManualVoiceStart = false;
   String _statusText = 'Подготвяме Hello Again...';
   String _assistantReply = '';
   String _transcriptPreview = '';
@@ -160,13 +225,23 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       _recognizedPhone = '';
       _statusText = 'Подготвям разговора.';
       _isConfirming = false;
+      _waitingForManualVoiceStart = false;
       _phoneAccessGrantedThisSession =
           _phoneAccessChoice == _PhoneAccessChoice.allowAlways;
       if (_phoneAccessChoice != _PhoneAccessChoice.allowAlways) {
         _phoneAccessChoice = _PhoneAccessChoice.undecided;
       }
     });
-    await _beginOrResumeOnboarding();
+
+    String? initialPhoneNumber;
+    if (AndroidPhoneNumberHint.isSupported) {
+      initialPhoneNumber = await _requestPhoneNumberBeforeOnboarding();
+      if (initialPhoneNumber == null || initialPhoneNumber.trim().isEmpty) {
+        return;
+      }
+    }
+
+    await _beginOrResumeOnboarding(initialPhoneNumber: initialPhoneNumber);
   }
 
   Future<bool> _ensurePhonePermissionForSetup() async {
@@ -214,7 +289,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   bool get _showPhoneAccessChoices =>
       _phoneAccessGrantedThisSession ? false : false;
 
-  Future<void> _beginOrResumeOnboarding() async {
+  Future<void> _beginOrResumeOnboarding({String? initialPhoneNumber}) async {
     if (!mounted) return;
     setState(() {
       _isWorking = true;
@@ -227,14 +302,86 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       final payload = await _backendClient.startOnboarding(
         sessionId: _onboardingSessionId.isEmpty ? null : _onboardingSessionId,
       );
+
+      final cleanInitialPhone = (initialPhoneNumber ?? '').trim();
+      if (cleanInitialPhone.isNotEmpty) {
+        final draft = Map<String, dynamic>.from(
+          payload['draft'] as Map? ?? const {},
+        );
+        final sessionId = (draft['session_id'] ?? '').toString().trim();
+        if (sessionId.isNotEmpty) {
+          _onboardingSessionId = sessionId;
+          await _prefs?.setString(_onboardingSessionKey, sessionId);
+        }
+
+        if (!mounted) return;
+        setState(() {
+          _transcriptPreview = cleanInitialPhone;
+          _statusText = 'Получих телефонния номер. Продължавам.';
+        });
+
+        final nextPayload = await _backendClient.sendOnboardingTurn(
+          sessionId: _onboardingSessionId,
+          message: 'Телефонният ми номер е $cleanInitialPhone.',
+        );
+        await _handleOnboardingPayload(nextPayload, autoContinue: true);
+        return;
+      }
+
       await _handleOnboardingPayload(payload, autoContinue: true);
     } catch (error) {
       if (!mounted) return;
       setState(() {
+        _requestingPhoneNumberHint = false;
         _isWorking = false;
         _statusText =
             'Не успях да започна разговора. Натиснете веднъж и ще опитам пак. ${error.toString()}';
       });
+    }
+  }
+
+  Future<String?> _requestPhoneNumberBeforeOnboarding() async {
+    if (!AndroidPhoneNumberHint.isSupported) {
+      return null;
+    }
+
+    if (!mounted) return null;
+    setState(() {
+      _isWorking = true;
+      _isListening = false;
+      _isConfirming = false;
+      _transcriptPreview = '';
+      _statusText = 'Изберете телефонния си номер, за да продължим.';
+    });
+
+    try {
+      final phoneNumber = await AndroidPhoneNumberHint.requestPhoneNumberHint()
+          .timeout(const Duration(seconds: 20));
+      final cleanPhoneNumber = (phoneNumber ?? '').trim();
+      if (cleanPhoneNumber.isEmpty) {
+        if (!mounted) return null;
+        setState(() {
+          _isWorking = false;
+          _statusText =
+              'Не беше избран телефонен номер. Натиснете продължи отново, за да опитаме пак.';
+        });
+        return null;
+      }
+
+      if (!mounted) return null;
+      setState(() {
+        _transcriptPreview = cleanPhoneNumber;
+        _statusText = 'Телефонният номер е избран.';
+      });
+      return cleanPhoneNumber;
+    } catch (error) {
+      if (!mounted) return null;
+      setState(() {
+        _isWorking = false;
+        _statusText =
+            'Не успях да покажа Android избора за телефонен номер. ${error.toString()}';
+      });
+      return null;
     }
   }
 
@@ -244,8 +391,10 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         _presentPhoneAccessChoices();
         return;
       }
-      await _requestAndSubmitAndroidPhoneNumber();
-      return;
+      final submittedPhoneNumber = await _requestAndSubmitAndroidPhoneNumber();
+      if (submittedPhoneNumber) {
+        return;
+      }
     }
 
     if (_conversationMode == 'login_confirmation') {
@@ -257,6 +406,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     if (!mounted) return;
 
     setState(() {
+      _waitingForManualVoiceStart = false;
+      _transcriptPreview = '';
       _isWorking = true;
       _isListening = true;
       _isConfirming = false;
@@ -325,13 +476,16 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     await _handleOnboardingPayload(payload, autoContinue: true);
   }
 
-  Future<void> _requestAndSubmitAndroidPhoneNumber() async {
-    if (!_shouldUseAndroidPhoneHint) {
-      return;
+  Future<bool> _requestAndSubmitAndroidPhoneNumber() async {
+    if (!_shouldUseAndroidPhoneHint || _requestingPhoneNumberHint) {
+      return false;
     }
 
-    if (!mounted) return;
+    if (!mounted) return false;
     setState(() {
+      _requestingPhoneNumberHint = true;
+      _waitingForManualVoiceStart = false;
+      _transcriptPreview = '';
       _isWorking = true;
       _isListening = false;
       _isConfirming = false;
@@ -347,21 +501,24 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       final cleanPhoneNumber = (phoneNumber ?? '').trim();
 
       if (cleanPhoneNumber.isEmpty) {
-        if (!mounted) return;
+        if (!mounted) return false;
         setState(() {
+          _requestingPhoneNumberHint = false;
           _isWorking = false;
           _isListening = false;
           _isConfirming = false;
           _assistantReply =
               'За да влезете или да създадете профил, е нужно да изберете телефонния си номер от устройството.';
           _statusText =
-              'Не мога да продължа без телефонен номер от устройството. Натиснете веднъж и ще опитам пак.';
+              'Android не върна номер. Продължавам с гласовото въвеждане.';
         });
-        return;
+        return false;
       }
 
-      if (!mounted) return;
+      if (!mounted) return false;
       setState(() {
+        _requestingPhoneNumberHint = false;
+        _waitingForManualVoiceStart = false;
         _transcriptPreview = cleanPhoneNumber;
         _statusText = 'Получих телефонния номер. Продължавам.';
       });
@@ -371,17 +528,20 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         message: 'Телефонният ми номер е $cleanPhoneNumber.',
       );
       await _handleOnboardingPayload(payload, autoContinue: true);
+      return true;
     } catch (_) {
-      if (!mounted) return;
+      if (!mounted) return false;
       setState(() {
+        _requestingPhoneNumberHint = false;
         _isWorking = false;
         _isListening = false;
         _isConfirming = false;
         _assistantReply =
             'Не успях да взема телефонния номер от Android.';
         _statusText =
-            'Android не успя да покаже избора за телефонен номер. Натиснете веднъж и ще опитам пак.';
+            'Android не успя да покаже избора за телефонен номер. Продължавам с гласовото въвеждане.';
       });
+      return false;
     }
   }
 
@@ -648,6 +808,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
           assistantReply: _assistantReply,
           statusText: _statusText,
           transcript: _transcriptPreview,
+          showVoiceStartPrompt: _waitingForManualVoiceStart,
           isListening: _isListening,
           isWorking: _isWorking,
           isConfirming: _isConfirming,
@@ -663,7 +824,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       case HelloAgainStage.board:
         final session = _session;
         return AgentBoardScreen(
-          userId: session?.userId.toString() ?? 'hello_again_frontend',
+          userId: (session?.userId ?? 0).toString(),
           accountToken: session?.token,
           welcomeText: session == null
               ? null
@@ -1003,6 +1164,7 @@ class RegistrationScreen extends StatelessWidget {
     required this.assistantReply,
     required this.statusText,
     required this.transcript,
+    required this.showVoiceStartPrompt,
     required this.isListening,
     required this.isWorking,
     required this.isConfirming,
@@ -1018,6 +1180,7 @@ class RegistrationScreen extends StatelessWidget {
   final String assistantReply;
   final String statusText;
   final String transcript;
+  final bool showVoiceStartPrompt;
   final bool isListening;
   final bool isWorking;
   final bool isConfirming;
@@ -1029,6 +1192,29 @@ class RegistrationScreen extends StatelessWidget {
   final Future<void> Function() onDenyPhoneAccess;
   final Future<void> Function() onRetry;
 
+  String _resolvedHeadlineText() {
+    if (showVoiceStartPrompt) {
+      return 'Ready to hear about you.';
+    }
+    if (assistantReply.isNotEmpty) {
+      return assistantReply;
+    }
+    return 'Кажете ми нещо за себе си, както Ви е удобно.';
+  }
+
+  String _resolvedBodyText() {
+    if (showPhoneAccessChoices) {
+      return 'This step needs access to the phone number stored on the device. Without it, onboarding cannot continue.';
+    }
+    if (showVoiceStartPrompt) {
+      return 'Turn on your audio, raise the volume if needed, and tap Start when you are ready.';
+    }
+    if (transcript.isNotEmpty) {
+      return transcript;
+    }
+    return 'Когато сте готови, говорете спокойно. Аз ще продължа разговора.';
+  }
+
   @override
   Widget build(BuildContext context) {
     final indicatorColor = isListening
@@ -1036,6 +1222,19 @@ class RegistrationScreen extends StatelessWidget {
         : isConfirming
         ? const Color(0xFF7A8B67)
         : const Color(0xFFC8B6A1);
+    final headlineText = showVoiceStartPrompt
+        ? 'Ready to hear about you.'
+        : assistantReply.isEmpty
+        ? 'ÐšÐ°Ð¶ÐµÑ‚Ðµ Ð¼Ð¸ Ð½ÐµÑ‰Ð¾ Ð·Ð° ÑÐµÐ±Ðµ ÑÐ¸, ÐºÐ°ÐºÑ‚Ð¾ Ð’Ð¸ Ðµ ÑƒÐ´Ð¾Ð±Ð½Ð¾.'
+        : assistantReply;
+    final bodyText = showPhoneAccessChoices
+        ? 'This step needs access to the phone number stored on the device. Without it, onboarding cannot continue.'
+        : showVoiceStartPrompt
+        ? 'Turn on your audio, raise the volume if needed, and tap Start when you are ready.'
+        : transcript.isEmpty
+        ? 'ÐšÐ¾Ð³Ð°Ñ‚Ð¾ ÑÑ‚Ðµ Ð³Ð¾Ñ‚Ð¾Ð²Ð¸, Ð³Ð¾Ð²Ð¾Ñ€ÐµÑ‚Ðµ ÑÐ¿Ð¾ÐºÐ¾Ð¹Ð½Ð¾. ÐÐ· Ñ‰Ðµ Ð¿Ñ€Ð¾Ð´ÑŠÐ»Ð¶Ð° Ñ€Ð°Ð·Ð³Ð¾Ð²Ð¾Ñ€Ð°.'
+        : transcript;
+    final actionLabel = showVoiceStartPrompt ? 'Start' : retryLabel;
 
     final statusLabel = isListening
         ? 'Слушам'
@@ -1082,9 +1281,7 @@ class RegistrationScreen extends StatelessWidget {
                       ),
                       const SizedBox(height: 18),
                       Text(
-                        assistantReply.isEmpty
-                            ? 'Кажете ми нещо за себе си, както Ви е удобно.'
-                            : assistantReply,
+                        _resolvedHeadlineText(),
                         style: const TextStyle(
                           fontSize: 28,
                           height: 1.22,
@@ -1143,11 +1340,7 @@ class RegistrationScreen extends StatelessWidget {
                         ),
                         const SizedBox(height: 18),
                         Text(
-                          showPhoneAccessChoices
-                              ? 'This step needs access to the phone number stored on the device. Without it, onboarding cannot continue.'
-                              : transcript.isEmpty
-                              ? 'Когато сте готови, говорете спокойно. Аз ще продължа разговора.'
-                              : transcript,
+                          _resolvedBodyText(),
                           style: const TextStyle(
                             fontSize: 24,
                             height: 1.42,
@@ -1258,13 +1451,28 @@ class RegistrationScreen extends StatelessWidget {
                         borderRadius: BorderRadius.circular(22),
                       ),
                     ),
-                    child: Text(
-                      isWorking && !isConfirming ? 'Изчакайте...' : 'Повтори разговора',
-                      style: const TextStyle(
-                        fontSize: 18,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
+                    child: showVoiceStartPrompt
+                        ? const Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(Icons.volume_up_rounded, size: 22),
+                              SizedBox(width: 10),
+                              Text(
+                                'Start',
+                                style: TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          )
+                        : Text(
+                            isWorking && !isConfirming ? 'Please wait...' : actionLabel,
+                            style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
                   ),
                 ),
               ],

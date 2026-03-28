@@ -13,13 +13,24 @@ import '../pipeline/pipeline_state.dart';
 import '../voice/agent_voice_controller.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  const HomeScreen({
+    super.key,
+    this.initialCommand,
+    this.autoRunOnOpen = false,
+    this.startHandsFreeOnOpen = true,
+  });
+
+  final String? initialCommand;
+  final bool autoRunOnOpen;
+  final bool startHandsFreeOnOpen;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  static const _defaultReasoningProvider = 'openai';
+
   late final TextEditingController _commandCtrl;
   late final TextEditingController _urlCtrl;
   late PipelineOrchestrator _orch;
@@ -27,7 +38,6 @@ class _HomeScreenState extends State<HomeScreen> {
   final _scrollCtrl = ScrollController();
   bool _showUrlField = false;
   bool _isLeavingApp = false;
-  String _reasoningProvider = 'local';
   String _lastSubmittedCommand = '';
   PipelinePhase _lastObservedPhase = PipelinePhase.idle;
   String? _activeConfirmationKey;
@@ -37,8 +47,11 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    final initialCommand = widget.initialCommand?.trim();
     _commandCtrl = TextEditingController(
-      text: 'Search up Jeffrey Epstien on Chrome',
+      text: (initialCommand != null && initialCommand.isNotEmpty)
+          ? initialCommand
+          : 'Search up Jeffrey Epstien on Chrome',
     );
     _urlCtrl = TextEditingController(text: _resolveDefaultBaseUrl());
     _orch = PipelineOrchestrator(client: AgentClient(baseUrl: _urlCtrl.text));
@@ -46,9 +59,16 @@ class _HomeScreenState extends State<HomeScreen> {
     _voiceController = _buildVoiceController(_urlCtrl.text);
     _voiceController.addListener(_onVoiceControllerChange);
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) {
+      if (mounted && widget.startHandsFreeOnOpen) {
         unawaited(_ensureAlwaysListening());
       }
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final command = widget.initialCommand?.trim() ?? '';
+      if (!mounted || !widget.autoRunOnOpen || command.isEmpty) {
+        return;
+      }
+      unawaited(_run(commandOverride: command));
     });
   }
 
@@ -142,7 +162,10 @@ class _HomeScreenState extends State<HomeScreen> {
     if (command.isEmpty) return;
     _lastSubmittedCommand = command;
     FocusScope.of(context).unfocus();
-    await _orch.prepare(command, reasoningProvider: _reasoningProvider);
+    await _orch.prepare(
+      command,
+      reasoningProvider: _defaultReasoningProvider,
+    );
     if (!mounted) {
       return;
     }
@@ -328,7 +351,10 @@ class _HomeScreenState extends State<HomeScreen> {
     await _voiceController.pauseForTask(
       status: 'Проверявам какво искате да направя...',
     );
-    await _orch.prepare(transcript, reasoningProvider: _reasoningProvider);
+    await _orch.prepare(
+      transcript,
+      reasoningProvider: _defaultReasoningProvider,
+    );
     if (!mounted) {
       return;
     }
@@ -548,6 +574,9 @@ class _HomeScreenState extends State<HomeScreen> {
       'look up',
       'google',
       'navigate',
+      'take me to',
+      'drive to',
+      'bring me to',
       'directions',
       'route',
       'send',
@@ -571,6 +600,9 @@ class _HomeScreenState extends State<HomeScreen> {
       'карти',
       'маршрут',
       'навигация',
+      'заведи ме до',
+      'закарай ме до',
+      'отведи ме до',
       'хром',
       'браузър',
       'сайт',
@@ -589,6 +621,14 @@ class _HomeScreenState extends State<HomeScreen> {
     final ambiguityFlags = _stringValues(
       intent['ambiguity_flags'],
     ).map((value) => value.toLowerCase()).toList();
+    final entities =
+        (intent['entities'] as Map?)?.cast<String, dynamic>() ??
+        const <String, dynamic>{};
+    final destination = (entities['destination'] ?? '').toString().trim();
+    final isNavigationIntent =
+        (goalType == 'navigate_to' || goalType == 'start_navigation') &&
+        appPackage == 'com.google.android.apps.maps' &&
+        destination.isNotEmpty;
 
     if (goalType.isEmpty || goalType == 'invalid_request') {
       return 'The request was not parsed as a phone action command.';
@@ -599,10 +639,11 @@ class _HomeScreenState extends State<HomeScreen> {
     if (appPackage.isEmpty) {
       return 'The target app is still unknown.';
     }
-    if (confidence < 0.55) {
+    if (confidence < 0.55 && !isNavigationIntent) {
       return 'The parser is not confident enough yet.';
     }
-    if (ambiguityFlags.any(
+    if (!isNavigationIntent &&
+        ambiguityFlags.any(
       (flag) =>
           flag.contains('not_actionable') ||
           flag.contains('unknown') ||
@@ -806,13 +847,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-                    child: _ReasoningProviderCard(
-                      selectedProvider: _reasoningProvider,
-                      onChanged: isRunning
-                          ? null
-                          : (value) =>
-                                setState(() => _reasoningProvider = value),
-                    ),
+                    child: const _ExecutionEngineCard(),
                   ),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
@@ -947,14 +982,8 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
-class _ReasoningProviderCard extends StatelessWidget {
-  const _ReasoningProviderCard({
-    required this.selectedProvider,
-    required this.onChanged,
-  });
-
-  final String selectedProvider;
-  final ValueChanged<String>? onChanged;
+class _ExecutionEngineCard extends StatelessWidget {
+  const _ExecutionEngineCard();
 
   @override
   Widget build(BuildContext context) {
@@ -972,7 +1001,7 @@ class _ReasoningProviderCard extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Reasoning Engine',
+            'Execution Engine',
             style: TextStyle(
               fontSize: 13,
               fontWeight: FontWeight.w700,
@@ -981,7 +1010,7 @@ class _ReasoningProviderCard extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           Text(
-            'Choose whether intent parsing and step-by-step reasoning should run on the local model or through the OpenAI API.',
+            'This page now runs through the OpenAI backend only. The local Qwen-style navigator path has been removed from the controls here.',
             style: TextStyle(
               fontSize: 13,
               height: 1.35,
@@ -989,33 +1018,23 @@ class _ReasoningProviderCard extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 12),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment<String>(
-                value: 'local',
-                icon: Icon(Icons.memory_outlined),
-                label: Text('Local Model'),
-              ),
-              ButtonSegment<String>(
-                value: 'openai',
-                icon: Icon(Icons.cloud_outlined),
-                label: Text('OpenAI API'),
+          Row(
+            children: [
+              Icon(Icons.cloud_outlined, color: cs.primary, size: 18),
+              const SizedBox(width: 8),
+              Text(
+                'ChatGPT / OpenAI API',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: cs.onSurface,
+                ),
               ),
             ],
-            selected: {selectedProvider},
-            onSelectionChanged: onChanged == null
-                ? null
-                : (selection) {
-                    if (selection.isNotEmpty) {
-                      onChanged!(selection.first);
-                    }
-                  },
           ),
           const SizedBox(height: 10),
           Text(
-            selectedProvider == 'openai'
-                ? 'OpenAI mode uses the backend OPENAI_LLM_API_KEY and OPENAI_LLM_MODEL settings.'
-                : 'Local mode uses the backend LOCAL_LLM_PROVIDER and LOCAL_LLM_MODEL settings.',
+            'Uses the backend OPENAI_LLM_API_KEY and OPENAI_LLM_MODEL settings for parsing and execution planning.',
             style: TextStyle(fontSize: 12, color: cs.onSurface.withAlpha(145)),
           ),
         ],
