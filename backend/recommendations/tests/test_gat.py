@@ -238,6 +238,29 @@ class TestGATModel:
         assert result["loss"] is not None
         assert float(result["loss"].detach()) >= 0
 
+
+class TestRecommenderDefaults:
+    def _dummy_graph(self, n_nodes: int = 5):
+        from recommendations.gat.feature_schema import FEATURE_DIM
+
+        x = torch.rand(n_nodes, FEATURE_DIM)
+        src = [i for i in range(n_nodes) for j in range(n_nodes) if i != j]
+        dst = [j for i in range(n_nodes) for j in range(n_nodes) if i != j]
+        edge_index = torch.tensor([src, dst], dtype=torch.long)
+        return x, edge_index
+
+    def test_recommender_defaults_use_social_edges_and_modern_ranker(self):
+        from recommendations.gat.recommender import _default_graph_params, _default_model_params
+
+        assert _default_graph_params()["use_social_edges"] is True
+        assert _default_model_params()["model_family"] == "pyg_gatv2_ranker"
+
+    def test_recommender_default_feature_selection_uses_full_feature_space(self):
+        from recommendations.gat.feature_schema import FEATURE_NAMES
+        from recommendations.gat.recommender import _normalize_enabled_features
+
+        assert _normalize_enabled_features(None) == list(FEATURE_NAMES)
+
     def test_top_k_recommendations(self):
         from recommendations.gat.gat_model import top_k_recommendations
         embeddings = torch.randn(10, 16)
