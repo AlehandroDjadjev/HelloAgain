@@ -43,6 +43,38 @@ def _user_payload_kwargs(payload: dict | None) -> dict:
     }
 
 
+def _account_profile_from_request(request: HttpRequest):
+    header = str(request.headers.get("Authorization", "")).strip()
+    if not header.lower().startswith("token "):
+        return None
+    token = header.split(None, 1)[1].strip() if " " in header else ""
+    if not token:
+        return None
+    try:
+        from apps.accounts.services import profile_for_token
+    except Exception:
+        return None
+    try:
+        return profile_for_token(token)
+    except Exception:
+        return None
+
+
+def _effective_user_payload_kwargs(request: HttpRequest, payload: dict | None = None) -> dict:
+    profile = _account_profile_from_request(request)
+    if profile is not None:
+        return {
+            "user_id": str(profile.user_id),
+            "phone_number": str(profile.phone_number or "").strip() or None,
+        }
+    return _user_payload_kwargs(payload)
+
+
+def _effective_user_id(request: HttpRequest, payload: dict | None = None) -> str:
+    resolved = _effective_user_payload_kwargs(request, payload)
+    return str(resolved.get("user_id") or resolved.get("phone_number") or "anonymous")
+
+
 def home_view(request: HttpRequest):
     return render(
         request,
@@ -70,7 +102,10 @@ def add_action_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = _graph_service().add_action_flow(prompt, **_user_payload_kwargs(payload))
+        result = _graph_service().add_action_flow(
+            prompt,
+            **_effective_user_payload_kwargs(request, payload),
+        )
     except ValueError as exc:
         print(f"[controller] add-action rejected: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=400)
@@ -94,7 +129,10 @@ def fetch_action_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = _graph_service().fetch_action_flow(prompt, **_user_payload_kwargs(payload))
+        result = _graph_service().fetch_action_flow(
+            prompt,
+            **_effective_user_payload_kwargs(request, payload),
+        )
     except Exception as exc:
         print(f"[controller] fetch-action failed: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=500)
@@ -115,7 +153,10 @@ def conversation_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = _graph_service().conversation_flow(prompt, **_user_payload_kwargs(payload))
+        result = _graph_service().conversation_flow(
+            prompt,
+            **_effective_user_payload_kwargs(request, payload),
+        )
     except Exception as exc:
         print(f"[controller] conversation failed: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=500)
@@ -125,10 +166,7 @@ def conversation_view(request: HttpRequest):
 
 def state_view(request: HttpRequest):
     return JsonResponse(
-        _graph_service().export_state(
-            user_id=request.GET.get("user_id"),
-            phone_number=request.GET.get("phone_number"),
-        )
+        _graph_service().export_state(**_effective_user_payload_kwargs(request, request.GET))
     )
 
 
@@ -142,7 +180,7 @@ def reset_state_view(request: HttpRequest):
         return JsonResponse({"detail": f"invalid JSON body: {exc}"}, status=400)
     try:
         result = _graph_service().reset_state(
-            **_user_payload_kwargs(payload),
+            **_effective_user_payload_kwargs(request, payload),
             reset_all=bool(payload.get("reset_all")),
         )
     except Exception as exc:
@@ -200,7 +238,7 @@ def agent_mcp_invoke_view(request: HttpRequest, mcp_id: str):
             tool_name=tool_name,
             arguments=arguments,
             fallback_prompt=fallback_prompt,
-            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
+            user_id=_effective_user_id(request, payload),
             board_state=payload.get("board_state") if isinstance(payload.get("board_state"), dict) else {},
         )
     except ValueError as exc:
@@ -213,7 +251,7 @@ def agent_mcp_invoke_view(request: HttpRequest, mcp_id: str):
 def agent_board_memory_view(request: HttpRequest):
     if request.method == "GET":
         try:
-            user_id = str(request.GET.get("user_id") or "").strip() or None
+            user_id = _effective_user_payload_kwargs(request, request.GET).get("user_id")
             if user_id:
                 board_state = semi_agent_service.connections_service.load_board_state_for_user(
                     user_id
@@ -243,6 +281,8 @@ def agent_board_memory_view(request: HttpRequest):
     try:
         user_id = str(payload.get("user_id") or "").strip() or None
         removed_result_id = str(payload.get("removed_result_id") or "").strip() or None
+        effective_user_id = _effective_user_payload_kwargs(request, payload).get("user_id")
+        user_id = effective_user_id or user_id
         if user_id:
             if removed_result_id:
                 semi_agent_service.board_memory.remove_result_binding(removed_result_id)
@@ -287,7 +327,7 @@ def agent_run_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
-            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
+            user_id=_effective_user_id(request, payload),
             session_id=str(payload.get("session_id") or "default_session"),
             reasoning_provider=str(payload.get("reasoning_provider") or "openai"),
         )
@@ -320,7 +360,7 @@ def agent_run_start_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
-            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
+            user_id=_effective_user_id(request, payload),
             session_id=str(payload.get("session_id") or "default_session"),
             reasoning_provider=str(payload.get("reasoning_provider") or "openai"),
         )
@@ -410,7 +450,7 @@ def agent_object_open_view(request: HttpRequest):
     try:
         result = semi_agent_service.open_board_object(
             object_payload=payload.get("object") if isinstance(payload.get("object"), dict) else payload,
-            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
+            user_id=_effective_user_id(request, payload),
         )
     except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)
@@ -431,7 +471,7 @@ def agent_object_delete_view(request: HttpRequest):
             object_payload=payload.get("object")
             if isinstance(payload.get("object"), dict)
             else payload,
-            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
+            user_id=_effective_user_id(request, payload),
         )
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)

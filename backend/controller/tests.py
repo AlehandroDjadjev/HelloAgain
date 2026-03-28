@@ -4,12 +4,14 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.http import HttpResponse
 from django.test import RequestFactory, SimpleTestCase, TestCase
 
-from accounts.models import AccountProfile
+from apps.accounts.models import AccountProfile
+from apps.accounts.services import issue_token
 from config.cors import LocalDevCorsMiddleware
 
 from engine.custom_mcp_registry import CustomMcpRegistry
@@ -60,6 +62,7 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertEqual(phone_command_descriptor["id"], "phone_command")
         self.assertEqual(len(phone_command_descriptor["tools"]), 1)
         self.assertTrue(phone_command_descriptor["invoke_url"].endswith("/api/agent/mcps/phone_command/invoke/"))
+        self.assertEqual(phone_command_descriptor["tools"][0]["path"], "/api/agent/mcps/phone_command/invoke/")
 
     def test_service_builds_tool_catalog_from_registry_descriptors(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -807,6 +810,87 @@ class SemiAgentServiceTests(SimpleTestCase):
             self.assertEqual(payload["viewer"]["widget_type"], "user_connection")
             self.assertIsNotNone(store.resolve_result_binding("result_user"))
 
+    def test_phone_command_mcp_infers_single_tool_and_returns_launcher_metadata(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            service = SemiAgentService(board_memory=store)
+
+            payload = service.invoke_mcp(
+                mcp_id="phone_command",
+                tool_name="",
+                arguments={"prompt": "Open Chrome"},
+            )
+
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["tool_name"], "open_phone_command")
+            self.assertEqual(payload["result"]["widget_type"], "phone_command_launcher")
+            self.assertEqual(payload["result"]["prompt"], "Open Chrome")
+            self.assertEqual(payload["result"]["board_object"]["extra_data"]["kind"], "phone_command")
+            self.assertEqual(payload["result"]["board_object"]["extra_data"]["prompt"], "Open Chrome")
+            self.assertTrue(
+                payload["result"]["open_url"].endswith("/api/agent/phone-command/open/?prompt=Open+Chrome")
+            )
+
+    def test_opening_phone_command_object_returns_launcher_viewer(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            service = SemiAgentService(board_memory=store)
+            store.register_result_bindings(
+                [
+                    {
+                        "result_id": "result_phone",
+                        "object_name": "phone_command",
+                        "memory_type": "instant",
+                        "delete_after_click": True,
+                        "result_title": "Phone Command",
+                        "result_summary": "Open the prepared phone flow.",
+                        "payload": {
+                            "linked_results": [
+                                {
+                                    "result": {
+                                        "widget_type": "phone_command_launcher",
+                                        "prompt": "Open Chrome",
+                                        "board_object": {
+                                            "extra_data": {
+                                                "kind": "phone_command",
+                                                "prompt": "Open Chrome",
+                                            }
+                                        },
+                                    }
+                                }
+                            ],
+                            "object": {
+                                "name": "phone_command",
+                                "text": "Phone Command",
+                                "extraData": {
+                                    "kind": "phone_command",
+                                    "prompt": "Open Chrome",
+                                },
+                            },
+                        },
+                    }
+                ]
+            )
+
+            payload = service.open_board_object(
+                object_payload={
+                    "name": "phone_command",
+                    "resultId": "result_phone",
+                    "memoryType": "instant",
+                    "deleteAfterClick": True,
+                    "extraData": {
+                        "kind": "phone_command",
+                        "prompt": "Open Chrome",
+                    },
+                }
+            )
+
+            self.assertTrue(payload["found"])
+            self.assertEqual(payload["board_commands"][0]["action"], "delete")
+            self.assertEqual(payload["viewer"]["widget_type"], "phone_command_launcher")
+            self.assertEqual(payload["viewer"]["prompt"], "Open Chrome")
+            self.assertTrue(payload["viewer"]["auto_run_on_open"])
+
     def test_run_speech_stage_includes_recent_temp_history_and_short_mcp_guidance(self) -> None:
         class RecordingLlmProvider:
             def __init__(self) -> None:
@@ -1237,3 +1321,87 @@ class AgentBoardMemoryEndpointTests(TestCase):
 
         profile.refresh_from_db()
         self.assertEqual(profile.whiteboard_state["objects"][0]["name"], "guest_note")
+
+
+class AuthenticatedIdentityFlowTests(TestCase):
+    def _auth_headers(self, user: User) -> dict[str, str]:
+        token = issue_token(user)
+        return {"HTTP_AUTHORIZATION": f"Token {token.key}"}
+
+    def test_agent_run_start_prefers_authenticated_profile_over_body_user_id(self) -> None:
+        viewer_user = User.objects.create_user(username="viewer-auth")
+        viewer_profile = AccountProfile.objects.create(
+            user=viewer_user,
+            display_name="Viewer Auth",
+            phone_number="+359888111111",
+        )
+        other_user = User.objects.create_user(username="other-auth")
+        other_profile = AccountProfile.objects.create(
+            user=other_user,
+            display_name="Other Auth",
+            phone_number="+359888222222",
+        )
+
+        with patch("controller.views.semi_agent_service.start_run") as mock_start_run:
+            mock_start_run.return_value = {"ok": True, "run_id": "run_123"}
+
+            response = self.client.post(
+                "/api/agent/run/start/",
+                data=json.dumps(
+                    {
+                        "prompt": "Find someone to talk to.",
+                        "user_id": str(other_profile.user_id),
+                        "session_id": "session_1",
+                        "board_state": {"board": {"width": 800, "height": 600}, "objects": []},
+                        "largest_empty_space": {
+                            "bbox": {"x": 0, "y": 0, "width": 800, "height": 600},
+                        },
+                    }
+                ),
+                content_type="application/json",
+                **self._auth_headers(viewer_user),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        _, kwargs = mock_start_run.call_args
+        self.assertEqual(kwargs["user_id"], str(viewer_profile.user_id))
+
+    def test_add_action_prefers_authenticated_profile_over_body_user_id(self) -> None:
+        viewer_user = User.objects.create_user(username="viewer-gnn")
+        viewer_profile = AccountProfile.objects.create(
+            user=viewer_user,
+            display_name="Viewer GNN",
+            phone_number="+359888333333",
+        )
+        other_user = User.objects.create_user(username="other-gnn")
+        other_profile = AccountProfile.objects.create(
+            user=other_user,
+            display_name="Other GNN",
+            phone_number="+359888444444",
+        )
+
+        fake_graph_service = SimpleNamespace(
+            add_action_flow=lambda prompt, **kwargs: {
+                "ok": True,
+                "prompt": prompt,
+                "user_id": kwargs.get("user_id"),
+                "phone_number": kwargs.get("phone_number"),
+            }
+        )
+
+        with patch("controller.views._graph_service", return_value=fake_graph_service):
+            response = self.client.post(
+                "/api/add-action/",
+                data=json.dumps(
+                    {
+                        "prompt": "Call my sister this evening.",
+                        "user_id": str(other_profile.user_id),
+                    }
+                ),
+                content_type="application/json",
+                **self._auth_headers(viewer_user),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["user_id"], str(viewer_profile.user_id))

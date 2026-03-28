@@ -993,6 +993,8 @@ class SemiAgentService:
         supported_tools = self._supported_mcp_tools().get(clean_mcp_id)
         if supported_tools is None:
             raise ValueError(f"Unsupported MCP '{clean_mcp_id}'.")
+        if not clean_tool_name and len(supported_tools) == 1:
+            clean_tool_name = sorted(supported_tools)[0]
         if clean_tool_name not in supported_tools:
             raise ValueError(f"Unsupported tool '{clean_tool_name}'.")
 
@@ -1342,13 +1344,20 @@ class SemiAgentService:
     ) -> Dict[str, Any]:
         if tool_name != "open_phone_command":
             raise ValueError(f"Unsupported tool '{tool_name}'.")
-        encoded_prompt = quote_plus(prompt)
+        launch_metadata = self._build_phone_command_launch_metadata(prompt)
         return {
             "ok": True,
-            "prompt": prompt,
-            "open_url": f"/api/agent/phone-command/open/?prompt={encoded_prompt}",
-            "deep_link": f"helloagain://phone-command?prompt={encoded_prompt}",
-            "message": "Phone command app handoff is ready.",
+            "widget_type": "phone_command_launcher",
+            "message": "Phone command launch is ready.",
+            "board_object": {
+                "tags": ["kind:phone_command", "launch:phone_command"],
+                "extra_data": {
+                    "kind": "phone_command",
+                    "launch_target": "phone_command",
+                    **launch_metadata,
+                },
+            },
+            **launch_metadata,
         }
 
     def _summarize_mcp_result(self, mcp_id: str, tool_name: str, result: Dict[str, Any]) -> str:
@@ -1538,6 +1547,18 @@ class SemiAgentService:
                     **user_viewer,
                 }
 
+        phone_command_launch = self._extract_phone_command_launch(object_payload, binding)
+        if phone_command_launch is not None:
+            return {
+                "widget_type": "phone_command_launcher",
+                "title": default_title or "Phone Command",
+                "summary": default_summary or "Open the phone command screen and run the prepared prompt.",
+                "memory_type": binding.get("memory_type"),
+                "linked_call_ids": binding.get("linked_call_ids", []),
+                "payload": default_payload,
+                **phone_command_launch,
+            }
+
         return {
             "title": default_title,
             "summary": default_summary,
@@ -1582,6 +1603,61 @@ class SemiAgentService:
                 except (TypeError, ValueError):
                     continue
         return None
+
+    def _extract_phone_command_launch(
+        self,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        candidates = [
+            object_payload.get("extraData"),
+            object_payload.get("extra_data"),
+        ]
+        payload = binding.get("payload") if isinstance(binding.get("payload"), dict) else {}
+        candidates.append(payload.get("object") if isinstance(payload.get("object"), dict) else {})
+        for linked in payload.get("linked_results", []):
+            if not isinstance(linked, dict):
+                continue
+            result = linked.get("result") if isinstance(linked.get("result"), dict) else {}
+            candidates.append(result.get("board_object"))
+            candidates.append(result)
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            extra_data = (
+                candidate.get("extra_data")
+                if isinstance(candidate.get("extra_data"), dict)
+                else candidate.get("extraData")
+                if isinstance(candidate.get("extraData"), dict)
+                else candidate
+            )
+            kind = self._clean_text(extra_data.get("kind")).lower()
+            prompt = self._clean_text(extra_data.get("prompt"))
+            if kind != "phone_command" and not prompt:
+                continue
+            if not prompt:
+                continue
+            launch_metadata = self._build_phone_command_launch_metadata(prompt)
+            launch_metadata["launch_target"] = (
+                self._clean_text(extra_data.get("launch_target")) or "phone_command"
+            )
+            launch_metadata["auto_run_on_open"] = self._to_bool(
+                extra_data.get("auto_run_on_open", extra_data.get("autoRunOnOpen")),
+                default=True,
+            )
+            return launch_metadata
+        return None
+
+    def _build_phone_command_launch_metadata(self, prompt: str) -> Dict[str, Any]:
+        clean_prompt = self._clean_text(prompt)
+        encoded_prompt = quote_plus(clean_prompt)
+        return {
+            "prompt": clean_prompt,
+            "open_url": f"/api/agent/phone-command/open/?prompt={encoded_prompt}",
+            "deep_link": f"helloagain://phone-command?prompt={encoded_prompt}",
+            "auto_run_on_open": True,
+        }
 
     def _extract_board_object_metadata(self, linked_payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
         tags: List[str] = []

@@ -12,9 +12,20 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'browser_voice_bridge.dart';
 import 'src/config/backend_base_url.dart';
+import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
 
 Future<void> main() async {
+  await _runWhitespaceApp(
+    const WhitespaceLaunchConfig.boardOnlyFromEnvironment(),
+  );
+}
+
+Future<void> mainWithOnboarding() async {
+  await _runWhitespaceApp(const WhitespaceLaunchConfig.fromEnvironment());
+}
+
+Future<void> _runWhitespaceApp(WhitespaceLaunchConfig launchConfig) async {
   WidgetsFlutterBinding.ensureInitialized();
   try {
     await dotenv.load(fileName: '.env');
@@ -24,7 +35,7 @@ Future<void> main() async {
   await SystemChrome.setPreferredOrientations(const [
     DeviceOrientation.portraitUp,
   ]);
-  runApp(const AgentBoardApp());
+  runApp(AgentBoardApp(launchConfig: launchConfig));
 }
 
 class AgentBoardApp extends StatelessWidget {
@@ -56,6 +67,7 @@ class WhitespaceLaunchConfig {
     this.accountToken = '',
     this.displayName = '',
     this.skipStoredSessionLookup = false,
+    this.launchBoardDirectly = false,
   });
 
   const WhitespaceLaunchConfig.fromEnvironment()
@@ -65,12 +77,40 @@ class WhitespaceLaunchConfig {
       skipStoredSessionLookup = const bool.fromEnvironment(
         'WHITESPACE_SKIP_STORED_SESSION_LOOKUP',
         defaultValue: false,
+      ),
+      launchBoardDirectly = const bool.fromEnvironment(
+        'WHITESPACE_LAUNCH_BOARD_DIRECTLY',
+        defaultValue: false,
       );
+
+  const WhitespaceLaunchConfig.boardOnly({
+    this.userId = 'whitespace_frontend_guest',
+    this.accountToken = '',
+    this.displayName = 'friend',
+    this.skipStoredSessionLookup = false,
+  }) : launchBoardDirectly = true;
+
+  const WhitespaceLaunchConfig.boardOnlyFromEnvironment()
+    : userId = const String.fromEnvironment(
+        'WHITESPACE_USER_ID',
+        defaultValue: 'whitespace_frontend_guest',
+      ),
+      accountToken = const String.fromEnvironment('WHITESPACE_ACCOUNT_TOKEN'),
+      displayName = const String.fromEnvironment(
+        'WHITESPACE_DISPLAY_NAME',
+        defaultValue: 'friend',
+      ),
+      skipStoredSessionLookup = const bool.fromEnvironment(
+        'WHITESPACE_SKIP_STORED_SESSION_LOOKUP',
+        defaultValue: false,
+      ),
+      launchBoardDirectly = true;
 
   final String userId;
   final String accountToken;
   final String displayName;
   final bool skipStoredSessionLookup;
+  final bool launchBoardDirectly;
 
   String? get resolvedUserId {
     final value = userId.trim();
@@ -219,6 +259,15 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
           await prefs.remove(_tokenKey);
         }
       }
+    }
+
+    if (widget.launchConfig.launchBoardDirectly) {
+      return _ResolvedWhitespaceLaunch.guest(
+        userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+        displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
+        welcomeText:
+            'Whitespace board launched directly. Onboarding was skipped for this entrypoint.',
+      );
     }
 
     return null;
@@ -1238,6 +1287,27 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
               viewer: viewer,
             );
           });
+        } else if (widgetType == 'phone_command_launcher') {
+          final prompt = (viewer['prompt'] ?? '').toString().trim();
+          final rawAutoRun = viewer['auto_run_on_open'];
+          final autoRunOnOpen = rawAutoRun is bool
+              ? rawAutoRun
+              : rawAutoRun?.toString().trim().toLowerCase() != 'false';
+          if (prompt.isNotEmpty) {
+            await Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => NavigationLauncherScreen(
+                  initialPrompt: prompt,
+                  autoRunOnOpen: autoRunOnOpen,
+                ),
+              ),
+            );
+          } else {
+            await showDialog<void>(
+              context: context,
+              builder: (context) => AgentResultDialog(viewer: viewer),
+            );
+          }
         } else {
           await showDialog<void>(
             context: context,
@@ -1445,6 +1515,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         largestEmptySpace: _sceneController.findLargestEmptySpaceSnapshot(),
         userId: widget.userId,
         sessionId: _sessionId,
+        token: widget.accountToken,
       );
 
       final runId = (startPayload['run_id'] ?? '').toString();
@@ -2911,6 +2982,7 @@ class AgentBackendClient {
     required Map<String, dynamic> largestEmptySpace,
     required String userId,
     required String sessionId,
+    String? token,
   }) {
     return _postJson('/api/agent/run/start/', {
       'prompt': prompt,
@@ -2918,7 +2990,7 @@ class AgentBackendClient {
       'largest_empty_space': largestEmptySpace,
       'user_id': userId,
       'session_id': sessionId,
-    });
+    }, token: token);
   }
 
   Future<Map<String, dynamic>> fetchAgentSpeech(String runId) {
