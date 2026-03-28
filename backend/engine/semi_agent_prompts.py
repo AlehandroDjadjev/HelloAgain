@@ -128,6 +128,10 @@ Available whiteboard actions:
 - "shrink" scales an object down.
 - "delete" removes an object.
 - "click" represents opening a result widget.
+- "click object" clicks an object by name and should be used when you want the board automation to open that object immediately.
+
+For requests with the phone mcp automatically add a click action on the created object that will redirect.
+When the widget carries a prompt in its body it should be auto opened.
 
 The idea is you have to make the appearance of a new object grand - shrink other objects, move them out the way and put it in the center. Interact with the board.
 Create a package of many continuos actions.
@@ -171,7 +175,7 @@ JSON shape:
   ],
   "board_commands": [
     {{
-      "action": "move|shrink|enlarge|create|delete",
+      "action": "move|shrink|enlarge|create|delete|click|click object",
       "name": "object name",
       "x": 0,
       "y": 0,

@@ -398,7 +398,15 @@ class SemiAgentService:
                                 "properties": {
                                     "action": {
                                         "type": "string",
-                                        "enum": ["create", "move", "enlarge", "shrink", "delete", "click"],
+                                        "enum": [
+                                            "create",
+                                            "move",
+                                            "enlarge",
+                                            "shrink",
+                                            "delete",
+                                            "click",
+                                            "click object",
+                                        ],
                                     },
                                     "name": {"type": "string"},
                                     "x": {"type": "number"},
@@ -2109,7 +2117,7 @@ class SemiAgentService:
         for item in items:
             if not isinstance(item, dict):
                 continue
-            action = self._clean_text(item.get("action")).lower()
+            action = self._normalize_board_action(item.get("action"))
             if action not in {"create", "move", "enlarge", "shrink", "delete", "click"}:
                 continue
             name = self._clean_text(item.get("name")) or focus_name
@@ -2142,6 +2150,13 @@ class SemiAgentService:
                 command["factor"] = self._to_float(item.get("factor"), default_factor)
             results.append(command)
         return results
+
+    def _normalize_board_action(self, value: Any) -> str:
+        action = self._clean_text(value)
+        compact = re.sub(r"[\s_-]+", "", action.lower())
+        if compact == "clickobject":
+            return "click"
+        return action.lower()
 
     def _normalize_result_bindings(
         self,
