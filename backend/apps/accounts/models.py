@@ -73,6 +73,7 @@ class AccountProfile(models.Model):
     share_email_with_friends = models.BooleanField(default=True)
     home_lat = models.FloatField(null=True, blank=True)
     home_lng = models.FloatField(null=True, blank=True)
+    whiteboard_state = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -214,6 +215,73 @@ class FriendRequest(models.Model):
 
     def __str__(self):
         return f"{self.from_profile} -> {self.to_profile} ({self.status})"
+
+
+class ConnectionThread(models.Model):
+    participant_low = models.ForeignKey(
+        AccountProfile,
+        on_delete=models.CASCADE,
+        related_name="connection_threads_low",
+    )
+    participant_high = models.ForeignKey(
+        AccountProfile,
+        on_delete=models.CASCADE,
+        related_name="connection_threads_high",
+    )
+    created_by = models.ForeignKey(
+        AccountProfile,
+        on_delete=models.CASCADE,
+        related_name="created_connection_threads",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["participant_low", "participant_high"],
+                name="unique_connection_thread_pair",
+            ),
+            models.CheckConstraint(
+                condition=~Q(participant_low=F("participant_high")),
+                name="connection_thread_not_to_self",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Thread {self.id}: {self.participant_low} <-> {self.participant_high}"
+
+    def includes(self, profile: AccountProfile) -> bool:
+        return profile.pk in {self.participant_low_id, self.participant_high_id}
+
+    def counterparty_for(self, profile: AccountProfile) -> AccountProfile:
+        if self.participant_low_id == profile.pk:
+            return self.participant_high
+        if self.participant_high_id == profile.pk:
+            return self.participant_low
+        raise ValueError("Profile is not part of this connection thread.")
+
+
+class ConnectionMessage(models.Model):
+    thread = models.ForeignKey(
+        ConnectionThread,
+        on_delete=models.CASCADE,
+        related_name="messages",
+    )
+    sender_profile = models.ForeignKey(
+        AccountProfile,
+        on_delete=models.CASCADE,
+        related_name="sent_connection_messages",
+    )
+    body = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"Message {self.id} in thread {self.thread_id}"
 
 
 class ImportedContact(models.Model):

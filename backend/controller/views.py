@@ -35,6 +35,14 @@ def _base_url(request: HttpRequest) -> str:
     return request.build_absolute_uri("/").rstrip("/")
 
 
+def _user_payload_kwargs(payload: dict | None) -> dict:
+    source = payload if isinstance(payload, dict) else {}
+    return {
+        "user_id": str(source.get("user_id") or "").strip() or None,
+        "phone_number": str(source.get("phone_number") or "").strip() or None,
+    }
+
+
 def home_view(request: HttpRequest):
     return render(
         request,
@@ -62,7 +70,7 @@ def add_action_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = _graph_service().add_action_flow(prompt)
+        result = _graph_service().add_action_flow(prompt, **_user_payload_kwargs(payload))
     except ValueError as exc:
         print(f"[controller] add-action rejected: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=400)
@@ -86,7 +94,7 @@ def fetch_action_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = _graph_service().fetch_action_flow(prompt)
+        result = _graph_service().fetch_action_flow(prompt, **_user_payload_kwargs(payload))
     except Exception as exc:
         print(f"[controller] fetch-action failed: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=500)
@@ -107,7 +115,7 @@ def conversation_view(request: HttpRequest):
     if not prompt:
         return JsonResponse({"detail": "prompt required"}, status=400)
     try:
-        result = _graph_service().conversation_flow(prompt)
+        result = _graph_service().conversation_flow(prompt, **_user_payload_kwargs(payload))
     except Exception as exc:
         print(f"[controller] conversation failed: {exc}", file=sys.stderr, flush=True)
         return JsonResponse({"detail": str(exc)}, status=500)
@@ -116,7 +124,12 @@ def conversation_view(request: HttpRequest):
 
 
 def state_view(request: HttpRequest):
-    return JsonResponse(_graph_service().export_state())
+    return JsonResponse(
+        _graph_service().export_state(
+            user_id=request.GET.get("user_id"),
+            phone_number=request.GET.get("phone_number"),
+        )
+    )
 
 
 @csrf_exempt
@@ -124,7 +137,14 @@ def reset_state_view(request: HttpRequest):
     if request.method != "POST":
         return JsonResponse({"detail": "POST required"}, status=405)
     try:
-        result = _graph_service().reset_state()
+        payload = _parse_json_request(request)
+    except json.JSONDecodeError as exc:
+        return JsonResponse({"detail": f"invalid JSON body: {exc}"}, status=400)
+    try:
+        result = _graph_service().reset_state(
+            **_user_payload_kwargs(payload),
+            reset_all=bool(payload.get("reset_all")),
+        )
     except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)
     return JsonResponse(result)
@@ -180,7 +200,7 @@ def agent_mcp_invoke_view(request: HttpRequest, mcp_id: str):
             tool_name=tool_name,
             arguments=arguments,
             fallback_prompt=fallback_prompt,
-            user_id=str(payload.get("user_id") or "anonymous"),
+            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
             board_state=payload.get("board_state") if isinstance(payload.get("board_state"), dict) else {},
         )
     except ValueError as exc:
@@ -191,13 +211,60 @@ def agent_mcp_invoke_view(request: HttpRequest, mcp_id: str):
 
 
 def agent_board_memory_view(request: HttpRequest):
-    if request.method != "GET":
-        return JsonResponse({"detail": "GET required"}, status=405)
+    if request.method == "GET":
+        try:
+            user_id = str(request.GET.get("user_id") or "").strip() or None
+            if user_id:
+                board_state = semi_agent_service.connections_service.load_board_state_for_user(
+                    user_id
+                )
+                if board_state is not None:
+                    payload = {"ok": True, "board_state": board_state}
+                else:
+                    payload = semi_agent_service.get_board_memory_state()
+            else:
+                payload = semi_agent_service.get_board_memory_state()
+        except Exception as exc:
+            return JsonResponse({"detail": str(exc)}, status=500)
+        return JsonResponse(payload)
+
+    if request.method != "POST":
+        return JsonResponse({"detail": "GET or POST required"}, status=405)
+
     try:
-        payload = semi_agent_service.get_board_memory_state()
+        payload = _parse_json_request(request)
+    except json.JSONDecodeError as exc:
+        return JsonResponse({"detail": f"invalid JSON body: {exc}"}, status=400)
+
+    board_state = payload.get("board_state")
+    if not isinstance(board_state, dict):
+        return JsonResponse({"detail": "board_state object required"}, status=400)
+
+    try:
+        user_id = str(payload.get("user_id") or "").strip() or None
+        removed_result_id = str(payload.get("removed_result_id") or "").strip() or None
+        if user_id:
+            if removed_result_id:
+                semi_agent_service.board_memory.remove_result_binding(removed_result_id)
+            persisted_state = semi_agent_service.connections_service.save_board_state_for_user(
+                user_id,
+                board_state,
+            )
+            if persisted_state is not None:
+                result = {"ok": True, "board_state": persisted_state}
+            else:
+                result = semi_agent_service.save_board_memory_state(
+                    board_state=board_state,
+                    removed_result_id=removed_result_id,
+                )
+        else:
+            result = semi_agent_service.save_board_memory_state(
+                board_state=board_state,
+                removed_result_id=removed_result_id,
+            )
     except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)
-    return JsonResponse(payload)
+    return JsonResponse(result)
 
 
 @csrf_exempt
@@ -220,9 +287,9 @@ def agent_run_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
-            user_id=str(payload.get("user_id") or "anonymous"),
+            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
             session_id=str(payload.get("session_id") or "default_session"),
-            reasoning_provider=str(payload.get("reasoning_provider") or "qwen"),
+            reasoning_provider=str(payload.get("reasoning_provider") or "openai"),
         )
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)
@@ -253,9 +320,9 @@ def agent_run_start_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
-            user_id=str(payload.get("user_id") or "anonymous"),
+            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
             session_id=str(payload.get("session_id") or "default_session"),
-            reasoning_provider=str(payload.get("reasoning_provider") or "qwen"),
+            reasoning_provider=str(payload.get("reasoning_provider") or "openai"),
         )
     except ValueError as exc:
         print(f"[controller] semi-agent start rejected: {exc}", file=sys.stderr, flush=True)
@@ -343,8 +410,31 @@ def agent_object_open_view(request: HttpRequest):
     try:
         result = semi_agent_service.open_board_object(
             object_payload=payload.get("object") if isinstance(payload.get("object"), dict) else payload,
-            user_id=str(payload.get("user_id") or "anonymous"),
+            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
         )
+    except Exception as exc:
+        return JsonResponse({"detail": str(exc)}, status=500)
+    return JsonResponse(result)
+
+
+@csrf_exempt
+def agent_object_delete_view(request: HttpRequest):
+    if request.method != "POST":
+        return JsonResponse({"detail": "POST required"}, status=405)
+    try:
+        payload = _parse_json_request(request)
+    except json.JSONDecodeError as exc:
+        return JsonResponse({"detail": f"invalid JSON body: {exc}"}, status=400)
+
+    try:
+        result = semi_agent_service.delete_board_object(
+            object_payload=payload.get("object")
+            if isinstance(payload.get("object"), dict)
+            else payload,
+            user_id=str(payload.get("user_id") or payload.get("phone_number") or "anonymous"),
+        )
+    except ValueError as exc:
+        return JsonResponse({"detail": str(exc)}, status=400)
     except Exception as exc:
         return JsonResponse({"detail": str(exc)}, status=500)
     return JsonResponse(result)
