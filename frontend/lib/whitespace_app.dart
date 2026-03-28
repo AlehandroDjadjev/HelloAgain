@@ -12,7 +12,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'browser_voice_bridge.dart';
 import 'src/config/backend_base_url.dart';
-import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
 
 Future<void> main() async {
@@ -1008,6 +1007,10 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       _lastSpeech = widget.welcomeText!.trim();
     }
     unawaited(_hydrateBoardFromBackend());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _ensureVoiceLoopStartedAutomatically();
+    });
   }
 
   @override
@@ -1102,35 +1105,25 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     await _submitPrompt(message: message, triggeredBySpeech: false);
   }
 
-  Future<void> _openNavigationApiTestPage() async {
-    if (_isBusy || _isListening) return;
-
-    final prompt = _promptController.text.trim();
-    if (prompt.isEmpty) {
+  void _ensureVoiceLoopStartedAutomatically() {
+    if (_voiceLoopEnabled || _isBusy) {
+      return;
+    }
+    if (!_voiceBridge.isSpeechRecognitionSupported) {
       setState(() {
-        _statusText = 'Write a prompt first, then I will open the phone command page and run it immediately.';
+        _statusText =
+            'Always-listening voice is unavailable here. Open the app in a supported Chrome browser to use hands-free mode.';
       });
       return;
     }
 
+    final token = _voiceLoopToken + 1;
     setState(() {
-      _statusText = 'Opening phone command with "$prompt"...';
+      _voiceLoopEnabled = true;
+      _voiceLoopToken = token;
+      _statusText = 'Voice conversation mode is on automatically. Listening...';
     });
-
-    if (!mounted) return;
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => NavigationLauncherScreen(
-          initialPrompt: prompt,
-          autoRunOnOpen: true,
-        ),
-      ),
-    );
-
-    if (!mounted) return;
-    setState(() {
-      _statusText = 'Returned from the navigation run page.';
-    });
+    unawaited(_runVoiceLoop(token));
   }
 
   void _toggleVoiceLoop() {
@@ -1706,44 +1699,6 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                 ),
                               ),
                             ],
-                          ),
-                          const SizedBox(height: 10),
-                          GestureDetector(
-                            onTap: (_isBusy || _isListening)
-                                ? null
-                                : _openNavigationApiTestPage,
-                            child: Container(
-                              height: 50,
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF1F7A5A),
-                                borderRadius: BorderRadius.circular(18),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: const Color(0xFF1F7A5A).withValues(alpha: 0.24),
-                                    blurRadius: 18,
-                                    offset: const Offset(0, 10),
-                                  ),
-                                ],
-                              ),
-                              child: const Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(
-                                    Icons.map_outlined,
-                                    color: Colors.white,
-                                  ),
-                                  SizedBox(width: 10),
-                                  Text(
-                                    'Run Phone Command',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
                           ),
                         ],
                       ),
