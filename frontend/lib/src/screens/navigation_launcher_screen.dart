@@ -7,6 +7,7 @@ import '../api/agent_client.dart';
 import '../config/backend_base_url.dart';
 import '../pipeline/orchestrator.dart';
 import '../pipeline/pipeline_state.dart';
+import '../services/navigation_overlay_service.dart';
 
 class NavigationLauncherScreen extends StatefulWidget {
   const NavigationLauncherScreen({
@@ -23,16 +24,26 @@ class NavigationLauncherScreen extends StatefulWidget {
       _NavigationLauncherScreenState();
 }
 
-class _NavigationLauncherScreenState extends State<NavigationLauncherScreen> {
+class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
+    with WidgetsBindingObserver {
   static const _reasoningProvider = 'openai';
 
   late final TextEditingController _promptController;
   late final PipelineOrchestrator _orch;
+  final _overlayService = const NavigationOverlayService();
   bool _showDebug = false;
+  bool _overlayPermissionMissing = false;
+  bool _awaitingOverlayPermissionReturn = false;
+  bool _overlayVisible = false;
+  bool _completionHandled = false;
+  bool _bringingAppToFront = false;
+  bool _pendingReturnToHome = false;
+  PipelinePhase _lastObservedPhase = PipelinePhase.idle;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _promptController = TextEditingController(
       text: widget.initialPrompt?.trim().isNotEmpty == true
           ? widget.initialPrompt!.trim()
@@ -41,6 +52,7 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen> {
     _orch = PipelineOrchestrator(
       client: AgentClient(baseUrl: resolveBackendBaseUrl()),
     )..addListener(_onOrchestratorChanged);
+    unawaited(_refreshOverlayPermissionState());
 
     if (widget.autoRunOnOpen) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -52,14 +64,38 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _orch.removeListener(_onOrchestratorChanged);
+    unawaited(_overlayService.hide());
     _promptController.dispose();
     super.dispose();
   }
 
   void _onOrchestratorChanged() {
     if (!mounted) return;
+    if (_orch.phase != _lastObservedPhase) {
+      _lastObservedPhase = _orch.phase;
+      unawaited(_syncNavigationOverlay());
+      if (_orch.phase == PipelinePhase.completed && !_completionHandled) {
+        _pendingReturnToHome = true;
+        unawaited(_finishCompletedFlow());
+      }
+    }
     setState(() {});
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      return;
+    }
+    if (_awaitingOverlayPermissionReturn) {
+      _awaitingOverlayPermissionReturn = false;
+      unawaited(_handleOverlayPermissionReturn());
+    }
+    if (_pendingReturnToHome) {
+      unawaited(_finishCompletedFlow());
+    }
   }
 
   Future<void> _startCommand() async {
@@ -69,6 +105,12 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen> {
     }
 
     FocusScope.of(context).unfocus();
+    await _refreshOverlayPermissionState();
+    await _showStartupOverlayIfPossible(prompt);
+    await _runCommandFlow(prompt);
+  }
+
+  Future<void> _runCommandFlow(String prompt) async {
     await _orch.preparePhoneCommand(
       prompt,
       reasoningProvider: _reasoningProvider,
@@ -81,6 +123,9 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen> {
   }
 
   String _statusText() {
+    if (_overlayPermissionMissing && !_orch.phase.isRunning) {
+      return 'The phone flow can still run, but the floating navigator bubble needs "Display over other apps" to appear outside the app.';
+    }
     switch (_orch.phase) {
       case PipelinePhase.creatingSession:
         return 'Creating the command session...';
@@ -103,6 +148,91 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen> {
         }
         return 'Loading the phone flow...';
     }
+  }
+
+  Future<void> _refreshOverlayPermissionState() async {
+    if (!_overlayService.isSupported) {
+      return;
+    }
+    final granted = await _overlayService.hasPermission();
+    if (!mounted) return;
+    setState(() {
+      _overlayPermissionMissing = !granted;
+    });
+  }
+
+  Future<void> _handleOverlayPermissionReturn() async {
+    await _refreshOverlayPermissionState();
+    if (!mounted || _overlayPermissionMissing || !_orch.phase.isRunning) {
+      return;
+    }
+    await _syncNavigationOverlay();
+  }
+
+  Future<void> _finishCompletedFlow() async {
+    if (!mounted || _completionHandled || _orch.phase != PipelinePhase.completed) {
+      return;
+    }
+
+    await _overlayService.hide();
+    _overlayVisible = false;
+
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    if (lifecycleState != AppLifecycleState.resumed) {
+      if (!_bringingAppToFront) {
+        _bringingAppToFront = true;
+        await _overlayService.bringToFront();
+        _bringingAppToFront = false;
+      }
+      return;
+    }
+
+    _completionHandled = true;
+    _pendingReturnToHome = false;
+
+    if (!mounted) {
+      return;
+    }
+
+    Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
+  }
+
+  Future<void> _syncNavigationOverlay() async {
+    if (!_overlayService.isSupported) {
+      return;
+    }
+
+    if (_orch.phase.isRunning) {
+      final hasPermission = await _overlayService.hasPermission();
+      if (!hasPermission) {
+        _overlayVisible = false;
+        return;
+      }
+      await _overlayService.show(
+        title: _guardTitle(),
+        message: _guardBody().isNotEmpty ? _guardBody() : _statusText(),
+      );
+      _overlayVisible = true;
+      return;
+    }
+
+    if (_overlayVisible) {
+      await _overlayService.hide();
+      _overlayVisible = false;
+    }
+  }
+
+  Future<void> _showStartupOverlayIfPossible(String prompt) async {
+    if (_overlayPermissionMissing || !_overlayService.isSupported) {
+      return;
+    }
+    await _overlayService.show(
+      title: 'Launching phone command',
+      message: prompt.isNotEmpty
+          ? 'Starting "$prompt" on the phone now.'
+          : 'Starting the phone command now.',
+    );
+    _overlayVisible = true;
   }
 
   String _intentSummaryText() {
@@ -304,6 +434,22 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen> {
                                 ],
                               ),
                             ),
+                            if (_overlayPermissionMissing) ...[
+                              const SizedBox(height: 10),
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: TextButton.icon(
+                                  onPressed: () async {
+                                    _awaitingOverlayPermissionReturn = true;
+                                    await _overlayService.requestPermission();
+                                  },
+                                  icon: const Icon(
+                                    Icons.picture_in_picture_alt_outlined,
+                                  ),
+                                  label: const Text('Enable Floating Bubble'),
+                                ),
+                              ),
+                            ],
                             if (_intentSummaryText().isNotEmpty) ...[
                               const SizedBox(height: 16),
                               Container(

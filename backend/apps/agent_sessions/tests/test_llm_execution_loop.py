@@ -142,6 +142,39 @@ class LLMExecutionLoopTests(TestCase):
         SessionService.transition(session, SessionStatus.EXECUTING)
         return session
 
+    def test_get_next_action_returns_complete_for_completed_session(self):
+        session = self._make_session("Open Chrome", "com.android.chrome")
+        SessionService.transition(session, SessionStatus.COMPLETED)
+
+        response = ExecutionService.get_next_action(
+            session,
+            plan=None,
+            screen_state=_screen("com.android.chrome", "Chrome", "done", []),
+        )
+
+        self.assertEqual(response.status, "complete")
+        self.assertEqual(response.reason, "Session is already complete.")
+
+    def test_decide_after_result_returns_complete_for_completed_session(self):
+        session = self._make_session("Open Chrome", "com.android.chrome")
+        SessionService.transition(session, SessionStatus.COMPLETED)
+
+        decision = ExecutionService.decide_after_result(
+            session,
+            plan=None,
+            action_id="final_step",
+            result_success=True,
+            result_code="OK",
+            action_type="OPEN_APP",
+            params={"package_name": "com.android.chrome"},
+            reasoning="The goal is already complete.",
+            screen_hash_before="before",
+            screen_hash_after="after",
+        )
+
+        self.assertEqual(decision.status, "complete")
+        self.assertEqual(decision.reason, "Session is already complete.")
+
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
     def test_chrome_search_e2e(self, mock_from_reasoning_provider):
         mock_client = MagicMock()
