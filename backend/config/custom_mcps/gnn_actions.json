@@ -2,14 +2,14 @@
   "id": "gnn_actions",
   "protocol": "at_home_mcp",
   "kind": "backend_integrated_toolset",
-  "description": "This MCP exposes the already integrated gnn actions in the backend. The prompt comes from a user with who you have to analyze and build description of their character and full emotional state. It updates the emotional profile, stores action memory, and can fetch what fits now.",
+  "description": "This MCP exposes the already integrated gnn actions in the backend. The prompt comes from a user with who you have to analyze and build description of their character and full emotional state. It updates the emotional profile, stores action memory, and can fetch what fits now. EMOTIONS - GNN ACTIONS",
   "invoke_url": "/api/agent/mcps/gnn_actions/invoke/",
   "tools": [
     {
       "name": "add_action",
       "method": "POST",
       "path": "/api/add-action/",
-      "description": "Whenever the user talks of any new thing they've done - giving info about themselves we add an action",
+      "description": "Whenever the user talks of any new thing they've done - giving info about themselves - we add an action. Any description of a new activity - new action.",
       "body_schema": {
         "prompt": "string"
       }
@@ -18,7 +18,7 @@
       "name": "fetch_action",
       "method": "POST",
       "path": "/api/fetch-action/",
-      "description": "When the user needs reccomendation for a thing to do - if they are sad, anything to reccomend ",
+      "description": "When the user needs reccomendation for a thing to do - if they are sad, anything to reccomend and they need to be given something (request implicitly or explicitly)",
       "body_schema": {
         "prompt": "string"
       }
@@ -27,7 +27,7 @@
       "name": "conversation",
       "method": "POST",
       "path": "/api/conversation/",
-      "description": "Conversation mode updates the user state and extracts the emotional or context attribute map fully without forcing a brand new action.",
+      "description": "USE ALMOST NEVER. Only updates weights of existing acitons / attributes of the users state - it will not give not usable product responce - only use with no details on discussion that brings up no new actions or requires any reccomendations",
       "body_schema": {
         "prompt": "string"
       }

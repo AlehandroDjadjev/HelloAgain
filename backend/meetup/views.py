@@ -151,6 +151,94 @@ def _next_accepted_meeting(profile, exclude_invite_id: int | None = None) -> Mee
         qs = qs.exclude(pk=exclude_invite_id)
     return qs.order_by("proposed_time", "id").first()
 
+
+def _normalize_friend_name(value: object) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _accepted_friends_for_profile(profile):
+    requests = FriendRequest.objects.select_related(
+        "from_profile__user",
+        "from_profile__elder_profile",
+        "to_profile__user",
+        "to_profile__elder_profile",
+    ).filter(
+        status=FriendRequest.Status.ACCEPTED,
+    ).filter(
+        Q(from_profile=profile) | Q(to_profile=profile),
+    )
+    return [
+        request_obj.to_profile if request_obj.from_profile_id == profile.id else request_obj.from_profile
+        for request_obj in requests
+    ]
+
+
+def _resolve_meetup_friend(viewer, body: dict):
+    friend_user_id_raw = body.get("friend_user_id")
+    friend_name_raw = str(body.get("friend_name") or "").strip()
+    has_friend_user_id = friend_user_id_raw not in {None, ""}
+    has_friend_name = bool(friend_name_raw)
+
+    if has_friend_user_id and has_friend_name:
+        return _json_error(
+            "Provide exactly one friend selector. Use friend_name or friend_user_id, not both.",
+            code="MULTIPLE_FRIEND_SELECTORS",
+        )
+
+    resolved_by_id = None
+    if has_friend_user_id:
+        try:
+            friend_user_id = int(friend_user_id_raw)
+        except (TypeError, ValueError):
+            return _json_error("friend_user_id must be a valid integer.", code="INVALID_FRIEND")
+
+        resolved_by_id = get_object_or_404(
+            type(viewer).objects.select_related("user", "elder_profile"),
+            user_id=friend_user_id,
+        )
+        if resolved_by_id.id == viewer.id:
+            return _json_error("You cannot create a meetup with yourself.", code="INVALID_PARTICIPANT")
+        if get_friendship_status(viewer, resolved_by_id) != FriendRequest.Status.ACCEPTED:
+            return _json_error(
+                "Meetups can be proposed only to accepted friends.",
+                status_code=403,
+                code="FRIEND_REQUIRED",
+            )
+
+    if has_friend_name:
+        normalized_name = _normalize_friend_name(friend_name_raw)
+        friends = _accepted_friends_for_profile(viewer)
+        matches = [
+            friend for friend in friends
+            if _normalize_friend_name(friend.display_name) == normalized_name
+        ]
+        if not matches:
+            return _json_error(
+                "No accepted friend was found with that name.",
+                status_code=404,
+                code="FRIEND_NOT_FOUND",
+            )
+        if len(matches) > 1:
+            return _json_error(
+                "More than one accepted friend has that name. Enter the full unique display name.",
+                code="FRIEND_NAME_AMBIGUOUS",
+            )
+        resolved_by_name = matches[0]
+        if resolved_by_id is not None and resolved_by_name.id != resolved_by_id.id:
+            return _json_error(
+                "friend_user_id and friend_name refer to different friends.",
+                code="FRIEND_MISMATCH",
+            )
+        return resolved_by_name
+
+    if resolved_by_id is not None:
+        return resolved_by_id
+
+    return _json_error(
+        "Provide friend_name or friend_user_id for an accepted friend.",
+        code="MISSING_FRIEND",
+    )
+
 class RecommendMeetupView(APIView):
     def post(self, request):
         participants = request.data.get('participants', [])
@@ -248,19 +336,9 @@ def propose_friend_meetup(request):
     except Exception:
         return _json_error("Invalid JSON body.")
 
-    friend_user_id = body.get("friend_user_id")
-    if not friend_user_id:
-        return _json_error("friend_user_id is required.", code="MISSING_FRIEND")
-
-    friend_profile = get_object_or_404(
-        type(viewer).objects.select_related("user", "elder_profile"),
-        user_id=friend_user_id,
-    )
-    if friend_profile.id == viewer.id:
-        return _json_error("You cannot create a meetup with yourself.", code="INVALID_PARTICIPANT")
-
-    if get_friendship_status(viewer, friend_profile) != FriendRequest.Status.ACCEPTED:
-        return _json_error("Meetups can be proposed only to accepted friends.", status_code=403, code="FRIEND_REQUIRED")
+    friend_profile = _resolve_meetup_friend(viewer, body)
+    if isinstance(friend_profile, JsonResponse):
+        return friend_profile
 
     viewer_meeting = _next_accepted_meeting(viewer)
     if viewer_meeting is not None:

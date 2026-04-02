@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.utils import timezone
 
 from controller.models import Action, ActionAttributeScore, Attribute, MainUserProfile, UserActionEdge, UserAttributeScore
 from .gnn import GraphTensors, OnlineTrainer, PreferenceGNN
 from .llm_parser import QwenPromptParser
 from .prompts import build_action_inventory_text, render_attribute_inventory
+from .user_context import ActiveUserTracker
 
 
 def clamp(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -28,10 +31,17 @@ class RankedAction:
 
 
 class GraphService:
-    def __init__(self, parser: QwenPromptParser | None = None) -> None:
+    def __init__(
+        self,
+        parser: QwenPromptParser | None = None,
+        *,
+        user_tracker: ActiveUserTracker | None = None,
+    ) -> None:
         self.parser = parser or QwenPromptParser()
         self.model: PreferenceGNN | None = None
         self.trainer: OnlineTrainer | None = None
+        self.user_tracker = user_tracker or ActiveUserTracker()
+        self._table_column_cache: Dict[str, set[str]] = {}
 
     def _ensure_model(self, attr_dim: int) -> None:
         if self.model is not None and getattr(self.model, "input_attr_dim", None) == attr_dim:
@@ -40,30 +50,151 @@ class GraphService:
         self.model.input_attr_dim = attr_dim
         self.trainer = OnlineTrainer(self.model)
 
-    def _user(self) -> MainUserProfile:
-        user, _ = MainUserProfile.objects.get_or_create(name="main_user")
-        return user
+    def _resolve_user_profile(
+        self,
+        *,
+        user_id: str | None = None,
+        phone_number: str | None = None,
+    ) -> tuple[MainUserProfile, Dict[str, str]]:
+        user_context = self.user_tracker.resolve(user_id=user_id, phone_number=phone_number)
+        user, _ = MainUserProfile.objects.get_or_create(name=user_context["record_name"])
+        return user, user_context
 
     def _timestamp(self) -> str:
         return timezone.now().isoformat()
 
+    def _table_columns(self, model) -> set[str]:
+        table_name = model._meta.db_table
+        cached = self._table_column_cache.get(table_name)
+        if cached is not None:
+            return cached
+        with connection.cursor() as cursor:
+            description = connection.introspection.get_table_description(cursor, table_name)
+        columns = {
+            getattr(column, "name", None) or column[0]
+            for column in description
+        }
+        self._table_column_cache[table_name] = columns
+        return columns
+
+    def _table_has_column(self, model, column_name: str) -> bool:
+        return column_name in self._table_columns(model)
+
+    def _insert_legacy_owned_row(
+        self,
+        model,
+        *,
+        user: MainUserProfile,
+        values: Dict[str, Any],
+    ):
+        table_name = model._meta.db_table
+        available_columns = self._table_columns(model)
+        timestamp = timezone.now()
+        payload: Dict[str, Any] = {
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            **values,
+        }
+        if "owner_id" in available_columns:
+            payload["owner_id"] = user.pk
+        if "history_stack" in available_columns and "history_stack" not in payload:
+            payload["history_stack"] = []
+        if "desired_attribute_map" in available_columns and "desired_attribute_map" not in payload:
+            payload["desired_attribute_map"] = {}
+
+        filtered_payload = {
+            key: value
+            for key, value in payload.items()
+            if key in available_columns
+        }
+        serialized_payload = {
+            key: (
+                json.dumps(value, ensure_ascii=False)
+                if isinstance(value, (dict, list))
+                else value
+            )
+            for key, value in filtered_payload.items()
+        }
+        quote = connection.ops.quote_name
+        columns_sql = ", ".join(quote(column) for column in serialized_payload)
+        placeholders = ", ".join(["%s"] * len(serialized_payload))
+        sql = (
+            f"INSERT INTO {quote(table_name)} ({columns_sql}) "
+            f"VALUES ({placeholders})"
+        )
+        with connection.cursor() as cursor:
+            cursor.execute(sql, list(serialized_payload.values()))
+
+    def _attribute_queryset(self, user: MainUserProfile):
+        return Attribute.objects.filter(name__startswith=self._attribute_prefix(user))
+
+    def _action_queryset(self, user: MainUserProfile):
+        return Action.objects.filter(name__startswith=self._action_prefix(user))
+
+    def _namespace_token(self, user: MainUserProfile) -> str:
+        return hashlib.sha1(user.name.encode("utf-8")).hexdigest()[:12]
+
+    def _attribute_prefix(self, user: MainUserProfile) -> str:
+        return f"attr__{self._namespace_token(user)}__"
+
+    def _action_prefix(self, user: MainUserProfile) -> str:
+        return f"action__{self._namespace_token(user)}__"
+
+    def _attribute_storage_name(self, user: MainUserProfile, name: str) -> str:
+        clean_name = str(name or "").strip().lower()
+        prefix = self._attribute_prefix(user)
+        return f"{prefix}{clean_name}"[:120]
+
+    def _action_storage_name(self, user: MainUserProfile, name: str) -> str:
+        clean_name = str(name or "").strip().lower()
+        prefix = self._action_prefix(user)
+        return f"{prefix}{clean_name}"[:160]
+
+    def _display_attribute_name(self, user: MainUserProfile, name: str) -> str:
+        value = str(name or "").strip()
+        prefix = self._attribute_prefix(user)
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+        return value
+
+    def _display_action_name(self, user: MainUserProfile, name: str) -> str:
+        value = str(name or "").strip()
+        prefix = self._action_prefix(user)
+        if value.startswith(prefix):
+            return value[len(prefix) :]
+        return value
+
+    def _resolve_owner_from_action(self, action: Action) -> MainUserProfile:
+        action_name = str(action.name or "")
+        if action_name.startswith("action__") and "__" in action_name[8:]:
+            token = action_name.split("__", 2)[1]
+            for user in MainUserProfile.objects.only("id", "name").all():
+                if self._namespace_token(user) == token:
+                    return user
+        user, _ = MainUserProfile.objects.get_or_create(name="main_user")
+        return user
+
     def _attribute_inventory(self, user: MainUserProfile) -> List[dict]:
         rows = {
-            row.attribute.name: row.score
+            self._display_attribute_name(user, row.attribute.name): row.score
             for row in UserAttributeScore.objects.filter(user=user).select_related("attribute")
         }
         inventory = []
-        for attr in Attribute.objects.all().order_by("name"):
-            inventory.append({"name": attr.name, "score": rows.get(attr.name, 0.0)})
+        for attr in self._attribute_queryset(user).order_by("name"):
+            display_name = self._display_attribute_name(user, attr.name)
+            inventory.append({"name": display_name, "score": rows.get(display_name, 0.0)})
         return inventory
 
-    def _action_inventory(self) -> List[dict]:
+    def _action_inventory(self, user: MainUserProfile) -> List[dict]:
         actions = []
-        for action in Action.objects.all().prefetch_related("attribute_scores__attribute").order_by("name"):
-            mapping = {row.attribute.name: row.score for row in action.attribute_scores.all()}
+        for action in self._action_queryset(user).prefetch_related("attribute_scores__attribute").order_by("name"):
+            mapping = {
+                self._display_attribute_name(user, row.attribute.name): row.score
+                for row in action.attribute_scores.all()
+            }
             actions.append(
                 {
-                    "name": action.name,
+                    "name": self._display_action_name(user, action.name),
                     "description": action.description,
                     "attribute_map": mapping,
                     "desired_attribute_map": self._action_desired_vector(action),
@@ -71,13 +202,12 @@ class GraphService:
             )
         return actions
 
-    def _plan(self, mode: str, prompt: str) -> Dict[str, Any]:
-        user = self._user()
+    def _plan(self, mode: str, prompt: str, *, user: MainUserProfile) -> Dict[str, Any]:
         attr_text = render_attribute_inventory(self._attribute_inventory(user))
         if mode == "add":
             action_text = "read-only reference only in add mode; do not reuse or modify existing actions"
         else:
-            action_text = build_action_inventory_text(self._action_inventory())
+            action_text = build_action_inventory_text(self._action_inventory(user))
         plan = self.parser.parse(
             mode=mode,
             user_prompt=prompt,
@@ -89,8 +219,14 @@ class GraphService:
     def _reconcile_plan_with_inventory(self, user: MainUserProfile, plan: Dict[str, Any]) -> Dict[str, Any]:
         user_state = plan.setdefault("user_state", {})
         current_scores = self._current_user_vector(user)
-        existing_attribute_names = {attr.name for attr in Attribute.objects.all().only("name")}
-        existing_action_names = {action.name for action in Action.objects.all().only("name")}
+        existing_attribute_names = {
+            self._display_attribute_name(user, attr.name)
+            for attr in self._attribute_queryset(user).only("name")
+        }
+        existing_action_names = {
+            self._display_action_name(user, action.name)
+            for action in self._action_queryset(user).only("name")
+        }
 
         raw_new_attributes = list(user_state.get("new_attributes", []))
         raw_updates = list(user_state.get("updates", []))
@@ -154,22 +290,69 @@ class GraphService:
             plan["reconciliation_notes"] = reconciliation_notes
         return plan
 
-    def _get_or_create_attribute(self, name: str, initial_score: float = 0.0) -> Attribute:
-        attr, created = Attribute.objects.get_or_create(name=name)
+    def _get_or_create_attribute(
+        self,
+        name: str,
+        *,
+        user: MainUserProfile,
+        initial_score: float = 0.0,
+    ) -> Attribute:
+        storage_name = self._attribute_storage_name(user, name)
+        attr = Attribute.objects.filter(name=storage_name).first()
+        created = attr is None
+        if attr is None:
+            if self._table_has_column(Attribute, "owner_id"):
+                try:
+                    self._insert_legacy_owned_row(
+                        Attribute,
+                        user=user,
+                        values={"name": storage_name},
+                    )
+                except IntegrityError:
+                    pass
+                attr = Attribute.objects.get(name=storage_name)
+            else:
+                attr = Attribute.objects.create(name=storage_name)
         if created:
-            user = self._user()
             UserAttributeScore.objects.get_or_create(user=user, attribute=attr, defaults={"score": clamp(initial_score)})
         return attr
 
-    def _get_or_create_action(self, name: str, description: str = "", base_summary: str = "", prompt_text: str = "") -> Action:
-        action, created = Action.objects.get_or_create(
-            name=name,
-            defaults={
-                "description": description,
-                "base_summary": base_summary,
-                "created_from_prompt": prompt_text,
-            },
-        )
+    def _get_or_create_action(
+        self,
+        user: MainUserProfile,
+        name: str,
+        description: str = "",
+        base_summary: str = "",
+        prompt_text: str = "",
+    ) -> Action:
+        storage_name = self._action_storage_name(user, name)
+        action = Action.objects.filter(name=storage_name).first()
+        created = action is None
+        if action is None:
+            if self._table_has_column(Action, "owner_id"):
+                try:
+                    self._insert_legacy_owned_row(
+                        Action,
+                        user=user,
+                        values={
+                            "name": storage_name,
+                            "description": description,
+                            "base_summary": base_summary,
+                            "created_from_prompt": prompt_text,
+                            "hit_count": 0,
+                            "helpful_count": 0,
+                        },
+                    )
+                except IntegrityError:
+                    pass
+                action = Action.objects.get(name=storage_name)
+            else:
+                action = Action.objects.create(
+                    name=storage_name,
+                    description=description,
+                    base_summary=base_summary,
+                    created_from_prompt=prompt_text,
+                )
         if not created:
             changed_fields: List[str] = []
             if description and action.description != description:
@@ -186,13 +369,40 @@ class GraphService:
                 action.save(update_fields=changed_fields)
         return action
 
-    def _create_action_for_add(self, name: str, description: str = "", base_summary: str = "", prompt_text: str = "") -> Action:
+    def _create_action_for_add(
+        self,
+        user: MainUserProfile,
+        name: str,
+        description: str = "",
+        base_summary: str = "",
+        prompt_text: str = "",
+    ) -> Action:
         cleaned_name = name.strip().lower()
         if not cleaned_name:
             raise ValueError("Invalid add-action parse: action_candidate.name is required in add mode.")
+        storage_name = self._action_storage_name(user, cleaned_name)
+        if Action.objects.filter(name=storage_name).exists():
+            raise ValueError(
+                f"Invalid add-action parse: action '{cleaned_name}' already exists. "
+                "Add mode must create a brand new action and cannot modify an existing one."
+            )
         try:
+            if self._table_has_column(Action, "owner_id"):
+                self._insert_legacy_owned_row(
+                    Action,
+                    user=user,
+                    values={
+                        "name": storage_name,
+                        "description": description,
+                        "base_summary": base_summary,
+                        "created_from_prompt": prompt_text,
+                        "hit_count": 0,
+                        "helpful_count": 0,
+                    },
+                )
+                return Action.objects.get(name=storage_name)
             return Action.objects.create(
-                name=cleaned_name,
+                name=storage_name,
                 description=description,
                 base_summary=base_summary,
                 created_from_prompt=prompt_text,
@@ -217,7 +427,7 @@ class GraphService:
 
     def _current_user_vector(self, user: MainUserProfile) -> Dict[str, float]:
         return {
-            row.attribute.name: row.score
+            self._display_attribute_name(user, row.attribute.name): row.score
             for row in UserAttributeScore.objects.filter(user=user).select_related("attribute")
         }
 
@@ -230,7 +440,7 @@ class GraphService:
         changed: Dict[str, float] = {}
         timestamp = self._timestamp()
         existing_rows = {
-            row.attribute.name: row
+            self._display_attribute_name(user, row.attribute.name): row
             for row in UserAttributeScore.objects.filter(user=user).select_related("attribute")
         }
         created_this_request: set[str] = set()
@@ -239,7 +449,11 @@ class GraphService:
             name = attr_payload["name"].strip().lower()
             if name in existing_rows:
                 continue
-            attr = self._get_or_create_attribute(name, attr_payload.get("initial_score", 0.0))
+            attr = self._get_or_create_attribute(
+                name,
+                user=user,
+                initial_score=attr_payload.get("initial_score", 0.0),
+            )
             row = self._ensure_user_attribute(user, attr, attr_payload.get("initial_score", 0.0))
             row.score = clamp(attr_payload.get("initial_score", 0.0))
             row.history_stack = self._append_history(
@@ -263,7 +477,7 @@ class GraphService:
             name = payload["attribute"].strip().lower()
             if name in created_this_request:
                 continue
-            attr = self._get_or_create_attribute(name)
+            attr = self._get_or_create_attribute(name, user=user)
             row = existing_rows.get(name) or self._ensure_user_attribute(user, attr)
             previous_score = float(row.score)
 
@@ -367,6 +581,7 @@ class GraphService:
 
     def _merge_into_action(
         self,
+        user: MainUserProfile,
         action: Action,
         attribute_updates: Dict[str, float],
         *,
@@ -386,7 +601,7 @@ class GraphService:
 
         timestamp = self._timestamp()
         existing = {
-            row.attribute.name: row
+            self._display_attribute_name(user, row.attribute.name): row
             for row in ActionAttributeScore.objects.filter(action=action).select_related("attribute")
         }
         applied: Dict[str, float] = {}
@@ -394,7 +609,11 @@ class GraphService:
         for name, score in attribute_updates.items():
             if overlap_only and name not in existing:
                 continue
-            attr = existing[name].attribute if name in existing else self._get_or_create_attribute(name)
+            attr = (
+                existing[name].attribute
+                if name in existing
+                else self._get_or_create_attribute(name, user=user)
+            )
             row = existing.get(name) or self._ensure_action_attribute(action, attr)
             entry = {
                 "timestamp": timestamp,
@@ -434,8 +653,9 @@ class GraphService:
         return applied
 
     def _action_vector(self, action: Action) -> Dict[str, float]:
+        user = self._resolve_owner_from_action(action)
         return {
-            row.attribute.name: row.score
+            self._display_attribute_name(user, row.attribute.name): row.score
             for row in ActionAttributeScore.objects.filter(action=action).select_related("attribute")
         }
 
@@ -489,8 +709,9 @@ class GraphService:
         return desired_attribute_updates
 
     def _action_attribute_history(self, action: Action) -> Dict[str, List[Dict[str, Any]]]:
+        user = self._resolve_owner_from_action(action)
         return {
-            row.attribute.name: list(row.history_stack or [])
+            self._display_attribute_name(user, row.attribute.name): list(row.history_stack or [])
             for row in ActionAttributeScore.objects.filter(action=action).select_related("attribute")
         }
 
@@ -536,20 +757,19 @@ class GraphService:
         edge.last_signal_kind = kind
         edge.save(update_fields=["score", "confidence", "touch_count", "last_signal_kind", "signal_history", "updated_at"])
 
-    def _build_graph_tensors(self) -> GraphTensors:
-        user = self._user()
-        attributes = list(Attribute.objects.all().order_by("name"))
-        actions = list(Action.objects.all().order_by("name"))
+    def _build_graph_tensors(self, user: MainUserProfile) -> GraphTensors:
+        attributes = list(self._attribute_queryset(user).order_by("name"))
+        actions = list(self._action_queryset(user).order_by("name"))
 
-        attr_names = [attr.name for attr in attributes]
-        action_names = [action.name for action in actions]
+        attr_names = [self._display_attribute_name(user, attr.name) for attr in attributes]
+        action_names = [self._display_action_name(user, action.name) for action in actions]
         attr_index = {name: idx for idx, name in enumerate(attr_names)}
         action_index = {name: idx for idx, name in enumerate(action_names)}
 
         attr_dim = max(512, len(attr_names) or 1)
         user_vector = torch.zeros(attr_dim, dtype=torch.float32)
         for row in UserAttributeScore.objects.filter(user=user).select_related("attribute"):
-            idx = attr_index.get(row.attribute.name)
+            idx = attr_index.get(self._display_attribute_name(user, row.attribute.name))
             if idx is not None:
                 user_vector[idx] = float(row.score)
 
@@ -557,30 +777,30 @@ class GraphService:
         if not actions:
             action_names = ["__no_action__"]
         else:
-            for row in ActionAttributeScore.objects.select_related("attribute", "action"):
-                a_idx = action_index.get(row.action.name)
-                attr_idx = attr_index.get(row.attribute.name)
+            for row in ActionAttributeScore.objects.filter(action__in=actions).select_related("attribute", "action"):
+                a_idx = action_index.get(self._display_action_name(user, row.action.name))
+                attr_idx = attr_index.get(self._display_attribute_name(user, row.attribute.name))
                 if a_idx is not None and attr_idx is not None:
                     action_matrix[a_idx, attr_idx] = float(row.score)
 
         user_action_weights = torch.zeros(max(len(actions), 1), dtype=torch.float32)
         if actions:
             for row in UserActionEdge.objects.filter(user=user).select_related("action"):
-                idx = action_index.get(row.action.name)
+                idx = action_index.get(self._display_action_name(user, row.action.name))
                 if idx is not None:
                     user_action_weights[idx] = float(row.score) * float(row.confidence)
 
         user_attr_weights = torch.zeros(attr_dim, dtype=torch.float32)
         for row in UserAttributeScore.objects.filter(user=user).select_related("attribute"):
-            idx = attr_index.get(row.attribute.name)
+            idx = attr_index.get(self._display_attribute_name(user, row.attribute.name))
             if idx is not None:
                 user_attr_weights[idx] = abs(float(row.score)) * float(row.confidence)
 
         action_attr_weights = torch.zeros((max(len(actions), 1), attr_dim), dtype=torch.float32)
         if actions:
-            for row in ActionAttributeScore.objects.select_related("attribute", "action"):
-                a_idx = action_index.get(row.action.name)
-                attr_idx = attr_index.get(row.attribute.name)
+            for row in ActionAttributeScore.objects.filter(action__in=actions).select_related("attribute", "action"):
+                a_idx = action_index.get(self._display_action_name(user, row.action.name))
+                attr_idx = attr_index.get(self._display_attribute_name(user, row.attribute.name))
                 if a_idx is not None and attr_idx is not None:
                     action_attr_weights[a_idx, attr_idx] = abs(float(row.score))
 
@@ -596,18 +816,17 @@ class GraphService:
         self._ensure_model(attr_dim)
         return graph
 
-    def _rank_actions(self) -> List[RankedAction]:
-        actions = list(Action.objects.all().order_by("name"))
+    def _rank_actions(self, user: MainUserProfile) -> List[RankedAction]:
+        actions = list(self._action_queryset(user).order_by("name"))
         if not actions:
             return []
-        graph = self._build_graph_tensors()
+        graph = self._build_graph_tensors(user)
         if self.model is None:
             return []
         self.model.eval()
         with torch.no_grad():
             outputs = self.model(graph)
         gnn_scores = outputs["scores"].detach().cpu().numpy().tolist()[: len(actions)]
-        user = self._user()
         user_vec = self._current_user_vector(user)
         direct = {row.action_id: row.score for row in UserActionEdge.objects.filter(user=user)}
 
@@ -630,13 +849,15 @@ class GraphService:
         ranked.sort(key=lambda item: item.score, reverse=True)
         return ranked
 
-    def _train_positive(self, action: Action) -> None:
-        actions = list(Action.objects.all().order_by("name"))
+    def _train_positive(self, user: MainUserProfile, action: Action) -> None:
+        actions = list(self._action_queryset(user).order_by("name"))
         if not actions:
             return
-        graph = self._build_graph_tensors()
+        graph = self._build_graph_tensors(user)
         try:
-            positive_index = [item.name for item in actions].index(action.name)
+            positive_index = [
+                self._display_action_name(user, item.name) for item in actions
+            ].index(self._display_action_name(user, action.name))
         except ValueError:
             return
         if self.trainer is not None:
@@ -645,7 +866,7 @@ class GraphService:
     def _top_candidates_payload(self, ranked: List[RankedAction], request_state: Dict[str, float]) -> List[Dict[str, Any]]:
         return [
             {
-                "name": item.action.name,
+                "name": self._display_action_name(self._resolve_owner_from_action(item.action), item.action.name),
                 "score": item.score,
                 "gnn_score": item.gnn_score,
                 "vector_similarity": item.vector_similarity,
@@ -657,10 +878,11 @@ class GraphService:
 
     def _rank_fetch_actions(
         self,
+        user: MainUserProfile,
         request_state: Dict[str, float],
         solution_state: Dict[str, float],
     ) -> List[Dict[str, Any]]:
-        ranked = self._rank_actions()
+        ranked = self._rank_actions(user)
         enriched: List[Dict[str, Any]] = []
         for item in ranked:
             action_vector = self._action_vector(item.action)
@@ -683,9 +905,10 @@ class GraphService:
         payload: List[Dict[str, Any]] = []
         for item in ranked[:10]:
             base: RankedAction = item["ranked"]
+            owner = self._resolve_owner_from_action(base.action)
             payload.append(
                 {
-                    "name": base.action.name,
+                    "name": self._display_action_name(owner, base.action.name),
                     "score": item["combined_fetch_score"],
                     "history_score": base.score,
                     "gnn_score": base.gnn_score,
@@ -700,7 +923,7 @@ class GraphService:
     def _action_payload(self, action: Action, user: MainUserProfile) -> Dict[str, Any]:
         edge = UserActionEdge.objects.filter(user=user, action=action).first()
         return {
-            "name": action.name,
+            "name": self._display_action_name(user, action.name),
             "description": action.description,
             "base_summary": action.base_summary,
             "attributes": self._action_vector(action),
@@ -759,7 +982,7 @@ class GraphService:
             "description": user.description,
             "attributes": [
                 {
-                    "name": row.attribute.name,
+                    "name": self._display_attribute_name(user, row.attribute.name),
                     "score": row.score,
                     "history_stack": list(row.history_stack or []),
                 }
@@ -768,9 +991,15 @@ class GraphService:
         }
 
     @transaction.atomic
-    def add_action_flow(self, prompt: str) -> Dict[str, Any]:
-        user = self._user()
-        plan = self._plan("add", prompt)
+    def add_action_flow(
+        self,
+        prompt: str,
+        *,
+        user_id: str | None = None,
+        phone_number: str | None = None,
+    ) -> Dict[str, Any]:
+        user, user_context = self._resolve_user_profile(user_id=user_id, phone_number=phone_number)
+        plan = self._plan("add", prompt, user=user)
         changed_user_state = self._update_user_state(user, plan, prompt, mode="add")
         current_user_state = self._current_user_vector(user)
         prompt_state = self._prompt_attribute_state(plan)
@@ -779,6 +1008,7 @@ class GraphService:
         candidate = plan.get("action_candidate") or {}
         action_name = (candidate.get("name") or "unnamed action").strip().lower()
         action = self._create_action_for_add(
+            user,
             name=action_name,
             description=candidate.get("description", ""),
             base_summary=plan.get("summary", ""),
@@ -804,6 +1034,7 @@ class GraphService:
         }
         full_action_update = {**request_state, **changed_user_state, **candidate_map}
         self._merge_into_action(
+            user,
             action,
             full_action_update,
             scale=1.0,
@@ -816,7 +1047,7 @@ class GraphService:
 
         background_updates: List[Dict[str, Any]] = []
         new_vector = self._action_vector(action)
-        for other in Action.objects.exclude(id=action.id):
+        for other in self._action_queryset(user).exclude(id=action.id):
             other_vector = self._action_vector(other)
             similarity = max(0.0, self._similarity(new_vector, other_vector))
             if similarity <= 0.0:
@@ -825,6 +1056,7 @@ class GraphService:
             if not overlap_payload:
                 continue
             applied = self._merge_into_action(
+                user,
                 other,
                 overlap_payload,
                 scale=similarity,
@@ -837,7 +1069,7 @@ class GraphService:
             if applied:
                 background_updates.append(
                     {
-                        "action": other.name,
+                        "action": self._display_action_name(user, other.name),
                         "relevance": similarity,
                         "applied_attributes": applied,
                     }
@@ -860,13 +1092,14 @@ class GraphService:
             plan=plan,
             changed_user_state=changed_user_state,
             request_state=request_state,
-            selected_action=action.name,
+            selected_action=self._display_action_name(user, action.name),
             background_updates=background_updates,
         )
-        self._train_positive(action)
+        self._train_positive(user, action)
 
         return {
             "mode": "add",
+            "user_context": user_context,
             "plan": plan,
             "attribute_catalog": self._attribute_inventory(user),
             "user": self._user_payload(user),
@@ -877,15 +1110,21 @@ class GraphService:
         }
 
     @transaction.atomic
-    def fetch_action_flow(self, prompt: str) -> Dict[str, Any]:
-        user = self._user()
-        plan = self._plan("fetch", prompt)
+    def fetch_action_flow(
+        self,
+        prompt: str,
+        *,
+        user_id: str | None = None,
+        phone_number: str | None = None,
+    ) -> Dict[str, Any]:
+        user, user_context = self._resolve_user_profile(user_id=user_id, phone_number=phone_number)
+        plan = self._plan("fetch", prompt, user=user)
         changed_user_state = self._update_user_state(user, plan, prompt, mode="fetch")
         current_user_state = self._current_user_vector(user)
         prompt_state = self._prompt_attribute_state(plan)
         request_state = self._request_state(current_user_state, prompt_state, changed_user_state)
         solution_state = self._prompt_solution_state(plan)
-        ranked = self._rank_fetch_actions(request_state, solution_state)
+        ranked = self._rank_fetch_actions(user, request_state, solution_state)
         if not ranked:
             self._record_user_interaction(
                 user,
@@ -899,6 +1138,7 @@ class GraphService:
             )
             return {
                 "mode": "fetch",
+                "user_context": user_context,
                 "plan": plan,
                 "attribute_catalog": self._attribute_inventory(user),
                 "user": self._user_payload(user),
@@ -917,6 +1157,7 @@ class GraphService:
         chosen.hit_count += 1
         chosen.save(update_fields=["hit_count", "updated_at"])
         self._merge_into_action(
+            user,
             chosen,
             request_state,
             scale=1.0,
@@ -949,6 +1190,7 @@ class GraphService:
             if not overlap_payload:
                 continue
             applied = self._merge_into_action(
+                user,
                 ranked_action.action,
                 overlap_payload,
                 scale=relevance,
@@ -961,7 +1203,7 @@ class GraphService:
             if applied:
                 background_updates.append(
                     {
-                        "action": ranked_action.action.name,
+                        "action": self._display_action_name(user, ranked_action.action.name),
                         "relevance": relevance,
                         "applied_attributes": applied,
                     }
@@ -974,18 +1216,19 @@ class GraphService:
             plan=plan,
             changed_user_state=changed_user_state,
             request_state=request_state,
-            selected_action=chosen.name,
+            selected_action=self._display_action_name(user, chosen.name),
             background_updates=background_updates,
         )
-        self._train_positive(chosen)
+        self._train_positive(user, chosen)
 
         return {
             "mode": "fetch",
+            "user_context": user_context,
             "plan": plan,
             "attribute_catalog": self._attribute_inventory(user),
             "user": self._user_payload(user),
             "result": {
-                "name": chosen.name,
+                "name": self._display_action_name(user, chosen.name),
                 "score": chosen_item["combined_fetch_score"],
                 "history_score": chosen_ranked.score,
                 "gnn_score": chosen_ranked.gnn_score,
@@ -1003,14 +1246,20 @@ class GraphService:
         }
 
     @transaction.atomic
-    def conversation_flow(self, prompt: str) -> Dict[str, Any]:
-        user = self._user()
-        plan = self._plan("conversation", prompt)
+    def conversation_flow(
+        self,
+        prompt: str,
+        *,
+        user_id: str | None = None,
+        phone_number: str | None = None,
+    ) -> Dict[str, Any]:
+        user, user_context = self._resolve_user_profile(user_id=user_id, phone_number=phone_number)
+        plan = self._plan("conversation", prompt, user=user)
         changed_user_state = self._update_user_state(user, plan, prompt, mode="conversation")
         current_user_state = self._current_user_vector(user)
         prompt_state = self._prompt_attribute_state(plan)
         request_state = self._request_state(current_user_state, prompt_state, changed_user_state)
-        ranked = self._rank_actions()
+        ranked = self._rank_actions(user)
 
         background_updates: List[Dict[str, Any]] = []
         for item in ranked:
@@ -1022,6 +1271,7 @@ class GraphService:
             if not overlap_payload:
                 continue
             applied = self._merge_into_action(
+                user,
                 item.action,
                 overlap_payload,
                 scale=relevance,
@@ -1034,7 +1284,7 @@ class GraphService:
             if applied:
                 background_updates.append(
                     {
-                        "action": item.action.name,
+                        "action": self._display_action_name(user, item.action.name),
                         "relevance": relevance,
                         "applied_attributes": applied,
                     }
@@ -1053,6 +1303,7 @@ class GraphService:
 
         return {
             "mode": "conversation",
+            "user_context": user_context,
             "plan": plan,
             "attribute_catalog": self._attribute_inventory(user),
             "user": self._user_payload(user),
@@ -1062,10 +1313,16 @@ class GraphService:
             "top_candidates": self._top_candidates_payload(ranked, request_state),
         }
 
-    def export_state(self) -> Dict[str, Any]:
-        user = self._user()
-        ranked = self._rank_actions()
+    def export_state(
+        self,
+        *,
+        user_id: str | None = None,
+        phone_number: str | None = None,
+    ) -> Dict[str, Any]:
+        user, user_context = self._resolve_user_profile(user_id=user_id, phone_number=phone_number)
+        ranked = self._rank_actions(user)
         return {
+            "user_context": user_context,
             "attribute_catalog": self._attribute_inventory(user),
             "user": {
                 "name": user.name,
@@ -1073,7 +1330,7 @@ class GraphService:
                 "state_history": list(user.state_history or []),
                 "attributes": [
                     {
-                        "name": row.attribute.name,
+                        "name": self._display_attribute_name(user, row.attribute.name),
                         "score": row.score,
                         "history_stack": list(row.history_stack or []),
                     }
@@ -1082,11 +1339,11 @@ class GraphService:
             },
             "actions": [
                 self._action_payload(action, user)
-                for action in Action.objects.all().order_by("name")
+                for action in self._action_queryset(user).order_by("name")
             ],
             "ranking": [
                 {
-                    "name": item.action.name,
+                    "name": self._display_action_name(user, item.action.name),
                     "score": item.score,
                     "gnn_score": item.gnn_score,
                     "vector_similarity": item.vector_similarity,
@@ -1097,13 +1354,29 @@ class GraphService:
         }
 
     @transaction.atomic
-    def reset_state(self) -> Dict[str, Any]:
-        UserActionEdge.objects.all().delete()
-        ActionAttributeScore.objects.all().delete()
-        UserAttributeScore.objects.all().delete()
-        Action.objects.all().delete()
-        Attribute.objects.all().delete()
-        MainUserProfile.objects.all().delete()
+    def reset_state(
+        self,
+        *,
+        user_id: str | None = None,
+        phone_number: str | None = None,
+        reset_all: bool = False,
+    ) -> Dict[str, Any]:
+        if reset_all:
+            UserActionEdge.objects.all().delete()
+            ActionAttributeScore.objects.all().delete()
+            UserAttributeScore.objects.all().delete()
+            Action.objects.all().delete()
+            Attribute.objects.all().delete()
+            MainUserProfile.objects.all().delete()
+        else:
+            user, _ = self._resolve_user_profile(user_id=user_id, phone_number=phone_number)
+            UserActionEdge.objects.filter(user=user).delete()
+            UserAttributeScore.objects.filter(user=user).delete()
+            self._action_queryset(user).delete()
+            self._attribute_queryset(user).delete()
+            user.state_history = []
+            user.description = ""
+            user.save(update_fields=["state_history", "description", "updated_at"])
         self.model = None
         self.trainer = None
-        return self.export_state()
+        return self.export_state(user_id=user_id, phone_number=phone_number)

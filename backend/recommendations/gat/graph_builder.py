@@ -39,7 +39,7 @@ def build_graph(
         [vector_to_list(profile.feature_vector, feature_names=feature_names) for profile in profiles],
         dtype=torch.float,
     )
-    x_for_graph = mask_feature_tensor(x, enabled_features)
+    x_for_graph = balance_feature_tensor(mask_feature_tensor(x, enabled_features))
 
     if use_social_edges:
         edges = list(SocialEdge.objects.filter(elder_a__in=profiles, elder_b__in=profiles))
@@ -158,3 +158,27 @@ def mask_feature_tensor(x: torch.Tensor, enabled_features: list[str] | None) -> 
         if feature_name not in enabled:
             masked[:, index] = 0.0
     return masked
+
+
+def balance_feature_tensor(
+    x: torch.Tensor,
+    *,
+    neutral_value: float = 0.5,
+    dominance_clip: float = 0.32,
+    min_scale: float = 0.85,
+    max_scale: float = 1.15,
+) -> torch.Tensor:
+    if x.numel() == 0:
+        return x
+
+    centered = x - neutral_value
+    # Compress extreme deviations so one feature cannot overwhelm graph similarity.
+    centered = torch.tanh(centered / max(dominance_clip, 1e-6)) * dominance_clip
+
+    # Lightly rebalance columns based on dataset spread without over-amplifying noise.
+    spread = centered.abs().mean(dim=0)
+    normalized_spread = spread / spread.mean().clamp_min(1e-6)
+    feature_scale = torch.rsqrt(normalized_spread.clamp_min(0.25))
+    feature_scale = feature_scale.clamp(min_scale, max_scale)
+
+    return centered * feature_scale.unsqueeze(0)

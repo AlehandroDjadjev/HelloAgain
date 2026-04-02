@@ -1,14 +1,22 @@
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.test import TestCase
+from django.test.utils import override_settings
 from django.utils import timezone
 
 from recommendations.models import ElderProfile, SocialEdge
 
-from .models import AccountProfile, FriendRequest, OnboardingDraft, RecommendationActivity
+from .models import (
+    AccountProfile,
+    ConnectionThread,
+    FriendRequest,
+    OnboardingDraft,
+    RecommendationActivity,
+)
 from .services import issue_token, recommend_profiles_for_viewer
 
 
@@ -75,6 +83,99 @@ class AccountApiTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["profile"]["user_id"], profile.user_id)
         self.assertEqual(payload["profile"]["phone_number"], "+359888111999")
+
+    @override_settings(ACCOUNT_JWT_TTL_SECONDS=3600)
+    def test_issue_token_sets_expected_jwt_expiration_and_jti(self):
+        profile = self._create_profile(
+            username="jwt-expiry-user",
+            email="jwt-expiry@example.com",
+            phone_number="+359888111998",
+            display_name="JWT Expiry User",
+        )
+
+        with patch("apps.accounts.services.time.time", return_value=1_710_000_000):
+            token = issue_token(profile.user)
+
+        _, payload_segment, _ = token.key.split(".")
+        payload = json.loads(_base64url_decode(payload_segment).decode("utf-8"))
+
+        self.assertEqual(payload["user_id"], profile.user_id)
+        self.assertEqual(payload["phone_number"], "+359888111998")
+        self.assertEqual(payload["jti"], token.session_key)
+        self.assertEqual(payload["iat"], 1_710_000_000)
+        self.assertEqual(payload["exp"], 1_710_003_600)
+        self.assertEqual(payload["exp"] - payload["iat"], 3600)
+
+    def test_profile_for_token_rejects_tampered_signature(self):
+        profile = self._create_profile(
+            username="jwt-tamper-user",
+            email="jwt-tamper@example.com",
+            phone_number="+359888111997",
+            display_name="JWT Tamper User",
+        )
+        token = issue_token(profile.user)
+        header_segment, payload_segment, signature_segment = token.key.split(".")
+        tampered_payload = payload_segment[:-1] + ("A" if payload_segment[-1] != "A" else "B")
+        tampered_token = f"{header_segment}.{tampered_payload}.{signature_segment}"
+
+        self.assertIsNone(profile_for_token(tampered_token))
+
+        response = self.client.get(
+            "/api/accounts/me/",
+            **{"HTTP_AUTHORIZATION": f"Token {tampered_token}"},
+        )
+        self.assertEqual(response.status_code, 401)
+
+    @override_settings(ACCOUNT_JWT_TTL_SECONDS=60)
+    def test_profile_for_token_rejects_expired_jwt(self):
+        profile = self._create_profile(
+            username="jwt-expired-user",
+            email="jwt-expired@example.com",
+            phone_number="+359888111996",
+            display_name="JWT Expired User",
+        )
+
+        with patch("apps.accounts.services.time.time", return_value=2_000_000_000):
+            token = issue_token(profile.user)
+
+        with patch("apps.accounts.services.time.time", return_value=2_000_000_061):
+            self.assertIsNone(profile_for_token(token.key))
+
+    def test_profile_for_token_rejects_revoked_jti_session(self):
+        profile = self._create_profile(
+            username="jwt-revoked-user",
+            email="jwt-revoked@example.com",
+            phone_number="+359888111995",
+            display_name="JWT Revoked User",
+        )
+        token = issue_token(profile.user)
+        AccountToken.objects.filter(user=profile.user).delete()
+
+        self.assertIsNone(profile_for_token(token.key))
+
+    def test_profile_for_token_rejects_future_issued_at(self):
+        profile = self._create_profile(
+            username="jwt-future-user",
+            email="jwt-future@example.com",
+            phone_number="+359888111994",
+            display_name="JWT Future User",
+        )
+        issued = issue_token(profile.user)
+        future_iat = int(time.time()) + 300
+        forged_token = _encode_account_jwt(
+            {
+                "sub": str(profile.user.pk),
+                "user_id": profile.user.pk,
+                "phone_number": profile.phone_number,
+                "display_name": profile.display_name,
+                "jti": issued.session_key,
+                "iat": future_iat,
+                "exp": future_iat + 3600,
+                "token_type": "hello_again_access",
+            }
+        )
+
+        self.assertIsNone(profile_for_token(forged_token))
 
     @patch("apps.accounts.views.seed_social_graph_for_profile")
     @patch("apps.accounts.views.sync_profile_to_recommendations")
@@ -938,4 +1039,165 @@ class AccountApiTests(TestCase):
             payload["board_object"]["extra_data"]["description"],
             sporty.description,
         )
+        self.assertTrue(payload["user"]["thread_id"])
+
+        sporty.refresh_from_db()
+        sporty_objects = sporty.whiteboard_state.get("objects", [])
+        self.assertEqual(len(sporty_objects), 1)
+        self.assertEqual(
+            sporty_objects[0]["extraData"]["user_id"],
+            viewer.user_id,
+        )
         mock_activity.assert_called_once()
+
+    def test_me_board_state_endpoint_persists_state(self):
+        viewer = self._create_profile(
+            username="board-user",
+            email="board@example.com",
+            display_name="Board User",
+            description="Keeps notes on the board.",
+        )
+
+        response = self.client.post(
+            "/api/accounts/me/board-state/",
+            data=json.dumps(
+                {
+                    "board_state": {
+                        "board": {"width": 800, "height": 600},
+                        "objects": [
+                            {
+                                "name": "note_1",
+                                "text": "Board note",
+                                "x": 42,
+                                "y": 64,
+                                "width": 180,
+                                "height": 140,
+                                "memoryType": "memory",
+                            }
+                        ],
+                    }
+                }
+            ),
+            content_type="application/json",
+            **self._auth_headers(viewer.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        get_response = self.client.get(
+            "/api/accounts/me/board-state/",
+            **self._auth_headers(viewer.user),
+        )
+        self.assertEqual(get_response.status_code, 200)
+        payload = get_response.json()
+        self.assertEqual(payload["board_state"]["objects"][0]["name"], "note_1")
+
+    def test_connection_thread_message_and_friendship_flow(self):
+        alice = self._create_profile(
+            username="alice-thread",
+            email="alice-thread@example.com",
+            display_name="Alice Thread",
+            phone_number="+359888100100",
+            description="Open and thoughtful.",
+        )
+        bob = self._create_profile(
+            username="bob-thread",
+            email="bob-thread@example.com",
+            display_name="Bob Thread",
+            phone_number="+359888100200",
+            description="Friendly and active.",
+        )
+        thread = ConnectionThread.objects.create(
+            participant_low=alice,
+            participant_high=bob,
+            created_by=alice,
+        )
+
+        send_message_response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/messages/",
+            data=json.dumps({"message": "Hey Bob, want to chat?"}),
+            content_type="application/json",
+            **self._auth_headers(alice.user),
+        )
+        self.assertEqual(send_message_response.status_code, 200)
+        self.assertEqual(
+            send_message_response.json()["thread"]["messages"][0]["text"],
+            "Hey Bob, want to chat?",
+        )
+
+        send_request_response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/friendship/",
+            data=json.dumps({"action": "send", "message": "Let us be friends"}),
+            content_type="application/json",
+            **self._auth_headers(alice.user),
+        )
+        self.assertEqual(send_request_response.status_code, 200)
+        self.assertEqual(
+            send_request_response.json()["thread"]["friend_status"],
+            "outgoing_pending",
+        )
+
+        accept_response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/friendship/",
+            data=json.dumps({"action": "accept"}),
+            content_type="application/json",
+            **self._auth_headers(bob.user),
+        )
+        self.assertEqual(accept_response.status_code, 200)
+        self.assertEqual(
+            accept_response.json()["thread"]["friend_status"],
+            "accepted",
+        )
+
+        alice.refresh_from_db()
+        bob.refresh_from_db()
+        alice_object = alice.whiteboard_state["objects"][0]
+        bob_object = bob.whiteboard_state["objects"][0]
+        self.assertTrue(alice_object["extraData"]["is_friend"])
+        self.assertTrue(bob_object["extraData"]["is_friend"])
+        self.assertEqual(
+            FriendRequest.objects.filter(status=FriendRequest.Status.ACCEPTED).count(),
+            1,
+        )
+
+    def test_reject_thread_removes_chat_for_both_users(self):
+        alice = self._create_profile(
+            username="reject-a",
+            email="reject-a@example.com",
+            display_name="Reject A",
+            description="Likes calm chats.",
+        )
+        bob = self._create_profile(
+            username="reject-b",
+            email="reject-b@example.com",
+            display_name="Reject B",
+            description="Also likes calm chats.",
+        )
+        thread = ConnectionThread.objects.create(
+            participant_low=alice,
+            participant_high=bob,
+            created_by=alice,
+        )
+        alice.whiteboard_state = {
+            "board": {"width": 1000, "height": 700},
+            "objects": [{"name": f"connection_thread_{thread.id}", "text": "Reject B"}],
+        }
+        alice.save(update_fields=["whiteboard_state"])
+        bob.whiteboard_state = {
+            "board": {"width": 1000, "height": 700},
+            "objects": [{"name": f"connection_thread_{thread.id}", "text": "Reject A"}],
+        }
+        bob.save(update_fields=["whiteboard_state"])
+
+        response = self.client.post(
+            f"/api/accounts/threads/{thread.id}/reject/",
+            data=json.dumps({}),
+            content_type="application/json",
+            **self._auth_headers(alice.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(ConnectionThread.objects.filter(pk=thread.id).exists())
+        alice.refresh_from_db()
+        bob.refresh_from_db()
+        self.assertEqual(alice.whiteboard_state["objects"], [])
+        self.assertEqual(bob.whiteboard_state["objects"], [])

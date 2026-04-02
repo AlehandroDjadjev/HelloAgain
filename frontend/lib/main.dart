@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'src/theme/app_theme.dart';
@@ -11,9 +10,6 @@ import 'src/screens/navigation_launcher_screen.dart';
 import 'src/services/deep_link_bridge.dart';
 import 'android_phone_number_hint.dart';
 import 'browser_voice_bridge.dart';
-import 'meetup_screen.dart';
-import 'voice_lab_screen.dart';
-import 'weather_screen.dart';
 import 'whitespace_app.dart' hide AgentBoardScreen;
 import 'whitespace_app.dart' as whitespace show AgentBoardScreen;
 
@@ -851,183 +847,15 @@ class AgentBoardScreen extends StatefulWidget {
 }
 
 class _AgentBoardScreenState extends State<AgentBoardScreen> {
-  int _selectedIndex = 0;
-
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: IndexedStack(
-        index: _selectedIndex,
-        children: [
-          whitespace.AgentBoardScreen(
-            userId: widget.userId,
-            accountToken: widget.accountToken,
-            welcomeText: widget.welcomeText,
-          ),
-          const VoiceLabScreen(),
-          const _LocationGate(
-            title: 'Weather',
-            message:
-                'Location access is needed to show the local weather forecast.',
-            childBuilder: _weatherBuilder,
-          ),
-          _LocationGate(
-            title: 'Meetup',
-            message:
-                'Location access is needed to suggest a good meetup place near you.',
-            childBuilder: (position) => _meetupBuilder(
-              position,
-              accountToken: widget.accountToken,
-            ),
-          ),
-        ],
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _selectedIndex,
-        onDestinationSelected: (value) {
-          setState(() {
-            _selectedIndex = value;
-          });
-        },
-        backgroundColor: const Color(0xFF162040),
-        indicatorColor: const Color(0xFF3B82F6).withValues(alpha: 0.25),
-        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.dashboard_outlined),
-            selectedIcon: Icon(Icons.dashboard),
-            label: 'Space',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.mic_none_rounded),
-            selectedIcon: Icon(Icons.mic_rounded),
-            label: 'Voice',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.wb_sunny_outlined),
-            selectedIcon: Icon(Icons.wb_sunny),
-            label: 'Weather',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.place_outlined),
-            selectedIcon: Icon(Icons.place),
-            label: 'Meetup',
-          ),
-        ],
-      ),
+    return whitespace.AgentBoardScreen(
+      userId: widget.userId,
+      accountToken: widget.accountToken,
+      welcomeText: widget.welcomeText,
     );
   }
 }
-
-class _LocationGate extends StatefulWidget {
-  const _LocationGate({
-    required this.title,
-    required this.message,
-    required this.childBuilder,
-  });
-
-  final String title;
-  final String message;
-  final Widget Function(Position position) childBuilder;
-
-  @override
-  State<_LocationGate> createState() => _LocationGateState();
-}
-
-class _LocationGateState extends State<_LocationGate> {
-  Future<Position>? _positionFuture;
-
-  @override
-  void initState() {
-    super.initState();
-    _positionFuture = _loadPosition();
-  }
-
-  Future<Position> _loadPosition() async {
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      throw StateError('Location services are turned off.');
-    }
-
-    var permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      throw StateError('Location permission was not granted.');
-    }
-
-    return Geolocator.getCurrentPosition();
-  }
-
-  void _retry() {
-    setState(() {
-      _positionFuture = _loadPosition();
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return FutureBuilder<Position>(
-      future: _positionFuture,
-      builder: (context, snapshot) {
-        if (snapshot.connectionState != ConnectionState.done) {
-          return Scaffold(
-            appBar: AppBar(title: Text(widget.title)),
-            body: const Center(child: CircularProgressIndicator()),
-          );
-        }
-
-        if (snapshot.hasData) {
-          return widget.childBuilder(snapshot.data!);
-        }
-
-        return Scaffold(
-          appBar: AppBar(title: Text(widget.title)),
-          body: Center(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.location_on_outlined, size: 48),
-                  const SizedBox(height: 16),
-                  Text(
-                    widget.message,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 18, height: 1.4),
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    snapshot.error?.toString() ?? 'Location is unavailable.',
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(color: Colors.black54),
-                  ),
-                  const SizedBox(height: 20),
-                  FilledButton(
-                    onPressed: _retry,
-                    child: const Text('Try again'),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-}
-
-Widget _weatherBuilder(Position position) =>
-    WeatherScreen(userPosition: position);
-
-Widget _meetupBuilder(
-  Position position, {
-  String? accountToken,
-}) =>
-    MeetupScreen(userPosition: position, accountToken: accountToken);
 
 class IntroOnboardingScreen extends StatefulWidget {
   const IntroOnboardingScreen({

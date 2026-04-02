@@ -111,6 +111,8 @@ CORE ACTION RULES:
 -When the user improves some negative scores on attributes on degrades positive scores we shouldnt directly chane the same attributes in actions. 
 Changes with them are about how the meaning of the action changes for the user. It should otherwise holds its history.
 
+The action name is ONLY the action that happened - context to how it happened is in its attributes.
+
 REQUIRED JSON SHAPE:
 {{
   "action_candidate": {{

@@ -10,6 +10,7 @@ from django.db import transaction
 
 from engine.llm_parser import QwenPromptParser
 from engine.qwen_worker_client import QwenWorkerClient
+from engine.user_context import ActiveUserTracker, normalize_phone_number
 
 from .models import AccountProfile
 from .services import (
@@ -25,6 +26,7 @@ from .services import (
     record_recommendation_activity,
     sync_profile_to_recommendations,
 )
+from .whiteboard_service import AccountWhiteboardService
 
 
 def _pretty_json(payload: Any) -> str:
@@ -39,11 +41,32 @@ class ConnectionsAgentService:
         "profile_notes",
     }
 
-    def __init__(self, *, qwen_client: QwenWorkerClient | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        qwen_client: QwenWorkerClient | None = None,
+        user_tracker: ActiveUserTracker | None = None,
+    ) -> None:
         self.qwen_client = qwen_client or QwenWorkerClient()
+        self.whiteboard_service = AccountWhiteboardService()
+        self.user_tracker = user_tracker or ActiveUserTracker()
 
     def resolve_profile(self, agent_user_id: str | None) -> AccountProfile:
-        clean = self._clean_text(agent_user_id) or "anonymous"
+        user_context = self.user_tracker.resolve(user_id=agent_user_id)
+        clean = self._clean_text(user_context.get("resolved_user_id")) or "anonymous"
+        normalized_phone = normalize_phone_number(user_context.get("phone_number"))
+
+        if normalized_phone:
+            profile = (
+                AccountProfile.objects.select_related("user", "elder_profile")
+                .filter(normalized_phone_number=normalized_phone)
+                .first()
+            )
+            if profile is not None:
+                if not profile.elder_profile_id:
+                    sync_profile_to_recommendations(profile, preserve_adaptation=False)
+                    profile.refresh_from_db()
+                return profile
 
         if clean.isdigit():
             profile = (
@@ -71,8 +94,10 @@ class ConnectionsAgentService:
         username = self._unique_username(clean)
         user = User.objects.create_user(username=username, email="")
         profile = ensure_account_profile(user)
+        if normalized_phone:
+            profile.phone_number = normalized_phone
         profile.display_name = self._display_name_from_identifier(clean)
-        profile.save()
+        profile.save(update_fields=["phone_number", "display_name"] if normalized_phone else ["display_name"])
         sync_profile_to_recommendations(profile, preserve_adaptation=False)
         return (
             AccountProfile.objects.select_related("user", "elder_profile")
@@ -166,6 +191,18 @@ class ConnectionsAgentService:
             }
 
         chosen = rows[0]
+        target = (
+            AccountProfile.objects.select_related("user", "elder_profile")
+            .filter(user_id=chosen["user_id"])
+            .first()
+        )
+        thread = None
+        if target is not None and target.pk != viewer.pk:
+            thread = self.whiteboard_service.ensure_thread(viewer, target)
+            self.whiteboard_service.sync_thread_objects(
+                thread,
+                exclude_profile_ids={viewer.id},
+            )
         user_payload = {
             "id": chosen["user_id"],
             "user_id": chosen["user_id"],
@@ -175,6 +212,7 @@ class ConnectionsAgentService:
             "friend_status": chosen.get("friend_status"),
             "match_percent": chosen.get("match_percent"),
             "raw_score": chosen.get("raw_score"),
+            "thread_id": thread.id if thread is not None else None,
         }
         return {
             "ok": True,
@@ -194,6 +232,10 @@ class ConnectionsAgentService:
                     "elder_profile_id": chosen.get("elder_profile_id"),
                     "display_name": chosen["display_name"],
                     "description": chosen["description"],
+                    "phone_number": target.phone_number if target is not None else "",
+                    "thread_id": thread.id if thread is not None else None,
+                    "friend_status": chosen.get("friend_status"),
+                    "is_friend": chosen.get("friend_status") == "accepted",
                 },
             },
             "message": f"Closest connection match is {chosen['display_name']}.",
@@ -223,6 +265,13 @@ class ConnectionsAgentService:
             signal_strength=0.14,
         )
         serialized = self._serialize_profile(target=target, viewer=viewer)
+        thread_payload = None
+        widget_type = "user_profile"
+        if viewer.pk != target.pk:
+            thread = self.whiteboard_service.ensure_thread(viewer, target)
+            self.whiteboard_service.sync_thread_objects(thread)
+            thread_payload = self.whiteboard_service.build_thread_payload(viewer, thread)
+            widget_type = "user_connection"
         summary = (
             (serialized.get("match_summary") or {}).get("friendship_summary")
             or serialized.get("description")
@@ -230,11 +279,32 @@ class ConnectionsAgentService:
             or "User profile"
         )
         return {
-            "widget_type": "user_profile",
+            "widget_type": widget_type,
             "title": serialized["display_name"],
             "summary": self._clean_text(summary),
             "user": serialized,
+            "thread": thread_payload,
         }
+
+    def load_board_state_for_user(self, user_id: str | None) -> Dict[str, Any] | None:
+        profile = self.whiteboard_service.resolve_profile(user_id)
+        if profile is None:
+            return None
+        return self.whiteboard_service.load_board_state_for_profile(profile)
+
+    def save_board_state_for_user(
+        self,
+        user_id: str | None,
+        board_state: Dict[str, Any] | None,
+    ) -> Dict[str, Any] | None:
+        return self.whiteboard_service.save_board_state_for_user(user_id, board_state)
+
+    def apply_board_commands_for_user(
+        self,
+        user_id: str | None,
+        commands: List[Dict[str, Any]],
+    ) -> Dict[str, Any] | None:
+        return self.whiteboard_service.apply_board_commands_for_user(user_id, commands)
 
     def _generate_profile_patch(
         self,
@@ -322,9 +392,15 @@ New user prompt:
         board_state: Dict[str, Any] | None,
     ) -> str:
         current_profile = self._profile_payload(profile)
-        fallback = prompt
+        profile_description = self._clean_text(
+            current_profile.get("effective_description") or current_profile.get("description")
+        )
+        fallback = " ".join(
+            segment for segment in [profile_description, prompt] if self._clean_text(segment)
+        ).strip() or prompt
         system_prompt = """
 You translate a request into a TEMPORARY search description for finding a helpful human connection.
+Build the temporary description from the current user's durable description plus the new prompt.
 Do not rewrite this as facts about the current user unless the prompt explicitly says them.
 Focus on the type of person, energy, interests, or support style that would fit the moment.
 If the whiteboard already holds user objects with extra data, use that as context.

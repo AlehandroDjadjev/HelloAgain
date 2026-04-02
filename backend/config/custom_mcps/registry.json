@@ -30,12 +30,13 @@
     {
       "id": "phone_command",
       "name": "phone_command",
-      "description": "Opens the Flutter phone command page with a provided prompt so the app can auto-run the prompt immediately.",
+      "description": "Prepares a phone-command launcher from a prompt so the board can create a clickable object that opens the Flutter phone command page.",
       "descriptor_file": "phone_command.json",
       "descriptor_url": "/api/agent/mcps/phone_command/",
       "notes": [
-        "Use this when the user should be sent directly into the stripped phone-command page in the Flutter app.",
+        "Use this when the user should get a clickable whiteboard object that launches the stripped phone-command page in the Flutter app.",
         "Pass the prompt exactly as the user wants it to run on the phone.",
+        "This MCP only prepares launch metadata and prompt data; the actual phone-command POST is delayed until the object is opened.",
         "This MCP is for launching the app flow, not for storing long-term memory or social profile data."
       ]
     }

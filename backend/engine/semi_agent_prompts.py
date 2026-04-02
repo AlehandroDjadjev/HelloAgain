@@ -11,6 +11,7 @@ def _pretty_json(payload: Dict[str, Any] | List[Any] | None) -> str:
 def build_step_one_mcp_prompt(
     *,
     registry: Dict[str, Any],
+    tool_catalog: Dict[str, Any],
     chain_history: List[Dict[str, Any]],
     board_state: Dict[str, Any],
 ) -> str:
@@ -22,7 +23,7 @@ First we run a sort of "mcp" layer. Now this doesnt use real mcps but exposes re
 The idea is to see where and how we can apply different stuff to drive a multiple step process - start with an abstract mcp then a another can be run ontop after.
 We still have to select if its even relevant for some as tools can be wildly different.
 But just be aware of the type of descition you are making - the first step of the reasoning process.
-Try and pick through the mcp list to get 1 used mcp (at least) per request.
+Stage 1 always runs. It must explicitly choose an MCP tool or explicitly choose no MCPs. Do not leave the tool decision implicit.
 If the whiteboard already has objects with `extraData`, that hidden metadata is part of the usable context too.
 Use both the user prompt and the board object extra data when deciding what MCP to use.
 
@@ -30,6 +31,24 @@ This is step 1.
 - Step 1 decides whether MCPs are needed and which MCP calls to make.
 - Step 2 waits for the MCP results, can recall stage 1, also does some work on processing them.
 - Keep the full JSON within 256 output tokens.
+- Choose the MCP tool whose descriptor most directly matches the request.
+- Do not invent a default MCP choice when you are unsure. If no MCP is justified, return `needs_mcps=false` and an empty `mcp_calls` array.
+- Requests about finding, matching, or connecting with a real person should prefer a people / connection tool over an emotion or action-memory tool.
+
+CONNECTION TOOL CHOICE RULES:
+- Use `connections.find_connection` when the user wants to find, match with, or connect to a real person.
+- Use `connections.update_profile` when the user reveals durable personal facts or preferences that should update their social profile.
+
+PHONE TOOL CHOICE RULES:
+- Use `phone_command.open_phone_command` when the request is about operating the phone, launching a phone flow, opening an app through the phone, or creating a clickable launcher object for a navigation / phone command prompt.
+- Prefer `phone_command.open_phone_command` over the social or GNN tools when the desired result is a phone-action launcher rather than memory, emotional analysis, or a real-person connection.
+- Pass the user's phone prompt through as the `prompt` argument with minimal rewriting.
+
+GNN TOOL CHOICE RULES:
+- Use `gnn_actions.add_action` when the user describes a concrete activity, behavior, or coping thing they did and it should become remembered action memory.
+- Use `gnn_actions.fetch_action` when the user needs a recommendation, what-fits-now suggestion, or action retrieval.
+- Use `gnn_actions.conversation` only when there is no meaningful new action to store and no recommendation to fetch. This should be rare.
+- If the user describes an activity that changed mood or energy, prefer `add_action` over `conversation`.
 
 Return exactly one JSON object and nothing else.
 
@@ -48,8 +67,8 @@ JSON shape:
   "mcp_calls": [
     {{
       "call_id": "gnn_actions.fetch_action.1",
-      "mcp_id": "gnn_actions",
-      "tool_name": "add_action|fetch_action|conversation",
+      "mcp_id": "gnn_actions|connections|phone_command",
+      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command",
       "arguments": {{
         "prompt": "prompt to send to the tool"
       }},
@@ -60,6 +79,9 @@ JSON shape:
 
 Current at-home MCP registry:
 {_pretty_json(registry)}
+
+Available MCP tools:
+{_pretty_json(tool_catalog)}
 
 Previous chain history:
 {_pretty_json(chain_history)}
@@ -75,6 +97,7 @@ def build_step_two_board_prompt(
     largest_empty_space: Dict[str, Any],
     step_one_plan: Dict[str, Any],
     mcp_results: List[Dict[str, Any]],
+    tool_catalog: Dict[str, Any],
     chain_history: List[Dict[str, Any]],
 ) -> str:
     return f"""
@@ -105,6 +128,10 @@ Available whiteboard actions:
 - "shrink" scales an object down.
 - "delete" removes an object.
 - "click" represents opening a result widget.
+- "click object" clicks an object by name and should be used when you want the board automation to open that object immediately.
+
+For requests with the phone mcp automatically add a click action on the created object that will redirect.
+When the widget carries a prompt in its body it should be auto opened.
 
 The idea is you have to make the appearance of a new object grand - shrink other objects, move them out the way and put it in the center. Interact with the board.
 Create a package of many continuos actions.
@@ -148,7 +175,7 @@ JSON shape:
   ],
   "board_commands": [
     {{
-      "action": "move|shrink|enlarge|create|delete",
+      "action": "move|shrink|enlarge|create|delete|click|click object",
       "name": "object name",
       "x": 0,
       "y": 0,
@@ -199,6 +226,9 @@ Step 1 plan:
 
 MCP results so far:
 {_pretty_json(mcp_results)}
+
+Available MCP tools:
+{_pretty_json(tool_catalog)}
 
 Previous chain history:
 {_pretty_json(chain_history)}

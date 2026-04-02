@@ -220,6 +220,13 @@ class ExecutionService:
         llm_mode = plan is None
 
         # ── Guards: terminal / paused ──────────────────────────────────────────
+        if session.status == SessionStatus.COMPLETED:
+            return NextActionResponse(
+                None,
+                "complete",
+                "",
+                "Session is already complete.",
+            )
         if session.status in SessionService.TERMINAL:
             return NextActionResponse(None, "abort", "", "Session is terminal.")
         if session.status == SessionStatus.PAUSED:
@@ -341,6 +348,8 @@ class ExecutionService:
         """
         llm_mode = plan is None
 
+        if session.status == SessionStatus.COMPLETED:
+            return ExecutionDecision("complete", reason="Session is already complete.")
         if session.status in SessionService.TERMINAL:
             return ExecutionDecision("abort", reason="Session is already terminal.")
 

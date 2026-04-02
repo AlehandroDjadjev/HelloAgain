@@ -274,6 +274,12 @@ class StepRunner {
       return false;
     }
 
+    if (decisionStatus == 'complete') {
+      _log('All steps complete.', LogLevel.success);
+      onComplete();
+      return false;
+    }
+
     return true;
   }
 

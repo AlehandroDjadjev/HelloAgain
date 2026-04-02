@@ -2,14 +2,14 @@
   "id": "phone_command",
   "protocol": "at_home_mcp",
   "kind": "backend_integrated_toolset",
-  "description": "This MCP opens the Flutter phone command page with a provided prompt and lets the app auto-run that prompt through the one-shot phone command flow.",
+  "description": "This MCP prepares a phone-command launcher from the given prompt so step 2 can create a board object that opens the Flutter phone command page on click. Use it on requests about operating the phone.",
   "invoke_url": "/api/agent/mcps/phone_command/invoke/",
   "tools": [
     {
       "name": "open_phone_command",
       "method": "POST",
-      "path": "/api/agent/phone-command/open/",
-      "description": "Use this when the user wants to jump straight into the stripped phone-command page with a prompt already filled in and auto-running.",
+      "path": "/api/agent/mcps/phone_command/invoke/",
+      "description": "Use this when the user should get a whiteboard object that opens the stripped phone-command page with the stored prompt. This invoke call only prepares launch metadata; the actual phone-command POST happens after the object is opened.",
       "body_schema": {
         "prompt": "string"
       }
