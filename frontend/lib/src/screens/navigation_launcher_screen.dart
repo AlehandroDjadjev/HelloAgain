@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:android_control_plugin/android_control_plugin.dart';
 import 'package:flutter/material.dart';
 
 import '../api/agent_client.dart';
@@ -32,7 +33,9 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
   late final PipelineOrchestrator _orch;
   final _overlayService = const NavigationOverlayService();
   bool _showDebug = false;
+  bool _accessibilityPermissionMissing = false;
   bool _overlayPermissionMissing = false;
+  bool _awaitingAccessibilityPermissionReturn = false;
   bool _awaitingOverlayPermissionReturn = false;
   bool _overlayVisible = false;
   bool _completionHandled = false;
@@ -52,7 +55,7 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     _orch = PipelineOrchestrator(
       client: AgentClient(baseUrl: resolveBackendBaseUrl()),
     )..addListener(_onOrchestratorChanged);
-    unawaited(_refreshOverlayPermissionState());
+    unawaited(_refreshPermissionState());
 
     if (widget.autoRunOnOpen) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -89,6 +92,10 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     if (state != AppLifecycleState.resumed) {
       return;
     }
+    if (_awaitingAccessibilityPermissionReturn) {
+      _awaitingAccessibilityPermissionReturn = false;
+      unawaited(_handleAccessibilityPermissionReturn());
+    }
     if (_awaitingOverlayPermissionReturn) {
       _awaitingOverlayPermissionReturn = false;
       unawaited(_handleOverlayPermissionReturn());
@@ -105,7 +112,7 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     }
 
     FocusScope.of(context).unfocus();
-    await _refreshOverlayPermissionState();
+    await _refreshPermissionState();
     await _showStartupOverlayIfPossible(prompt);
     await _runCommandFlow(prompt);
   }
@@ -123,6 +130,9 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
   }
 
   String _statusText() {
+    if (_accessibilityPermissionMissing && !_orch.phase.isRunning) {
+      return 'Enable Accessibility Control so Hello Again can operate the phone directly.';
+    }
     if (_overlayPermissionMissing && !_orch.phase.isRunning) {
       return 'The phone flow can still run, but the floating navigator bubble needs "Display over other apps" to appear outside the app.';
     }
@@ -150,19 +160,30 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     }
   }
 
-  Future<void> _refreshOverlayPermissionState() async {
-    if (!_overlayService.isSupported) {
-      return;
+  Future<void> _refreshPermissionState() async {
+    final permissionStatus = await PermissionChecker.getPermissionStatus();
+    final accessibilityMissing =
+        permissionStatus['accessibilityService'] != true;
+
+    var overlayMissing = false;
+    if (_overlayService.isSupported) {
+      final granted = await _overlayService.hasPermission();
+      overlayMissing = !granted;
     }
-    final granted = await _overlayService.hasPermission();
+
     if (!mounted) return;
     setState(() {
-      _overlayPermissionMissing = !granted;
+      _accessibilityPermissionMissing = accessibilityMissing;
+      _overlayPermissionMissing = overlayMissing;
     });
   }
 
+  Future<void> _handleAccessibilityPermissionReturn() async {
+    await _refreshPermissionState();
+  }
+
   Future<void> _handleOverlayPermissionReturn() async {
-    await _refreshOverlayPermissionState();
+    await _refreshPermissionState();
     if (!mounted || _overlayPermissionMissing || !_orch.phase.isRunning) {
       return;
     }
@@ -434,6 +455,26 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                 ],
                               ),
                             ),
+                            if (_accessibilityPermissionMissing) ...[
+                              const SizedBox(height: 10),
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: TextButton.icon(
+                                  onPressed: () async {
+                                    _awaitingAccessibilityPermissionReturn =
+                                        true;
+                                    await PermissionChecker
+                                        .openAccessibilitySettings();
+                                  },
+                                  icon: const Icon(
+                                    Icons.accessibility_new_rounded,
+                                  ),
+                                  label: const Text(
+                                    'Enable Accessibility Control',
+                                  ),
+                                ),
+                              ),
+                            ],
                             if (_overlayPermissionMissing) ...[
                               const SizedBox(height: 10),
                               Align(
