@@ -11,6 +11,7 @@ class _HelloAgainVoiceBridge {}
 
 extension _HelloAgainVoiceBridgeApi on _HelloAgainVoiceBridge {
   external bool isSpeechCaptureSupported();
+  external JSPromise<JSAny?> primeVoiceExperience();
   external JSPromise<JSString> captureAudioTurn(JSString language);
   external void stopRecognition();
   external JSPromise<JSAny?> playBase64Audio(
@@ -39,6 +40,10 @@ class BrowserVoiceBridge {
 
   bool get isSpeechRecognitionSupported =>
       _api?.isSpeechCaptureSupported() ?? false;
+
+  Future<void> primeVoiceExperience() async {
+    await _requireApi().primeVoiceExperience().toDart;
+  }
 
   Future<CapturedAudioTurn> captureAudioTurn({
     String language = 'bg-BG',

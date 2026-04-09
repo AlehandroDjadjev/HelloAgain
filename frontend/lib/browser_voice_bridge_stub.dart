@@ -15,6 +15,8 @@ class CapturedAudioTurn {
 class BrowserVoiceBridge {
   bool get isSpeechRecognitionSupported => false;
 
+  Future<void> primeVoiceExperience() async {}
+
   Future<CapturedAudioTurn> captureAudioTurn({
     String language = 'bg-BG',
   }) async {
