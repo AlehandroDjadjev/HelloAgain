@@ -161,7 +161,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   Future<void> _bootstrap() async {
     final prefs = await SharedPreferences.getInstance();
     final storedToken = prefs.getString(_tokenKey) ?? '';
-    final storedOnboardingSession = prefs.getString(_onboardingSessionKey) ?? '';
+    final storedOnboardingSession =
+        prefs.getString(_onboardingSessionKey) ?? '';
 
     AppAccountSession? session;
     if (storedToken.isNotEmpty) {
@@ -392,39 +393,26 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         return;
       }
     }
-
     if (_conversationMode == 'login_confirmation') {
       await _handleLoginConfirmation();
       return;
     }
-
     if (_isWorking && !_isConfirming) return;
     if (!mounted) return;
-
     setState(() {
       _waitingForManualVoiceStart = false;
       _transcriptPreview = '';
       _isWorking = true;
       _isListening = true;
       _isConfirming = false;
-      _statusText = 'Слушам Ви внимателно...';
+      _statusText = 'Listening closely...';
     });
-
     try {
-      final capturedTurn = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
-      final transcript = await _resolveCapturedTranscript(capturedTurn);
-      final cleanTranscript = transcript.trim();
-
-      if (cleanTranscript.isEmpty) {
-        throw StateError('Не беше разпозната реч.');
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _transcriptPreview = cleanTranscript;
-        _isListening = false;
-      });
-
+      final cleanTranscript = await _listenForOnboardingTranscript(
+        listeningStatus: 'Listening closely...',
+        retryStatus:
+            'Still listening. Say that one more time when you are ready.',
+      );
       final payload = await _backendClient.sendOnboardingTurn(
         sessionId: _onboardingSessionId,
         message: cleanTranscript,
@@ -436,7 +424,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         _isListening = false;
         _isWorking = false;
         _statusText =
-            'Не успях да чуя ясно. Натиснете веднъж и ще опитам отново.';
+            'I could not hear that clearly. I paused the mic for now.';
       });
     }
   }
@@ -532,8 +520,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         _isWorking = false;
         _isListening = false;
         _isConfirming = false;
-        _assistantReply =
-            'Не успях да взема телефонния номер от Android.';
+        _assistantReply = 'Не успях да взема телефонния номер от Android.';
         _statusText =
             'Android не успя да покаже избора за телефонен номер. Продължавам с гласовото въвеждане.';
       });
@@ -572,7 +559,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     setState(() {
       _phoneAccessGrantedThisSession = true;
       _phoneAccessChoice = _PhoneAccessChoice.allowAlways;
-      _statusText = 'Phone number access will stay allowed for future sessions.';
+      _statusText =
+          'Phone number access will stay allowed for future sessions.';
     });
     await _requestAndSubmitAndroidPhoneNumber();
   }
@@ -594,18 +582,13 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
 
   Future<bool> _askYesNo(String prompt) async {
     await _speakOnboardingText(prompt);
-
     while (mounted) {
-      setState(() {
-        _isListening = true;
-        _isConfirming = true;
-        _statusText = 'Моля, кажете само „да“ или „не“.';
-      });
-
-      final capturedTurn = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
-      final confirmation = await _resolveCapturedTranscript(capturedTurn);
+      final confirmation = await _listenForOnboardingTranscript(
+        listeningStatus: 'Please say just yes or no.',
+        retryStatus: 'Still listening. Please answer with yes or no.',
+        confirming: true,
+      );
       final normalized = _normalizeConfirmationAnswer(confirmation);
-
       if (normalized != null) {
         if (!mounted) return normalized;
         setState(() {
@@ -614,28 +597,80 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         });
         return normalized;
       }
-
       if (!mounted) return false;
       setState(() {
         _isListening = false;
-        _statusText = 'Не разбрах потвърждението. Ще попитам отново.';
+        _statusText = 'I did not catch the confirmation yet.';
       });
-      await _speakOnboardingText('Не разбрах. Моля, кажете само да или не.');
+      await _speakOnboardingText(
+        'I did not catch that. Please say only yes or no.',
+      );
     }
-
     return false;
+  }
+
+  Future<String> _listenForOnboardingTranscript({
+    required String listeningStatus,
+    required String retryStatus,
+    bool confirming = false,
+  }) async {
+    while (mounted && _stage == HelloAgainStage.onboarding) {
+      setState(() {
+        _isWorking = true;
+        _isListening = true;
+        _isConfirming = confirming;
+        _statusText = listeningStatus;
+      });
+      try {
+        final capturedTurn = await _voiceBridge.captureAudioTurn(
+          language: 'bg-BG',
+        );
+        final transcript = await _resolveCapturedTranscript(capturedTurn);
+        final cleanTranscript = transcript.trim();
+        if (cleanTranscript.isEmpty) {
+          throw StateError('No speech was recognized.');
+        }
+        if (!mounted) {
+          throw StateError('Onboarding was interrupted.');
+        }
+        setState(() {
+          _transcriptPreview = cleanTranscript;
+          _isListening = false;
+          _statusText = 'Heard you. Working on it...';
+        });
+        return cleanTranscript;
+      } catch (error) {
+        if (!_isRecoverableListeningError(error) ||
+            !mounted ||
+            _stage != HelloAgainStage.onboarding) {
+          rethrow;
+        }
+        setState(() {
+          _isListening = false;
+          _statusText = retryStatus;
+        });
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      }
+    }
+    throw StateError('Onboarding listening stopped.');
   }
 
   Future<void> _handleOnboardingPayload(
     Map<String, dynamic> payload, {
     required bool autoContinue,
   }) async {
-    final draft = Map<String, dynamic>.from(payload['draft'] as Map? ?? const {});
+    final draft = Map<String, dynamic>.from(
+      payload['draft'] as Map? ?? const {},
+    );
     final assistantReply = (payload['assistant_reply'] ?? '').toString().trim();
     final mode = (payload['mode'] ?? 'collecting').toString().trim();
-    final recognizedPhone = (payload['recognized_phone'] ?? '').toString().trim();
+    final recognizedPhone = (payload['recognized_phone'] ?? '')
+        .toString()
+        .trim();
     final token = (payload['token'] ?? '').toString().trim();
-    final profile = Map<String, dynamic>.from(payload['profile'] as Map? ?? const {});
+    final profile = Map<String, dynamic>.from(
+      payload['profile'] as Map? ?? const {},
+    );
     final sessionId = (draft['session_id'] ?? '').toString().trim();
 
     if (sessionId.isNotEmpty) {
@@ -662,8 +697,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     }
 
     if (token.isNotEmpty) {
-      final displayName = (profile['display_name'] ?? profile['name'] ?? 'Приятел')
-          .toString();
+      final displayName =
+          (profile['display_name'] ?? profile['name'] ?? 'Приятел').toString();
       final userId = int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0;
       await _prefs?.setString(_tokenKey, token);
       await _prefs?.remove(_onboardingSessionKey);
@@ -713,7 +748,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     }
   }
 
-  Future<String> _resolveCapturedTranscript(CapturedAudioTurn capturedTurn) async {
+  Future<String> _resolveCapturedTranscript(
+    CapturedAudioTurn capturedTurn,
+  ) async {
     final directTranscript = (capturedTurn.transcript ?? '').trim();
     if (directTranscript.isNotEmpty) {
       return directTranscript;
@@ -727,7 +764,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
           : _onboardingSessionId,
       language: capturedTurn.language,
     );
-    return (payload['transcript'] ?? payload['message'] ?? '').toString().trim();
+    return (payload['transcript'] ?? payload['message'] ?? '')
+        .toString()
+        .trim();
   }
 
   bool? _normalizeConfirmationAnswer(String transcript) {
@@ -749,14 +788,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       'добре',
       'става',
     };
-    const noWords = {
-      'не',
-      'no',
-      'wrong',
-      'грешно',
-      'повтори',
-      'отново',
-    };
+    const noWords = {'не', 'no', 'wrong', 'грешно', 'повтори', 'отново'};
 
     if (words.any(yesWords.contains)) {
       return true;
@@ -767,12 +799,25 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     return null;
   }
 
+  bool _isRecoverableListeningError(Object error) {
+    final lowered = error.toString().toLowerCase();
+    return lowered.contains('no speech') ||
+        lowered.contains('no-speech') ||
+        lowered.contains('timed out while listening for speech') ||
+        lowered.contains('did not return a transcript') ||
+        lowered.contains('no speech was recognized');
+  }
+
   Future<void> _speakOnboardingText(String text) async {
     try {
-      final payload = await _backendClient.speakText(text: text, language: 'bg-BG');
+      final payload = await _backendClient.speakText(
+        text: text,
+        language: 'bg-BG',
+      );
       final audioBase64 = (payload['audio_base64'] ?? '').toString().trim();
-      final mimeType =
-          (payload['audio_mime_type'] ?? 'audio/wav').toString().trim();
+      final mimeType = (payload['audio_mime_type'] ?? 'audio/wav')
+          .toString()
+          .trim();
       if (audioBase64.isNotEmpty) {
         await _voiceBridge.playBase64Audio(
           audioBase64: audioBase64,
@@ -789,9 +834,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   Widget build(BuildContext context) {
     switch (_stage) {
       case HelloAgainStage.booting:
-        return const Scaffold(
-          body: Center(child: CircularProgressIndicator()),
-        );
+        return const Scaffold(body: Center(child: CircularProgressIndicator()));
       case HelloAgainStage.intro:
         return IntroOnboardingScreen(
           showContinue: _showContinue,
@@ -810,8 +853,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
           isConfirming: _isConfirming,
           conversationMode: _conversationMode,
           showPhoneAccessChoices: _showPhoneAccessChoices,
-          retryLabel:
-              _shouldUseAndroidPhoneHint ? 'Избери номера' : 'Повтори разговора',
+          retryLabel: _shouldUseAndroidPhoneHint
+              ? 'Избери номера'
+              : 'Повтори разговора',
           onAllowPhoneThisTime: _allowPhoneAccessThisTime,
           onAllowPhoneAlways: _allowPhoneAccessAlways,
           onDenyPhoneAccess: _denyPhoneAccess,
@@ -1050,18 +1094,6 @@ class RegistrationScreen extends StatelessWidget {
         : isConfirming
         ? const Color(0xFF7A8B67)
         : const Color(0xFFC8B6A1);
-    final headlineText = showVoiceStartPrompt
-        ? 'Ready to hear about you.'
-        : assistantReply.isEmpty
-        ? 'ÐšÐ°Ð¶ÐµÑ‚Ðµ Ð¼Ð¸ Ð½ÐµÑ‰Ð¾ Ð·Ð° ÑÐµÐ±Ðµ ÑÐ¸, ÐºÐ°ÐºÑ‚Ð¾ Ð’Ð¸ Ðµ ÑƒÐ´Ð¾Ð±Ð½Ð¾.'
-        : assistantReply;
-    final bodyText = showPhoneAccessChoices
-        ? 'This step needs access to the phone number stored on the device. Without it, onboarding cannot continue.'
-        : showVoiceStartPrompt
-        ? 'Turn on your audio, raise the volume if needed, and tap Start when you are ready.'
-        : transcript.isEmpty
-        ? 'ÐšÐ¾Ð³Ð°Ñ‚Ð¾ ÑÑ‚Ðµ Ð³Ð¾Ñ‚Ð¾Ð²Ð¸, Ð³Ð¾Ð²Ð¾Ñ€ÐµÑ‚Ðµ ÑÐ¿Ð¾ÐºÐ¾Ð¹Ð½Ð¾. ÐÐ· Ñ‰Ðµ Ð¿Ñ€Ð¾Ð´ÑŠÐ»Ð¶Ð° Ñ€Ð°Ð·Ð³Ð¾Ð²Ð¾Ñ€Ð°.'
-        : transcript;
     final actionLabel = showVoiceStartPrompt ? 'Start' : retryLabel;
 
     final statusLabel = isListening
@@ -1180,11 +1212,15 @@ class RegistrationScreen extends StatelessWidget {
                           SizedBox(
                             width: double.infinity,
                             child: FilledButton(
-                              onPressed: isWorking ? null : onAllowPhoneThisTime,
+                              onPressed: isWorking
+                                  ? null
+                                  : onAllowPhoneThisTime,
                               style: FilledButton.styleFrom(
                                 backgroundColor: const Color(0xFFB56B4D),
                                 foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 16,
+                                ),
                                 shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(18),
                                 ),
@@ -1205,7 +1241,9 @@ class RegistrationScreen extends StatelessWidget {
                               onPressed: isWorking ? null : onAllowPhoneAlways,
                               style: FilledButton.styleFrom(
                                 foregroundColor: const Color(0xFF6B5444),
-                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 16,
+                                ),
                                 shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(18),
                                 ),
@@ -1226,8 +1264,12 @@ class RegistrationScreen extends StatelessWidget {
                               onPressed: isWorking ? null : onDenyPhoneAccess,
                               style: OutlinedButton.styleFrom(
                                 foregroundColor: const Color(0xFF6B5444),
-                                side: const BorderSide(color: Color(0xFFD6C4B2)),
-                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                side: const BorderSide(
+                                  color: Color(0xFFD6C4B2),
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 16,
+                                ),
                                 shape: RoundedRectangleBorder(
                                   borderRadius: BorderRadius.circular(18),
                                 ),
@@ -1295,7 +1337,9 @@ class RegistrationScreen extends StatelessWidget {
                             ],
                           )
                         : Text(
-                            isWorking && !isConfirming ? 'Please wait...' : actionLabel,
+                            isWorking && !isConfirming
+                                ? 'Please wait...'
+                                : actionLabel,
                             style: const TextStyle(
                               fontSize: 18,
                               fontWeight: FontWeight.w700,
@@ -1326,26 +1370,17 @@ class _WarmPaperBackground extends StatelessWidget {
         Positioned(
           top: -28,
           right: -10,
-          child: _BackdropOrb(
-            diameter: 180,
-            color: const Color(0xFFE8D7C6),
-          ),
+          child: _BackdropOrb(diameter: 180, color: const Color(0xFFE8D7C6)),
         ),
         Positioned(
           top: 120,
           left: -46,
-          child: _BackdropOrb(
-            diameter: 128,
-            color: const Color(0xFFE3D4C3),
-          ),
+          child: _BackdropOrb(diameter: 128, color: const Color(0xFFE3D4C3)),
         ),
         Positioned(
           bottom: -44,
           right: 18,
-          child: _BackdropOrb(
-            diameter: 168,
-            color: const Color(0xFFDDCBB8),
-          ),
+          child: _BackdropOrb(diameter: 168, color: const Color(0xFFDDCBB8)),
         ),
         Positioned.fill(
           child: DecoratedBox(
@@ -1362,10 +1397,7 @@ class _WarmPaperBackground extends StatelessWidget {
 }
 
 class _BackdropOrb extends StatelessWidget {
-  const _BackdropOrb({
-    required this.diameter,
-    required this.color,
-  });
+  const _BackdropOrb({required this.diameter, required this.color});
 
   final double diameter;
   final Color color;

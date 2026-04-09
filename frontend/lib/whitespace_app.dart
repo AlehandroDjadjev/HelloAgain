@@ -263,7 +263,8 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
 
     if (widget.launchConfig.launchBoardDirectly) {
       return _ResolvedWhitespaceLaunch.guest(
-        userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
+        userId:
+            widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
         displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
         welcomeText:
             'Whitespace board launched directly. Onboarding was skipped for this entrypoint.',
@@ -374,7 +375,8 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
           if (!mounted) return;
           setState(() {
             _isListening = false;
-            _statusText = 'I could not hear the answer clearly. Repeating the question.';
+            _statusText =
+                'I could not hear the answer clearly. Repeating the question.';
           });
           continue;
         }
@@ -454,9 +456,12 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
 
       setState(() {
         _isListening = false;
-        _statusText = 'I did not understand the confirmation. I will ask again.';
+        _statusText =
+            'I did not understand the confirmation. I will ask again.';
       });
-      await _speakOnboardingText('I did not understand. Please say only yes or no.');
+      await _speakOnboardingText(
+        'I did not understand. Please say only yes or no.',
+      );
     }
 
     return false;
@@ -555,13 +560,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
         .where((item) => item.isNotEmpty)
         .toList();
 
-    const yesWords = {
-      'yes',
-      'yep',
-      'correct',
-      'right',
-      'okay',
-    };
+    const yesWords = {'yes', 'yep', 'correct', 'right', 'okay'};
     const noWords = {'no', 'wrong', 'repeat', 'again'};
 
     if (words.any(yesWords.contains)) {
@@ -1169,6 +1168,7 @@ class AppAccountSession {
     );
   }
 }
+
 class AgentBoardScreen extends StatefulWidget {
   const AgentBoardScreen({
     super.key,
@@ -1356,7 +1356,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     if (!_voiceBridge.isSpeechRecognitionSupported) {
       setState(() {
         _statusText =
-            'Always-listening voice is unavailable here. Open the app in a supported Chrome browser to use hands-free mode.';
+            'Always-listening voice is unavailable on this device right now.';
       });
       return;
     }
@@ -1383,8 +1383,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     if (_isBusy) return;
     if (!_voiceBridge.isSpeechRecognitionSupported) {
       setState(() {
-        _statusText =
-            'Chrome speech input is unavailable here. Open the web app in a supported Chrome browser.';
+        _statusText = 'Speech input is unavailable on this device right now.';
       });
       return;
     }
@@ -1870,6 +1869,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     final lowered = error.toString().toLowerCase();
     return lowered.contains('no speech') ||
         lowered.contains('no-speech') ||
+        lowered.contains('timed out while listening for speech') ||
         lowered.contains('did not return a transcript') ||
         lowered.contains('aborted') ||
         lowered.contains('audio capture aborted');
@@ -2039,7 +2039,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                               decoration: InputDecoration(
                                 hintText: _isListening
                                     ? (kIsWeb
-                                          ? 'Listening in the browser...'
+                                          ? 'Listening in the app...'
                                           : 'Listening on your phone...')
                                     : _voiceLoopEnabled
                                     ? 'Voice mode is on. Speak your next request...'
@@ -2921,7 +2921,10 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> fetchBoardMemory({String? token, String? userId}) {
+  Future<Map<String, dynamic>> fetchBoardMemory({
+    String? token,
+    String? userId,
+  }) {
     final cleanToken = (token ?? '').trim();
     if (cleanToken.isNotEmpty) {
       return _getJson('/api/accounts/me/board-state/', token: cleanToken);

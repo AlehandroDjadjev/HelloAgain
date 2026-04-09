@@ -43,7 +43,7 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
   Uint8List? _lastAudio;
   String _lastMimeType = 'audio/wav';
   String _status = kIsWeb
-      ? 'Tap start to enable the microphone in Chrome.'
+      ? 'Tap start to enable the microphone in the browser.'
       : 'Ready. Tap start when you want to test voice.';
   String _language = 'bg-BG';
   String? _error;
@@ -131,7 +131,7 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
       if (!await recorder.hasPermission()) {
         throw VoiceGatewayException(
           _requiresManualStart
-              ? 'Chrome microphone permission is required.'
+              ? 'Browser microphone permission is required.'
               : 'Microphone permission is required for always-listening mode.',
         );
       }
@@ -413,7 +413,7 @@ class _VoiceLabScreenState extends State<VoiceLabScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(_requiresManualStart ? 'Chrome mode' : 'Mobile mode'),
+                    Text(_requiresManualStart ? 'Browser mode' : 'Mobile mode'),
                     const SizedBox(height: 8),
                     Text(_status),
                     const SizedBox(height: 12),
