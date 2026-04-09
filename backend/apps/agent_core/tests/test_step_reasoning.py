@@ -361,6 +361,80 @@ class StepReasoningServiceTests(SimpleTestCase):
         self.assertEqual(result.action_type, "TYPE_TEXT")
         self.assertAlmostEqual(result.confidence, 0.91)
 
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
+    def test_reason_next_step_marks_chat_goal_complete_when_thread_is_already_open(self, mock_from_settings):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "TAP_ELEMENT",
+            "params": {"selector": {"element_ref": "send_btn"}},
+            "reasoning": "The chat thread is open, tap the send area.",
+            "confidence": 0.67,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_settings.return_value = mock_client
+
+        screen_state = _screen(
+            [
+                _node("title", "android.widget.TextView", text="Alex"),
+                _node("message_box", "android.widget.EditText", cdesc="Message", clickable=True, editable=True),
+                _node("send_btn", "android.widget.ImageButton", cdesc="Send", clickable=True),
+            ]
+        )
+        screen_state["foreground_package"] = "com.viber.voip"
+        screen_state["window_title"] = "Alex"
+
+        service = StepReasoningService()
+        result = service.reason_next_step(
+            goal="Open the Alex chat in Viber",
+            target_app="com.viber.voip",
+            entities={"recipient": "Alex"},
+            screen_state=screen_state,
+            step_history=[{"action_type": "OPEN_APP", "result_success": True}],
+            constraints={"max_steps_remaining": 6},
+        )
+
+        self.assertTrue(result.is_goal_complete)
+        self.assertIn("conversation interface is already open", result.reasoning)
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
+    def test_reason_next_step_does_not_auto_complete_send_goal(self, mock_from_settings):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "TAP_ELEMENT",
+            "params": {"selector": {"element_ref": "send_btn"}},
+            "reasoning": "The draft is ready to send.",
+            "confidence": 0.88,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_settings.return_value = mock_client
+
+        screen_state = _screen(
+            [
+                _node("title", "android.widget.TextView", text="Alex"),
+                _node("message_box", "android.widget.EditText", text="Running late", clickable=True, editable=True, focused=True),
+                _node("send_btn", "android.widget.ImageButton", cdesc="Send", clickable=True),
+            ],
+            focused="message_box",
+        )
+        screen_state["foreground_package"] = "com.whatsapp"
+        screen_state["window_title"] = "Alex"
+
+        service = StepReasoningService()
+        result = service.reason_next_step(
+            goal="Send Alex a WhatsApp message",
+            target_app="com.whatsapp",
+            entities={"recipient": "Alex"},
+            screen_state=screen_state,
+            step_history=[{"action_type": "TYPE_TEXT", "result_success": True}],
+            constraints={"max_steps_remaining": 3},
+        )
+
+        self.assertFalse(result.is_goal_complete)
+
     def test_normalize_reasoned_step_prefers_focus_for_unfocused_editable(self):
         step = _normalize_reasoned_step(
             ReasonedStep(

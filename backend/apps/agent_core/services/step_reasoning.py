@@ -91,6 +91,25 @@ _APP_CONTEXT_HINTS: dict[str, str] = {
     ),
 }
 
+_COMPLETION_BLOCKING_TERMS = frozenset({
+    "send",
+    "submit",
+    "confirm",
+    "delete",
+    "pay",
+    "purchase",
+    "call",
+    "dial",
+    "post",
+    "publish",
+    "upload",
+    "share",
+    "reply",
+    "text ",
+    "message ",
+    "email ",
+})
+
 @dataclass
 class ReasonedStep:
     action_type: str
@@ -262,6 +281,14 @@ class StepReasoningService:
             screen_state=screen_state,
             entities=entities,
             goal=goal,
+        )
+        step = _apply_completion_override(
+            step=step,
+            goal=goal,
+            target_app=target_app,
+            entities=entities,
+            screen_state=screen_state,
+            step_history=step_history,
         )
         aligned_selector = step.params.get("selector") or {}
         if original_selector != aligned_selector:
@@ -757,12 +784,19 @@ def _align_step_to_visible_text_target(
         return step
 
     chosen_node = _find_matching_node(screen_state, selector)
+    if (
+        chosen_node
+        and bool(chosen_node.get("clickable"))
+        and _node_has_explicit_label(chosen_node)
+        and not _node_matches_any_target(screen_state, chosen_node, target_terms)
+    ):
+        return step
 
     # If the LLM already picked a clickable node, its choice is deliberate.
     # Alignment exists to redirect non-clickable text nodes to their clickable
     # parent containers — it must not override a valid clickable choice.
-    if chosen_node and bool(chosen_node.get("clickable")):
-        return step
+    # Keep evaluating candidates even when the original selector points at a
+    # clickable row so we can correct mis-targeted taps to the better match.
 
     candidates = _find_matching_tap_candidates(screen_state, target_terms)
     if not candidates:
@@ -792,7 +826,27 @@ def _align_step_to_visible_text_target(
                 and chosen_score is not None
                 and best.get("_match_score", chosen_score) >= chosen_score
             ):
-                return step
+                correction = (
+                    f"Kept tap target {chosen_node.get('ref')} because its visible label matches "
+                    f"the requested text ({chosen_term})."
+                )
+                reasoning = str(step.reasoning or "").strip()
+                if correction not in reasoning:
+                    reasoning = f"{reasoning} {correction}".strip() if reasoning else correction
+                return ReasonedStep(
+                    action_type=step.action_type,
+                    params=step.params,
+                    reasoning=reasoning,
+                    confidence=step.confidence,
+                    is_goal_complete=step.is_goal_complete,
+                    requires_confirmation=step.requires_confirmation,
+                    sensitivity=step.sensitivity,
+                    raw_llm_response=step.raw_llm_response,
+                    validation_attempts=step.validation_attempts,
+                    source=step.source,
+                    fallback_mode=step.fallback_mode,
+                    llm_failure_reason=step.llm_failure_reason,
+                )
 
     chosen = candidates[0]
     reasoning = str(step.reasoning or "").strip()
@@ -913,6 +967,13 @@ def _find_matching_tap_candidates(screen_state: dict, target_terms: list[str]) -
 def _node_matches_any_target(screen_state: dict, node: dict, target_terms: list[str]) -> bool:
     label = _node_effective_label(screen_state, node)
     return bool(_match_term(label, target_terms))
+
+
+def _node_has_explicit_label(node: dict) -> bool:
+    return bool(
+        str(node.get("text") or "").strip()
+        or str(node.get("content_desc") or "").strip()
+    )
 
 
 def _node_effective_label(screen_state: dict, node: dict, index: Optional[int] = None) -> str:
@@ -1314,6 +1375,196 @@ def _build_app_context(target_app: str, screen_state: dict) -> str:
             f"{common_elements}"
         )
     return f"{executor.__class__.__name__} classifies this screen as '{screen_hint}'."
+
+
+def _apply_completion_override(
+    *,
+    step: ReasonedStep,
+    goal: str,
+    target_app: str,
+    entities: dict,
+    screen_state: dict,
+    step_history: list[dict],
+) -> ReasonedStep:
+    if step.is_goal_complete:
+        return step
+    if step.requires_confirmation or step.action_type == ActionType.REQUEST_CONFIRMATION.value:
+        return step
+
+    completion_reason = _infer_goal_completion_reason(
+        goal=goal,
+        target_app=target_app,
+        entities=entities,
+        screen_state=screen_state,
+        step_history=step_history,
+    )
+    if not completion_reason:
+        return step
+
+    reasoning = str(step.reasoning or "").strip()
+    if completion_reason not in reasoning:
+        reasoning = f"{reasoning} {completion_reason}".strip() if reasoning else completion_reason
+
+    return ReasonedStep(
+        action_type=step.action_type,
+        params=step.params,
+        reasoning=reasoning,
+        confidence=max(step.confidence, 0.86),
+        is_goal_complete=True,
+        requires_confirmation=False,
+        sensitivity=step.sensitivity,
+        raw_llm_response=step.raw_llm_response,
+        validation_attempts=step.validation_attempts,
+        source=step.source,
+        fallback_mode=step.fallback_mode,
+        llm_failure_reason=step.llm_failure_reason,
+    )
+
+
+def _infer_goal_completion_reason(
+    *,
+    goal: str,
+    target_app: str,
+    entities: dict,
+    screen_state: dict,
+    step_history: list[dict],
+) -> str:
+    foreground_package = str(screen_state.get("foreground_package") or "").strip()
+    if not target_app or foreground_package != target_app:
+        return ""
+
+    goal_text = _normalize_free_text(goal)
+    if _goal_contains_blocking_action(goal_text):
+        return ""
+
+    screen_hint = _infer_executor_screen_hint(target_app, screen_state)
+    target_terms = _extract_target_terms(entities or {}, goal)
+    mentions_target = not target_terms or _screen_mentions_target(screen_state, target_terms)
+
+    if _goal_requests_navigation_destination(goal_text):
+        if screen_hint in {"route_preview", "navigation_active"} or _looks_like_maps_destination_ready(screen_state):
+            return "The requested navigation destination is already open on the current screen, so the goal can complete now."
+
+    if _goal_requests_compose_interface(goal_text):
+        if screen_hint == "compose_open" or _looks_like_compose_interface(screen_state):
+            return "The requested compose interface is already open to an acceptable degree, so the goal can complete now."
+
+    if _goal_requests_chat_interface(goal_text):
+        if (screen_hint == "chat_thread" or _looks_like_chat_interface(screen_state)) and mentions_target:
+            return "The requested chat or conversation interface is already open to an acceptable degree, so the goal can complete now."
+
+    if _goal_requests_app_open_only(goal_text):
+        if step_history or target_app == foreground_package:
+            return "The requested app destination is already open in the foreground, so no further phone actions are needed."
+
+    return ""
+
+
+def _infer_executor_screen_hint(target_app: str, screen_state: dict) -> str:
+    executor = get_executor(target_app)
+    if executor is None:
+        return ""
+    try:
+        return str(executor.infer_screen_hint(screen_state or {}) or "").strip().lower()
+    except Exception:
+        logger.exception("Executor screen hint failed for '%s' during completion inference", target_app)
+        return ""
+
+
+def _goal_contains_blocking_action(goal_text: str) -> bool:
+    return any(term in goal_text for term in _COMPLETION_BLOCKING_TERMS)
+
+
+def _goal_requests_navigation_destination(goal_text: str) -> bool:
+    return any(term in goal_text for term in ("navigate", "directions", "route", "drive to", "go to "))
+
+
+def _goal_requests_compose_interface(goal_text: str) -> bool:
+    return any(term in goal_text for term in ("compose", "draft", "write email", "new email"))
+
+
+def _goal_requests_chat_interface(goal_text: str) -> bool:
+    return any(term in goal_text for term in ("open chat", "chat", "conversation", "thread", "contact"))
+
+
+def _goal_requests_app_open_only(goal_text: str) -> bool:
+    if not any(term in goal_text for term in ("open", "launch", "start", "bring up")):
+        return False
+    if any(
+        term in goal_text for term in (
+            "take",
+            "photo",
+            "record",
+            "scan",
+            "tap",
+            "click",
+            "select",
+            "choose",
+            "type",
+            "play",
+            "watch",
+            "listen",
+            "upload",
+            "download",
+        )
+    ):
+        return False
+    if _goal_requests_navigation_destination(goal_text):
+        return False
+    if _goal_requests_compose_interface(goal_text):
+        return False
+    if _goal_requests_chat_interface(goal_text):
+        return False
+    if "search" in goal_text or "find " in goal_text or "look up" in goal_text:
+        return False
+    return True
+
+
+def _screen_mentions_target(screen_state: dict, target_terms: list[str]) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    return any(_normalize_free_text(term) in screen_text for term in target_terms if term.strip())
+
+
+def _looks_like_chat_interface(screen_state: dict) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    nodes = screen_state.get("nodes") or []
+    has_editable = any(bool(node.get("editable")) for node in nodes if isinstance(node, dict))
+    has_send = "send" in screen_text
+    has_message = "message" in screen_text or "type a message" in screen_text
+    return has_editable and (has_send or has_message)
+
+
+def _looks_like_compose_interface(screen_state: dict) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    nodes = [node for node in (screen_state.get("nodes") or []) if isinstance(node, dict)]
+    editable_count = sum(1 for node in nodes if bool(node.get("editable")))
+    return editable_count >= 2 or any(term in screen_text for term in ("compose", "subject", "\nto\n", " to "))
+
+
+def _looks_like_maps_destination_ready(screen_state: dict) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    if "end route" in screen_text or "exit navigation" in screen_text or "overview" in screen_text:
+        return True
+    return "start" in screen_text and "directions" in screen_text
+
+
+def _screen_text_blob(screen_state: dict) -> str:
+    parts: list[str] = [str(screen_state.get("window_title") or "")]
+    for node in screen_state.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        parts.extend([
+            str(node.get("text") or ""),
+            str(node.get("content_desc") or ""),
+            str(node.get("view_id") or ""),
+        ])
+    return "\n".join(part for part in parts if part)
+
+
+def _normalize_free_text(value: str) -> str:
+    lowered = str(value or "").casefold()
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in lowered)
+    return " ".join(cleaned.split())
 
 
 def _normalize_recovery_action(recovery: Optional[dict]) -> Optional[dict]:

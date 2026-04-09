@@ -564,6 +564,37 @@ class LLMExecutionLoopTests(TestCase):
         self.assertEqual(resumed.status, "complete")
 
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_open_chat_session_exits_when_destination_screen_is_already_reached(self, mock_from_reasoning_provider):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "TAP_ELEMENT",
+            "params": {"selector": {"element_ref": "send_btn"}},
+            "reasoning": "The requested chat is visible, so tap inside it.",
+            "confidence": 0.62,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_reasoning_provider.return_value = mock_client
+
+        session = self._make_session("Open the Alex chat in Viber", "com.viber.voip")
+        open_chat_screen = _screen(
+            "com.viber.voip",
+            "Alex",
+            "chat-thread",
+            [
+                _node("title", "android.widget.TextView", text="Alex"),
+                _node("message_box", "android.widget.EditText", cdesc="Message", editable=True),
+                _node("send_btn", "android.widget.ImageButton", cdesc="Send", clickable=True),
+            ],
+        )
+
+        response = ExecutionService.get_next_action(session, plan=None, screen_state=open_chat_screen)
+
+        self.assertEqual(response.status, "complete")
+        self.assertIn("conversation interface is already open", response.reasoning)
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
     def test_circuit_breaker_trips(self, mock_from_reasoning_provider):
         mock_client = MagicMock()
         mock_client.generate.return_value = {
