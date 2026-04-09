@@ -28,10 +28,10 @@ class BrowserVoiceBridge {
 
   static const int _sampleRate = 16000;
   static const int _channels = 1;
-  static const double _speechThreshold = 0.045;
-  static const Duration _maxTurnLength = Duration(seconds: 18);
-  static const Duration _minTurnLength = Duration(milliseconds: 700);
-  static const Duration _silenceWindow = Duration(milliseconds: 1800);
+  static const double _speechThreshold = 0.035;
+  static const Duration _maxTurnLength = Duration(seconds: 14);
+  static const Duration _minTurnLength = Duration(milliseconds: 450);
+  static const Duration _silenceWindow = Duration(milliseconds: 900);
   static const int _preSpeechChunkLimit = 8;
 
   bool _initialized = false;
@@ -178,7 +178,7 @@ class BrowserVoiceBridge {
     await _ensureInitialized('bg-BG');
     await _tts.stop();
     await _player.stop();
-    await _player.play(BytesSource(base64Decode(clean)));
+    await _player.play(BytesSource(base64Decode(clean), mimeType: mimeType));
     await _waitForPlaybackToFinish();
   }
 
