@@ -39,12 +39,14 @@
       let activeCapture = null;
 
       const captureConfig = {
-        startThreshold: 0.07,
-        stopThreshold: 0.03,
-        speechFramesToStart: 4,
+        startThreshold: 0.035,
+        stopThreshold: 0.018,
+        speechFramesToStart: 2,
         silenceMsToStop: 900,
         minSpeechMs: 650,
         startupTimeoutMs: 10000,
+        forceRecordAfterMs: 900,
+        maxCaptureMs: 14000,
       };
 
       const captureState = {
@@ -94,6 +96,14 @@
         if (activeCapture && activeCapture.startupTimer !== null) {
           clearTimeout(activeCapture.startupTimer);
           activeCapture.startupTimer = null;
+        }
+        if (activeCapture && activeCapture.forceRecordTimer !== null) {
+          clearTimeout(activeCapture.forceRecordTimer);
+          activeCapture.forceRecordTimer = null;
+        }
+        if (activeCapture && activeCapture.maxCaptureTimer !== null) {
+          clearTimeout(activeCapture.maxCaptureTimer);
+          activeCapture.maxCaptureTimer = null;
         }
       }
 
@@ -291,6 +301,21 @@
         captureState.recording = true;
         captureState.recordingStartedAt = performance.now();
         captureState.silenceStartedAt = null;
+        if (activeCapture) {
+          if (activeCapture.maxCaptureTimer !== null) {
+            clearTimeout(activeCapture.maxCaptureTimer);
+          }
+          activeCapture.maxCaptureTimer = setTimeout(() => {
+            if (
+              captureState.mediaRecorder &&
+              captureState.mediaRecorder.state !== 'inactive'
+            ) {
+              try {
+                captureState.mediaRecorder.stop();
+              } catch (_) {}
+            }
+          }, captureConfig.maxCaptureMs);
+        }
       }
 
       function monitorCaptureLoop() {
@@ -397,6 +422,12 @@
               }
               finalizeCaptureFailure('No speech was captured.');
             }, captureConfig.startupTimeoutMs),
+            forceRecordTimer: setTimeout(() => {
+              if (!activeCapture || activeCapture.done || captureState.recording) {
+                return;
+              }
+              startRecorder();
+            }, captureConfig.forceRecordAfterMs),
           };
 
           monitorCaptureLoop();

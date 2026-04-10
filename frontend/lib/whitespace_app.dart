@@ -1,9 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:ui' show lerpDouble;
+import 'dart:ui' as ui;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +13,9 @@ import 'browser_voice_bridge.dart';
 import 'src/config/backend_base_url.dart';
 import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
+
+const _bloodRed = Color(0xFF8C1C13);
+const _whiteSmoke = Color(0xFFFFFFFF);
 
 Future<void> main() async {
   await _runWhitespaceApp(
@@ -1343,12 +1345,6 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     }
   }
 
-  Future<void> _sendPrompt() async {
-    final message = _promptController.text.trim();
-    if (message.isEmpty || _isBusy || _isListening) return;
-    await _submitPrompt(message: message, triggeredBySpeech: false);
-  }
-
   void _ensureVoiceLoopStartedAutomatically() {
     if (_voiceLoopEnabled || _isBusy) {
       return;
@@ -1918,12 +1914,12 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
               builder: (context, constraints) {
                 final isCompact = constraints.maxWidth < 720;
                 final horizontalPadding = isCompact ? 14.0 : 18.0;
-                final topInset = isCompact ? 14.0 : 18.0;
                 final bottomInset = isCompact ? 14.0 : 18.0;
                 final boardSize = Size(
                   constraints.maxWidth,
                   constraints.maxHeight,
                 );
+                final isVoiceActive = _isListening || _voiceLoopEnabled;
                 final activePopup = _activeUserPopup;
                 final activePopupObject = activePopup == null
                     ? null
@@ -1934,23 +1930,13 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                   children: [
                     Positioned.fill(
                       child: DecoratedBox(
-                        decoration: const BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topCenter,
-                            end: Alignment.bottomCenter,
-                            colors: [
-                              Color(0xFFF9F3EB),
-                              Color(0xFFF0E3D5),
-                              Color(0xFFE6D3C3),
-                            ],
-                          ),
-                        ),
+                        decoration: const BoxDecoration(color: _whiteSmoke),
                         child: Stack(
                           children: [
                             Positioned.fill(
                               child: DecoratedBox(
                                 decoration: BoxDecoration(
-                                  color: Colors.white.withValues(alpha: 0.48),
+                                  color: _whiteSmoke,
                                   borderRadius: BorderRadius.circular(0),
                                 ),
                                 child: CustomPaint(painter: GridPainter()),
@@ -1997,157 +1983,36 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                       ),
                     ],
                     Positioned(
-                      top: topInset,
-                      left: horizontalPadding,
-                      right: isCompact ? horizontalPadding : null,
-                      child: AgentResponseCard(
-                        speech: _lastSpeech,
-                        status: _statusText,
-                        isBusy: _isBusy,
-                        compact: isCompact,
+                      top: isCompact ? 68 : 78,
+                      left: 0,
+                      right: 0,
+                      child: IgnorePointer(
+                        child: Center(
+                          child: _SpeechTrailOverlay(
+                            speech: _lastSpeech,
+                            compact: isCompact,
+                          ),
+                        ),
                       ),
                     ),
                     Positioned(
                       left: horizontalPadding,
                       right: horizontalPadding,
                       bottom: bottomInset,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Container(
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.84),
-                              borderRadius: BorderRadius.circular(22),
-                              border: Border.all(
-                                color: Colors.black.withValues(alpha: 0.08),
-                                width: 0.8,
-                              ),
-                              boxShadow: [
-                                BoxShadow(
-                                  color: Colors.black.withValues(alpha: 0.08),
-                                  blurRadius: 24,
-                                  offset: const Offset(0, 14),
-                                ),
-                              ],
-                            ),
-                            child: TextField(
-                              enabled: !_isBusy && !_isListening,
-                              controller: _promptController,
-                              onSubmitted: (_) => _sendPrompt(),
-                              minLines: isCompact ? 1 : 1,
-                              maxLines: isCompact ? 3 : 2,
-                              decoration: InputDecoration(
-                                hintText: _isListening
-                                    ? (kIsWeb
-                                          ? 'Listening in the app...'
-                                          : 'Listening on your phone...')
-                                    : _voiceLoopEnabled
-                                    ? 'Voice mode is on. Speak your next request...'
-                                    : 'Write a prompt or use the mic...',
-                                hintStyle: TextStyle(
-                                  color: Colors.black.withValues(alpha: 0.44),
-                                ),
-                                border: InputBorder.none,
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 16,
-                                  vertical: 16,
-                                ),
-                              ),
-                            ),
+                      child: Center(
+                        child: ConstrainedBox(
+                          constraints: BoxConstraints(
+                            maxWidth: isCompact ? double.infinity : 380,
                           ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: GestureDetector(
-                                  onTap: (_isBusy && !_voiceLoopEnabled)
-                                      ? null
-                                      : _toggleVoiceLoop,
-                                  child: Container(
-                                    height: 54,
-                                    decoration: BoxDecoration(
-                                      color: (_isListening || _voiceLoopEnabled)
-                                          ? const Color(0xFFD2604A)
-                                          : const Color(0xFFB85A40),
-                                      borderRadius: BorderRadius.circular(20),
-                                      boxShadow: [
-                                        BoxShadow(
-                                          color: const Color(
-                                            0xFFB85A40,
-                                          ).withValues(alpha: 0.26),
-                                          blurRadius: 18,
-                                          offset: const Offset(0, 10),
-                                        ),
-                                      ],
-                                    ),
-                                    child: Row(
-                                      mainAxisAlignment:
-                                          MainAxisAlignment.center,
-                                      children: [
-                                        Icon(
-                                          (_isListening || _voiceLoopEnabled)
-                                              ? Icons.hearing
-                                              : Icons.mic_none,
-                                          color: Colors.white,
-                                        ),
-                                        const SizedBox(width: 10),
-                                        Text(
-                                          _voiceLoopEnabled
-                                              ? 'Voice On'
-                                              : 'Voice',
-                                          style: const TextStyle(
-                                            color: Colors.white,
-                                            fontSize: 15,
-                                            fontWeight: FontWeight.w700,
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: GestureDetector(
-                                  onTap: (_isBusy || _isListening)
-                                      ? null
-                                      : _sendPrompt,
-                                  child: Container(
-                                    height: 54,
-                                    decoration: BoxDecoration(
-                                      color: Colors.white.withValues(
-                                        alpha: 0.88,
-                                      ),
-                                      borderRadius: BorderRadius.circular(20),
-                                      border: Border.all(
-                                        color: Colors.black.withValues(
-                                          alpha: 0.08,
-                                        ),
-                                        width: 0.8,
-                                      ),
-                                    ),
-                                    child: Center(
-                                      child: Text(
-                                        _isBusy
-                                            ? 'Running'
-                                            : _isListening
-                                            ? 'Listening'
-                                            : 'Send Prompt',
-                                        style: TextStyle(
-                                          color: Colors.black.withValues(
-                                            alpha: 0.74,
-                                          ),
-                                          fontSize: 14,
-                                          fontWeight: FontWeight.w700,
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ],
+                          child: _VoiceToggleButton(
+                            isActive: isVoiceActive,
+                            isBusy: _isBusy,
+                            semanticsLabel: _statusText,
+                            onTap: (_isBusy && !_voiceLoopEnabled)
+                                ? null
+                                : _toggleVoiceLoop,
                           ),
-                        ],
+                        ),
                       ),
                     ),
                   ],
@@ -2161,76 +2026,484 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   }
 }
 
-class AgentResponseCard extends StatelessWidget {
-  const AgentResponseCard({
-    super.key,
-    required this.speech,
-    required this.status,
+class _VoiceToggleButton extends StatelessWidget {
+  const _VoiceToggleButton({
+    required this.isActive,
     required this.isBusy,
+    required this.semanticsLabel,
+    required this.onTap,
+  });
+
+  final bool isActive;
+  final bool isBusy;
+  final String semanticsLabel;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = isActive ? 'Voice On' : 'Voice Off';
+    final icon = isActive ? Icons.graphic_eq_rounded : Icons.mic_none_rounded;
+    final background = isActive ? _bloodRed : Colors.white;
+    final borderColor = _bloodRed;
+    final foreground = isActive ? Colors.white : Colors.black;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 260),
+      curve: Curves.easeOutCubic,
+      width: 124,
+      height: 124,
+      decoration: BoxDecoration(
+        color: background,
+        shape: BoxShape.circle,
+        border: Border.all(color: borderColor, width: 2),
+        boxShadow: [
+          BoxShadow(
+            color: _bloodRed.withValues(alpha: isActive ? 0.28 : 0.12),
+            blurRadius: isActive ? 24 : 16,
+            offset: Offset(0, isActive ? 10 : 6),
+          ),
+        ],
+      ),
+        child: Semantics(
+        button: true,
+        label: '$label. $semanticsLabel',
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            onTap: onTap,
+            customBorder: const CircleBorder(),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 18),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  AnimatedScale(
+                    scale: isActive ? 1.08 : 1,
+                    duration: const Duration(milliseconds: 240),
+                    curve: Curves.easeOutBack,
+                    child: AnimatedSwitcher(
+                      duration: const Duration(milliseconds: 220),
+                      transitionBuilder: (child, animation) {
+                        return RotationTransition(
+                          turns: Tween<double>(begin: 0.88, end: 1).animate(
+                            animation,
+                          ),
+                          child: FadeTransition(opacity: animation, child: child),
+                        );
+                      },
+                    child: Icon(
+                      icon,
+                      key: ValueKey(icon),
+                      color: foreground,
+                      size: isActive ? 42 : 38,
+                    ),
+                  ),
+                ),
+                  const SizedBox(height: 10),
+                  AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 220),
+                    transitionBuilder: (child, animation) {
+                      return SlideTransition(
+                        position: Tween<Offset>(
+                          begin: const Offset(0, 0.2),
+                          end: Offset.zero,
+                        ).animate(animation),
+                        child: FadeTransition(opacity: animation, child: child),
+                      );
+                    },
+                    child: Text(
+                      label,
+                      key: ValueKey(label),
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: foreground,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 0.2,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SpeechTrailOverlay extends StatefulWidget {
+  const _SpeechTrailOverlay({
+    required this.speech,
     required this.compact,
   });
 
   final String speech;
-  final String status;
-  final bool isBusy;
   final bool compact;
 
   @override
+  State<_SpeechTrailOverlay> createState() => _SpeechTrailOverlayState();
+}
+
+class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
+  List<String> _words = const <String>[];
+  int _activeWordIndex = -1;
+  int _animationToken = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _setSpeech(widget.speech, animate: false);
+  }
+
+  @override
+  void didUpdateWidget(covariant _SpeechTrailOverlay oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.speech != widget.speech) {
+      _setSpeech(widget.speech, animate: true);
+    }
+  }
+
+  void _setSpeech(String speech, {required bool animate}) {
+    final words = _speechTrailWords(speech, maxWords: widget.compact ? 12 : 18);
+    final token = _animationToken + 1;
+    _animationToken = token;
+    setState(() {
+      _words = words;
+      _activeWordIndex = words.isEmpty
+          ? -1
+          : (animate ? 0 : words.length - 1);
+    });
+    if (animate && words.length > 1) {
+      unawaited(_animateSpeechWords(words, token));
+    }
+  }
+
+  Future<void> _animateSpeechWords(List<String> words, int token) async {
+    final timings = _estimateSpeechTrailWordTimings(words);
+    for (var index = 0; index < timings.length; index++) {
+      if (!mounted || token != _animationToken) {
+        return;
+      }
+      if (_activeWordIndex != index) {
+        setState(() {
+          _activeWordIndex = index;
+        });
+      }
+      await Future<void>.delayed(timings[index]);
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: compact ? double.infinity : 360),
-      child: Container(
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.88),
-          borderRadius: BorderRadius.circular(24),
-          border: Border.all(
-            color: Colors.black.withValues(alpha: 0.08),
-            width: 0.8,
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.08),
-              blurRadius: 24,
-              offset: const Offset(0, 12),
-            ),
-          ],
-        ),
+    final width = widget.compact ? 300.0 : 520.0;
+    final height = widget.compact ? 98.0 : 116.0;
+    final fontSize = widget.compact ? 28.0 : 33.0;
+    final gap = widget.compact ? 14.0 : 18.0;
+    final spokenPrefix =
+        _activeWordIndex >= 0 && _activeWordIndex < _words.length
+        ? _words.sublist(0, _activeWordIndex + 1)
+        : _words;
+    final topSlice = _visibleSpeechTrailSlice(
+      spokenPrefix,
+      maxWidth: width,
+      fontSize: fontSize,
+      gap: gap,
+    );
+    if (topSlice.words.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final olderPrefix = topSlice.startIndex > 0
+        ? spokenPrefix.sublist(0, topSlice.startIndex)
+        : const <String>[];
+    final bottomSlice = _visibleSpeechTrailSlice(
+      olderPrefix,
+      maxWidth: width,
+      fontSize: fontSize,
+      gap: gap,
+    );
+    return ClipRect(
+      child: SizedBox(
+        width: width,
+        height: height,
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(
-              isBusy ? 'Semi Agent Running' : 'Semi Agent',
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                letterSpacing: 0.4,
-              ),
+            _SpeechTrailRow(
+              key: ValueKey('top-${topSlice.words.join(" ")}'),
+              words: topSlice.words,
+              compact: widget.compact,
+              gap: gap,
+              maxWidth: width,
+              slideOffset: const Offset(0.14, 0),
+              shaderBuilder: _buildSpeechTrailEntryShader,
             ),
-            const SizedBox(height: 8),
-            Text(
-              speech,
-              style: TextStyle(
-                color: Colors.black.withValues(alpha: 0.82),
-                fontSize: 13,
-                fontWeight: FontWeight.w600,
-                height: 1.22,
-              ),
-            ),
-            const SizedBox(height: 10),
-            Text(
-              status,
-              style: TextStyle(
-                color: Colors.black.withValues(alpha: 0.58),
-                fontSize: 11.5,
-                height: 1.2,
-              ),
+            SizedBox(height: widget.compact ? 6 : 8),
+            _SpeechTrailRow(
+              key: ValueKey('bottom-${bottomSlice.words.join(" ")}'),
+              words: bottomSlice.words,
+              compact: widget.compact,
+              gap: gap,
+              maxWidth: width,
+              slideOffset: const Offset(-0.16, 0),
+              shaderBuilder: _buildSpeechTrailExitShader,
             ),
           ],
         ),
       ),
     );
   }
+}
+
+class _SpeechTrailRow extends StatelessWidget {
+  const _SpeechTrailRow({
+    super.key,
+    required this.words,
+    required this.compact,
+    required this.gap,
+    required this.maxWidth,
+    required this.slideOffset,
+    required this.shaderBuilder,
+  });
+
+  final List<String> words;
+  final bool compact;
+  final double gap;
+  final double maxWidth;
+  final Offset slideOffset;
+  final Shader Function(Rect bounds) shaderBuilder;
+
+  @override
+  Widget build(BuildContext context) {
+    final fontSize = compact ? 28.0 : 33.0;
+    final contentWidth = _speechTrailContentWidth(
+      words,
+      fontSize: fontSize,
+      gap: gap,
+    );
+    if (words.isEmpty) {
+      return SizedBox(
+        width: maxWidth,
+        height: compact ? 30 : 36,
+      );
+    }
+
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 360),
+      curve: Curves.easeOutCubic,
+      builder: (context, value, child) {
+        return Align(
+          alignment: Alignment.center,
+          child: Transform.translate(
+            offset: Offset(
+              slideOffset.dx * (1 - value) * maxWidth * 0.35,
+              slideOffset.dy * (1 - value) * 18,
+            ),
+            child: child,
+          ),
+        );
+      },
+      child: Align(
+        alignment: Alignment.centerRight,
+        child: SizedBox(
+          width: contentWidth,
+          child: ShaderMask(
+            blendMode: BlendMode.dstIn,
+            shaderCallback: shaderBuilder,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                for (var index = 0; index < words.length; index++) ...[
+                  _SpeechTrailWord(
+                    word: words[index],
+                    compact: compact,
+                  ),
+                  if (index != words.length - 1) SizedBox(width: gap),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SpeechTrailWord extends StatelessWidget {
+  const _SpeechTrailWord({
+    required this.word,
+    required this.compact,
+  });
+
+  final String word;
+  final bool compact;
+
+  @override
+  Widget build(BuildContext context) {
+    final fontSize = compact ? 28.0 : 33.0;
+
+    return ShaderMask(
+      blendMode: BlendMode.srcIn,
+      shaderCallback: (bounds) {
+        return const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            Color(0xFFBF4342),
+            Color(0xFF8C1C13),
+            Colors.black,
+          ],
+        ).createShader(bounds);
+      },
+      child: Text(
+        word,
+        maxLines: 1,
+        overflow: TextOverflow.visible,
+        softWrap: false,
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: fontSize,
+          fontWeight: FontWeight.w800,
+          letterSpacing: -0.6,
+          height: 1,
+        ),
+      ),
+    );
+  }
+}
+
+class _VisibleSpeechTrailSlice {
+  const _VisibleSpeechTrailSlice({
+    required this.words,
+    required this.startIndex,
+  });
+
+  final List<String> words;
+  final int startIndex;
+}
+
+_VisibleSpeechTrailSlice _visibleSpeechTrailSlice(
+  List<String> words, {
+  required double maxWidth,
+  required double fontSize,
+  required double gap,
+}) {
+  if (words.isEmpty) {
+    return const _VisibleSpeechTrailSlice(words: <String>[], startIndex: 0);
+  }
+
+  var usedWidth = 0.0;
+  final visibleReversed = <String>[];
+  var startIndex = words.length - 1;
+
+  for (var index = words.length - 1; index >= 0; index--) {
+    final word = words[index];
+    final wordWidth = _measureSpeechTrailWordWidth(word, fontSize);
+    if (visibleReversed.isNotEmpty) {
+      usedWidth += gap;
+    }
+    if (visibleReversed.isNotEmpty && usedWidth >= maxWidth) {
+      break;
+    }
+    visibleReversed.add(word);
+    usedWidth += wordWidth;
+    startIndex = index;
+  }
+
+  return _VisibleSpeechTrailSlice(
+    words: visibleReversed.reversed.toList(growable: false),
+    startIndex: startIndex,
+  );
+}
+
+List<Duration> _estimateSpeechTrailWordTimings(List<String> words) {
+  return words.map((word) {
+    final clean = word.replaceAll(
+      RegExp(r"""[\s\.,!?;:'"()\[\]{}\-_\/\\]+"""),
+      '',
+    );
+    final characterCount = math.max(1, clean.length);
+    final hasPause = word.contains(RegExp(r'[,.!?;:]'));
+    final milliseconds = 160 + (characterCount * 32) + (hasPause ? 120 : 0);
+    return Duration(milliseconds: milliseconds.clamp(180, 520));
+  }).toList(growable: false);
+}
+
+double _speechTrailContentWidth(
+  List<String> words, {
+  required double fontSize,
+  required double gap,
+}) {
+  if (words.isEmpty) {
+    return 0;
+  }
+  return words.fold<double>(
+        0,
+        (sum, word) => sum + _measureSpeechTrailWordWidth(word, fontSize),
+      ) +
+      (gap * math.max(0, words.length - 1));
+}
+
+Shader _buildSpeechTrailEntryShader(Rect bounds) {
+  return ui.Gradient.linear(
+    bounds.centerLeft,
+    bounds.centerRight,
+    const <Color>[
+      Colors.white,
+      Colors.white,
+      Colors.transparent,
+    ],
+    const <double>[0.0, 0.9, 1.0],
+  );
+}
+
+Shader _buildSpeechTrailExitShader(Rect bounds) {
+  return ui.Gradient.linear(
+    bounds.centerLeft,
+    bounds.centerRight,
+    const <Color>[
+      Colors.transparent,
+      Colors.white,
+      Colors.white,
+    ],
+    const <double>[0.0, 0.1, 1.0],
+  );
+}
+
+double _measureSpeechTrailWordWidth(String word, double fontSize) {
+  final painter = TextPainter(
+    text: TextSpan(
+      text: word,
+      style: TextStyle(
+        fontSize: fontSize,
+        fontWeight: FontWeight.w800,
+        letterSpacing: -0.6,
+        height: 1,
+      ),
+    ),
+    maxLines: 1,
+    textDirection: TextDirection.ltr,
+  )..layout();
+  return painter.width;
+}
+
+List<String> _speechTrailWords(String speech, {int maxWords = 5}) {
+  final cleaned = speech
+      .split(RegExp(r'\s+'))
+      .map((word) => word.trim())
+      .where((word) => word.isNotEmpty)
+      .toList();
+  if (cleaned.isEmpty) {
+    return const <String>[];
+  }
+  if (cleaned.length <= maxWords) {
+    return cleaned;
+  }
+  return cleaned.sublist(cleaned.length - maxWords);
 }
 
 class _ActiveUserPopup {
@@ -3885,7 +4158,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
     final livePosition = Offset.lerp(_fromPosition, _toPosition, moveT)!;
 
     final motionEffect = _isDragging ? 1.0 : _motionEffectProgress(moveRaw);
-    final motionScale = lerpDouble(1.0, 0.8, motionEffect)!;
+    final motionScale = ui.lerpDouble(1.0, 0.8, motionEffect)!;
 
     final scaleValue = _scaleController.isAnimating
         ? _computeScalePopValue(
@@ -4046,11 +4319,11 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
 
     if (t < 0.68) {
       final local = Curves.easeOutCubic.transform(t / 0.68);
-      return lerpDouble(fromScale, overshoot, local)!;
+      return ui.lerpDouble(fromScale, overshoot, local)!;
     }
 
     final local = Curves.easeOutCubic.transform((t - 0.68) / 0.32);
-    return lerpDouble(overshoot, targetScale, local)!;
+    return ui.lerpDouble(overshoot, targetScale, local)!;
   }
 
   double _computeDeleteOpacity(double t) {
@@ -4060,11 +4333,11 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
 
     if (t <= 0.78) {
       final local = Curves.easeOut.transform(t / 0.78);
-      return lerpDouble(1.0, 0.15, local)!;
+      return ui.lerpDouble(1.0, 0.15, local)!;
     }
 
     final local = Curves.easeInOut.transform((t - 0.78) / 0.22);
-    return lerpDouble(0.15, 0.0, local)!;
+    return ui.lerpDouble(0.15, 0.0, local)!;
   }
 }
 
