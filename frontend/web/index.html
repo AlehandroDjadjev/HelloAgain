@@ -36,7 +36,9 @@
   <script>
     window.helloAgainVoice = (() => {
       let activeAudio = null;
+      let activeAudioSource = null;
       let activeCapture = null;
+      let playbackAudioContext = null;
 
       const captureConfig = {
         startThreshold: 0.035,
@@ -67,6 +69,17 @@
 
       function getAudioContextConstructor() {
         return window.AudioContext || window.webkitAudioContext || null;
+      }
+
+      function getPlaybackAudioContext() {
+        const AudioContextCtor = getAudioContextConstructor();
+        if (!AudioContextCtor) {
+          return null;
+        }
+        if (!playbackAudioContext || playbackAudioContext.state === 'closed') {
+          playbackAudioContext = new AudioContextCtor();
+        }
+        return playbackAudioContext;
       }
 
       function isSpeechCaptureSupported() {
@@ -213,6 +226,15 @@
           }
           return btoa(binary);
         });
+      }
+
+      function base64ToArrayBuffer(base64Value) {
+        const binary = atob(base64Value);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes.buffer;
       }
 
       function finalizeCaptureFailure(message, preserveMic = true) {
@@ -387,6 +409,22 @@
         pending.reject(new Error('Audio capture aborted.'));
       }
 
+      async function primeVoiceExperience() {
+        const context = getPlaybackAudioContext();
+        if (context && context.state === 'suspended') {
+          await context.resume();
+        }
+
+        if (context) {
+          const source = context.createBufferSource();
+          source.buffer = context.createBuffer(1, 1, 22050);
+          source.connect(context.destination);
+          source.start(0);
+        }
+
+        await ensureAudioCapture();
+      }
+
       function captureAudioTurn(language) {
         return new Promise(async (resolve, reject) => {
           if (!isSpeechCaptureSupported()) {
@@ -435,10 +473,17 @@
       }
 
       function playBase64Audio(base64Audio, mimeType) {
-        return new Promise((resolve, reject) => {
+        return new Promise(async (resolve, reject) => {
           if (!base64Audio) {
             resolve();
             return;
+          }
+
+          if (activeAudioSource) {
+            try {
+              activeAudioSource.stop(0);
+            } catch (_) {}
+            activeAudioSource = null;
           }
 
           if (activeAudio) {
@@ -446,6 +491,33 @@
               activeAudio.pause();
               activeAudio.currentTime = 0;
             } catch (_) {}
+          }
+
+          const context = getPlaybackAudioContext();
+          if (context) {
+            try {
+              if (context.state === 'suspended') {
+                await context.resume();
+              }
+
+              const audioBuffer = await context.decodeAudioData(
+                base64ToArrayBuffer(base64Audio),
+              );
+              const source = context.createBufferSource();
+              activeAudioSource = source;
+              source.buffer = audioBuffer;
+              source.connect(context.destination);
+              source.onended = () => {
+                if (activeAudioSource === source) {
+                  activeAudioSource = null;
+                }
+                resolve();
+              };
+              source.start(0);
+              return;
+            } catch (_) {
+              activeAudioSource = null;
+            }
           }
 
           const audio = new Audio(`data:${mimeType || 'audio/wav'};base64,${base64Audio}`);
@@ -478,6 +550,12 @@
       }
 
       function stopAudio() {
+        if (activeAudioSource) {
+          try {
+            activeAudioSource.stop(0);
+          } catch (_) {}
+          activeAudioSource = null;
+        }
         if (!activeAudio) {
           return;
         }
@@ -490,6 +568,7 @@
 
       return {
         isSpeechCaptureSupported,
+        primeVoiceExperience,
         captureAudioTurn,
         stopRecognition,
         playBase64Audio,

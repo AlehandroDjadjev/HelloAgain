@@ -1,17 +1,18 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'src/theme/app_theme.dart';
+import 'onboarding.dart';
 import 'src/screens/navigation_launcher_screen.dart';
 import 'src/services/deep_link_bridge.dart';
-import 'android_phone_number_hint.dart';
-import 'browser_voice_bridge.dart';
-import 'whitespace_app.dart' hide AgentBoardScreen;
-import 'whitespace_app.dart' as whitespace show AgentBoardScreen;
+import 'src/theme/app_theme.dart';
+
+const bool _showDeveloperOnboardingTestButton =
+    kDebugMode || bool.fromEnvironment('HELLO_AGAIN_FORCE_DEV_TEST_BUTTON');
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -34,9 +35,14 @@ class HelloAgainApp extends StatefulWidget {
 }
 
 class _HelloAgainAppState extends State<HelloAgainApp> {
+  static const _tokenKey = 'hello_again.account_token';
+  static const _onboardingSessionKey = 'hello_again.onboarding_session_id';
+
   final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
   StreamSubscription<Uri>? _deepLinkSub;
   Uri? _pendingDeepLink;
+  int _shellVersion = 0;
+  bool _isResettingOnboarding = false;
 
   @override
   void initState() {
@@ -89,6 +95,46 @@ class _HelloAgainAppState extends State<HelloAgainApp> {
     );
   }
 
+  Future<void> _restartOnboardingForTesting() async {
+    if (_isResettingOnboarding) {
+      return;
+    }
+
+    setState(() {
+      _isResettingOnboarding = true;
+    });
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_tokenKey);
+      await prefs.remove(_onboardingSessionKey);
+
+      _navigatorKey.currentState?.popUntil((route) => route.isFirst);
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _shellVersion += 1;
+      });
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Developer test mode reset the local session and relaunched onboarding.',
+          ),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isResettingOnboarding = false;
+        });
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -96,1208 +142,75 @@ class _HelloAgainAppState extends State<HelloAgainApp> {
       debugShowCheckedModeBanner: false,
       navigatorKey: _navigatorKey,
       theme: buildHelloAgainTheme(
-        scaffoldBackgroundColor: const Color(0xFFF4EDE3),
-        seedColor: const Color(0xFFB56B4D),
-        surfaceColor: const Color(0xFFFFFBF7),
+        scaffoldBackgroundColor: HelloAgainPalette.whiteSmoke,
+        seedColor: HelloAgainPalette.blushedBrick,
+        surfaceColor: HelloAgainPalette.almondCream,
       ),
-      home: const HelloAgainShell(),
-    );
-  }
-}
-
-enum HelloAgainStage { booting, intro, onboarding, board }
-
-enum _PhoneAccessChoice { undecided, allowThisTime, allowAlways, denied }
-
-class HelloAgainShell extends StatefulWidget {
-  const HelloAgainShell({super.key});
-
-  @override
-  State<HelloAgainShell> createState() => _HelloAgainShellState();
-}
-
-class _HelloAgainShellState extends State<HelloAgainShell> {
-  static const _tokenKey = 'hello_again.account_token';
-  static const _onboardingSessionKey = 'hello_again.onboarding_session_id';
-  static const _phoneAccessModeKey = 'hello_again.phone_access_mode';
-
-  late final AgentBackendClient _backendClient;
-  late final BrowserVoiceBridge _voiceBridge;
-
-  SharedPreferences? _prefs;
-  HelloAgainStage _stage = HelloAgainStage.booting;
-  AppAccountSession? _session;
-  bool _showContinue = false;
-  bool _isListening = false;
-  bool _isWorking = false;
-  bool _isConfirming = false;
-  bool _requestingPhoneNumberHint = false;
-  bool _waitingForManualVoiceStart = false;
-  String _statusText = 'Подготвяме Hello Again...';
-  String _assistantReply = '';
-  String _transcriptPreview = '';
-  String _conversationMode = 'collecting';
-  String _onboardingSessionId = '';
-  String _draftPhoneNumber = '';
-  String _recognizedPhone = '';
-  bool _phoneAccessGrantedThisSession = false;
-  _PhoneAccessChoice _phoneAccessChoice = _PhoneAccessChoice.undecided;
-
-  @override
-  void initState() {
-    super.initState();
-    _backendClient = AgentBackendClient();
-    _voiceBridge = createBrowserVoiceBridge();
-    unawaited(_bootstrap());
-  }
-
-  @override
-  void dispose() {
-    _voiceBridge.stopRecognition();
-    _voiceBridge.stopAudio();
-    super.dispose();
-  }
-
-  Future<void> _bootstrap() async {
-    final prefs = await SharedPreferences.getInstance();
-    final storedToken = prefs.getString(_tokenKey) ?? '';
-    final storedOnboardingSession =
-        prefs.getString(_onboardingSessionKey) ?? '';
-
-    AppAccountSession? session;
-    if (storedToken.isNotEmpty) {
-      try {
-        session = await _backendClient.fetchCurrentSession(token: storedToken);
-      } catch (_) {
-        await prefs.remove(_tokenKey);
-      }
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _prefs = prefs;
-      _session = session;
-      _onboardingSessionId = storedOnboardingSession;
-      _stage = HelloAgainStage.intro;
-      _statusText = session == null
-          ? 'Спокойното начало е готово.'
-          : 'Добре дошли отново. Отварям Вашето място.';
-    });
-  }
-
-  void _handleIntroFinished() {
-    if (_session != null) {
-      setState(() {
-        _stage = HelloAgainStage.board;
-      });
-      return;
-    }
-    setState(() {
-      _showContinue = true;
-      _statusText = 'Натиснете „Продължи“ и ще започнем разговора.';
-    });
-  }
-
-  Future<void> _startOnboarding() async {
-    if (_isWorking) return;
-
-    final phonePermissionGranted = await _ensurePhonePermissionForSetup();
-    if (!phonePermissionGranted) {
-      if (!mounted) return;
-      setState(() {
-        _showContinue = true;
-        _statusText =
-            'Нужен е достъп до телефонния номер, за да продължим настройката.';
-      });
-      return;
-    }
-
-    setState(() {
-      _showContinue = false;
-      _stage = HelloAgainStage.onboarding;
-      _assistantReply = '';
-      _transcriptPreview = '';
-      _conversationMode = 'collecting';
-      _draftPhoneNumber = '';
-      _recognizedPhone = '';
-      _statusText = 'Подготвям разговора.';
-      _isConfirming = false;
-      _waitingForManualVoiceStart = false;
-      _phoneAccessGrantedThisSession =
-          _phoneAccessChoice == _PhoneAccessChoice.allowAlways;
-      if (_phoneAccessChoice != _PhoneAccessChoice.allowAlways) {
-        _phoneAccessChoice = _PhoneAccessChoice.undecided;
-      }
-    });
-
-    String? initialPhoneNumber;
-    if (AndroidPhoneNumberHint.isSupported) {
-      initialPhoneNumber = await _requestPhoneNumberBeforeOnboarding();
-      if (initialPhoneNumber == null || initialPhoneNumber.trim().isEmpty) {
-        return;
-      }
-    }
-
-    await _beginOrResumeOnboarding(initialPhoneNumber: initialPhoneNumber);
-  }
-
-  Future<bool> _ensurePhonePermissionForSetup() async {
-    return true;
-
-    /*
-    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) {
-      retur  n true;
-    }
-
-    final current = await permission.Permission.phone.status;
-    if (current.isGranted || current.isLimited) {
-      return true;
-    }
-
-    final requested = await permission.Permission.phone.request();
-    if (requested.isGranted || requested.isLimited) {
-      return true;
-    }
-
-    if (requested.isPermanentlyDenied && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: const Text(
-            'Достъпът до телефонния номер е изключен. Разрешете го от настройките.',
-          ),
-          action: SnackBarAction(
-            label: 'Настройки',
-            onPressed: permission.openAppSettings,
-          ),
-        ),
-      );
-    }
-
-    return false;
-    */
-  }
-
-  bool get _shouldUseAndroidPhoneHint =>
-      AndroidPhoneNumberHint.isSupported &&
-      _stage == HelloAgainStage.onboarding &&
-      _conversationMode == 'collecting' &&
-      _draftPhoneNumber.trim().isEmpty;
-
-  bool get _showPhoneAccessChoices =>
-      _phoneAccessGrantedThisSession ? false : false;
-
-  Future<void> _beginOrResumeOnboarding({String? initialPhoneNumber}) async {
-    if (!mounted) return;
-    setState(() {
-      _isWorking = true;
-      _isListening = false;
-      _isConfirming = false;
-      _statusText = 'Подготвям разговора.';
-    });
-
-    try {
-      final payload = await _backendClient.startOnboarding(
-        sessionId: _onboardingSessionId.isEmpty ? null : _onboardingSessionId,
-      );
-
-      final cleanInitialPhone = (initialPhoneNumber ?? '').trim();
-      if (cleanInitialPhone.isNotEmpty) {
-        final draft = Map<String, dynamic>.from(
-          payload['draft'] as Map? ?? const {},
-        );
-        final sessionId = (draft['session_id'] ?? '').toString().trim();
-        if (sessionId.isNotEmpty) {
-          _onboardingSessionId = sessionId;
-          await _prefs?.setString(_onboardingSessionKey, sessionId);
+      builder: (context, child) {
+        final content = child ?? const SizedBox.shrink();
+        if (!_showDeveloperOnboardingTestButton) {
+          return content;
         }
 
-        if (!mounted) return;
-        setState(() {
-          _transcriptPreview = cleanInitialPhone;
-          _statusText = 'Получих телефонния номер. Продължавам.';
-        });
-
-        final nextPayload = await _backendClient.sendOnboardingTurn(
-          sessionId: _onboardingSessionId,
-          message: 'Телефонният ми номер е $cleanInitialPhone.',
-        );
-        await _handleOnboardingPayload(nextPayload, autoContinue: true);
-        return;
-      }
-
-      await _handleOnboardingPayload(payload, autoContinue: true);
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _requestingPhoneNumberHint = false;
-        _isWorking = false;
-        _statusText =
-            'Не успях да започна разговора. Натиснете веднъж и ще опитам пак. ${error.toString()}';
-      });
-    }
-  }
-
-  Future<String?> _requestPhoneNumberBeforeOnboarding() async {
-    if (!AndroidPhoneNumberHint.isSupported) {
-      return null;
-    }
-
-    if (!mounted) return null;
-    setState(() {
-      _isWorking = true;
-      _isListening = false;
-      _isConfirming = false;
-      _transcriptPreview = '';
-      _statusText = 'Изберете телефонния си номер, за да продължим.';
-    });
-
-    try {
-      final phoneNumber = await AndroidPhoneNumberHint.requestPhoneNumberHint()
-          .timeout(const Duration(seconds: 20));
-      final cleanPhoneNumber = (phoneNumber ?? '').trim();
-      if (cleanPhoneNumber.isEmpty) {
-        if (!mounted) return null;
-        setState(() {
-          _isWorking = false;
-          _statusText =
-              'Не беше избран телефонен номер. Натиснете продължи отново, за да опитаме пак.';
-        });
-        return null;
-      }
-
-      if (!mounted) return null;
-      setState(() {
-        _transcriptPreview = cleanPhoneNumber;
-        _statusText = 'Телефонният номер е избран.';
-      });
-      return cleanPhoneNumber;
-    } catch (error) {
-      if (!mounted) return null;
-      setState(() {
-        _isWorking = false;
-        _statusText =
-            'Не успях да покажа Android избора за телефонен номер. ${error.toString()}';
-      });
-      return null;
-    }
-  }
-
-  Future<void> _captureNextOnboardingTurn() async {
-    if (_shouldUseAndroidPhoneHint) {
-      if (_showPhoneAccessChoices) {
-        _presentPhoneAccessChoices();
-        return;
-      }
-      final submittedPhoneNumber = await _requestAndSubmitAndroidPhoneNumber();
-      if (submittedPhoneNumber) {
-        return;
-      }
-    }
-    if (_conversationMode == 'login_confirmation') {
-      await _handleLoginConfirmation();
-      return;
-    }
-    if (_isWorking && !_isConfirming) return;
-    if (!mounted) return;
-    setState(() {
-      _waitingForManualVoiceStart = false;
-      _transcriptPreview = '';
-      _isWorking = true;
-      _isListening = true;
-      _isConfirming = false;
-      _statusText = 'Listening closely...';
-    });
-    try {
-      final cleanTranscript = await _listenForOnboardingTranscript(
-        listeningStatus: 'Listening closely...',
-        retryStatus:
-            'Still listening. Say that one more time when you are ready.',
-      );
-      final payload = await _backendClient.sendOnboardingTurn(
-        sessionId: _onboardingSessionId,
-        message: cleanTranscript,
-      );
-      await _handleOnboardingPayload(payload, autoContinue: true);
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _isListening = false;
-        _isWorking = false;
-        _statusText =
-            'I could not hear that clearly. I paused the mic for now.';
-      });
-    }
-  }
-
-  Future<void> _handleLoginConfirmation() async {
-    final phoneConfirmed = await _askYesNo(
-      _recognizedPhone.isEmpty
-          ? 'Правилно ли разбрах, че вече имате профил?'
-          : 'Чух номер $_recognizedPhone. Правилен ли е?',
-    );
-    if (!mounted) return;
-
-    if (!phoneConfirmed) {
-      final payload = await _backendClient.confirmOnboardingLogin(
-        sessionId: _onboardingSessionId,
-        phoneConfirmed: false,
-        loginConfirmed: false,
-      );
-      await _handleOnboardingPayload(payload, autoContinue: true);
-      return;
-    }
-
-    final loginConfirmed = await _askYesNo(
-      'Искате ли да влезете в съществуващия си профил?',
-    );
-    if (!mounted) return;
-
-    final payload = await _backendClient.confirmOnboardingLogin(
-      sessionId: _onboardingSessionId,
-      phoneConfirmed: true,
-      loginConfirmed: loginConfirmed,
-    );
-    await _handleOnboardingPayload(payload, autoContinue: true);
-  }
-
-  Future<bool> _requestAndSubmitAndroidPhoneNumber() async {
-    if (!_shouldUseAndroidPhoneHint || _requestingPhoneNumberHint) {
-      return false;
-    }
-
-    if (!mounted) return false;
-    setState(() {
-      _requestingPhoneNumberHint = true;
-      _waitingForManualVoiceStart = false;
-      _transcriptPreview = '';
-      _isWorking = true;
-      _isListening = false;
-      _isConfirming = false;
-      _statusText = 'Изберете телефонния си номер от устройството.';
-    });
-
-    await _speakOnboardingText(
-      'За да продължим, изберете телефонния си номер от телефона.',
-    );
-
-    try {
-      final phoneNumber = await AndroidPhoneNumberHint.requestPhoneNumberHint();
-      final cleanPhoneNumber = (phoneNumber ?? '').trim();
-
-      if (cleanPhoneNumber.isEmpty) {
-        if (!mounted) return false;
-        setState(() {
-          _requestingPhoneNumberHint = false;
-          _isWorking = false;
-          _isListening = false;
-          _isConfirming = false;
-          _assistantReply =
-              'За да влезете или да създадете профил, е нужно да изберете телефонния си номер от устройството.';
-          _statusText =
-              'Android не върна номер. Продължавам с гласовото въвеждане.';
-        });
-        return false;
-      }
-
-      if (!mounted) return false;
-      setState(() {
-        _requestingPhoneNumberHint = false;
-        _waitingForManualVoiceStart = false;
-        _transcriptPreview = cleanPhoneNumber;
-        _statusText = 'Получих телефонния номер. Продължавам.';
-      });
-
-      final payload = await _backendClient.sendOnboardingTurn(
-        sessionId: _onboardingSessionId,
-        message: 'Телефонният ми номер е $cleanPhoneNumber.',
-      );
-      await _handleOnboardingPayload(payload, autoContinue: true);
-      return true;
-    } catch (_) {
-      if (!mounted) return false;
-      setState(() {
-        _requestingPhoneNumberHint = false;
-        _isWorking = false;
-        _isListening = false;
-        _isConfirming = false;
-        _assistantReply = 'Не успях да взема телефонния номер от Android.';
-        _statusText =
-            'Android не успя да покаже избора за телефонен номер. Продължавам с гласовото въвеждане.';
-      });
-      return false;
-    }
-  }
-
-  void _presentPhoneAccessChoices() {
-    if (!mounted) return;
-    setState(() {
-      _isWorking = false;
-      _isListening = false;
-      _isConfirming = false;
-      _assistantReply =
-          'Before we continue, you need to allow access to the phone number on this device.';
-      _statusText =
-          'Choose Allow this time, Allow always, or Don’t allow. Without this, onboarding cannot continue.';
-    });
-  }
-
-  Future<void> _allowPhoneAccessThisTime() async {
-    if (_isWorking) return;
-    if (!mounted) return;
-    setState(() {
-      _phoneAccessGrantedThisSession = true;
-      _phoneAccessChoice = _PhoneAccessChoice.allowThisTime;
-      _statusText = 'Phone number access allowed for this onboarding only.';
-    });
-    await _requestAndSubmitAndroidPhoneNumber();
-  }
-
-  Future<void> _allowPhoneAccessAlways() async {
-    if (_isWorking) return;
-    await _prefs?.setString(_phoneAccessModeKey, 'always');
-    if (!mounted) return;
-    setState(() {
-      _phoneAccessGrantedThisSession = true;
-      _phoneAccessChoice = _PhoneAccessChoice.allowAlways;
-      _statusText =
-          'Phone number access will stay allowed for future sessions.';
-    });
-    await _requestAndSubmitAndroidPhoneNumber();
-  }
-
-  Future<void> _denyPhoneAccess() async {
-    if (!mounted) return;
-    setState(() {
-      _phoneAccessGrantedThisSession = false;
-      _phoneAccessChoice = _PhoneAccessChoice.denied;
-      _isWorking = false;
-      _isListening = false;
-      _isConfirming = false;
-      _assistantReply =
-          'Phone number access was denied, so I cannot continue with registration.';
-      _statusText =
-          'This step is required. Choose Allow this time or Allow always to continue.';
-    });
-  }
-
-  Future<bool> _askYesNo(String prompt) async {
-    await _speakOnboardingText(prompt);
-    while (mounted) {
-      final confirmation = await _listenForOnboardingTranscript(
-        listeningStatus: 'Please say just yes or no.',
-        retryStatus: 'Still listening. Please answer with yes or no.',
-        confirming: true,
-      );
-      final normalized = _normalizeConfirmationAnswer(confirmation);
-      if (normalized != null) {
-        if (!mounted) return normalized;
-        setState(() {
-          _isListening = false;
-          _transcriptPreview = confirmation.trim();
-        });
-        return normalized;
-      }
-      if (!mounted) return false;
-      setState(() {
-        _isListening = false;
-        _statusText = 'I did not catch the confirmation yet.';
-      });
-      await _speakOnboardingText(
-        'I did not catch that. Please say only yes or no.',
-      );
-    }
-    return false;
-  }
-
-  Future<String> _listenForOnboardingTranscript({
-    required String listeningStatus,
-    required String retryStatus,
-    bool confirming = false,
-  }) async {
-    while (mounted && _stage == HelloAgainStage.onboarding) {
-      setState(() {
-        _isWorking = true;
-        _isListening = true;
-        _isConfirming = confirming;
-        _statusText = listeningStatus;
-      });
-      try {
-        final capturedTurn = await _voiceBridge.captureAudioTurn(
-          language: 'bg-BG',
-        );
-        final transcript = await _resolveCapturedTranscript(capturedTurn);
-        final cleanTranscript = transcript.trim();
-        if (cleanTranscript.isEmpty) {
-          throw StateError('No speech was recognized.');
-        }
-        if (!mounted) {
-          throw StateError('Onboarding was interrupted.');
-        }
-        setState(() {
-          _transcriptPreview = cleanTranscript;
-          _isListening = false;
-          _statusText = 'Heard you. Working on it...';
-        });
-        return cleanTranscript;
-      } catch (error) {
-        if (!_isRecoverableListeningError(error) ||
-            !mounted ||
-            _stage != HelloAgainStage.onboarding) {
-          rethrow;
-        }
-        setState(() {
-          _isListening = false;
-          _statusText = retryStatus;
-        });
-        await Future<void>.delayed(const Duration(milliseconds: 250));
-      }
-    }
-    throw StateError('Onboarding listening stopped.');
-  }
-
-  Future<void> _handleOnboardingPayload(
-    Map<String, dynamic> payload, {
-    required bool autoContinue,
-  }) async {
-    final draft = Map<String, dynamic>.from(
-      payload['draft'] as Map? ?? const {},
-    );
-    final assistantReply = (payload['assistant_reply'] ?? '').toString().trim();
-    final mode = (payload['mode'] ?? 'collecting').toString().trim();
-    final recognizedPhone = (payload['recognized_phone'] ?? '')
-        .toString()
-        .trim();
-    final token = (payload['token'] ?? '').toString().trim();
-    final profile = Map<String, dynamic>.from(
-      payload['profile'] as Map? ?? const {},
-    );
-    final sessionId = (draft['session_id'] ?? '').toString().trim();
-
-    if (sessionId.isNotEmpty) {
-      _onboardingSessionId = sessionId;
-      await _prefs?.setString(_onboardingSessionKey, sessionId);
-    }
-
-    if (!mounted) return;
-    setState(() {
-      _assistantReply = assistantReply;
-      _conversationMode = mode.isEmpty ? 'collecting' : mode;
-      _draftPhoneNumber = (draft['phone_number'] ?? '').toString().trim();
-      _recognizedPhone = recognizedPhone;
-      _isWorking = false;
-      _isListening = false;
-      _isConfirming = mode == 'login_confirmation';
-      _statusText = assistantReply.isEmpty
-          ? 'Продължаваме разговора.'
-          : assistantReply;
-    });
-
-    if (assistantReply.isNotEmpty) {
-      await _speakOnboardingText(assistantReply);
-    }
-
-    if (token.isNotEmpty) {
-      final displayName =
-          (profile['display_name'] ?? profile['name'] ?? 'Приятел').toString();
-      final userId = int.tryParse((profile['user_id'] ?? '0').toString()) ?? 0;
-      await _prefs?.setString(_tokenKey, token);
-      await _prefs?.remove(_onboardingSessionKey);
-      if (!mounted) return;
-      setState(() {
-        _session = AppAccountSession(
-          token: token,
-          userId: userId,
-          displayName: displayName,
-        );
-        _stage = HelloAgainStage.board;
-      });
-      return;
-    }
-
-    if (_conversationMode == 'ready_to_register') {
-      await _completeOnboardingRegistration();
-      return;
-    }
-
-    if (autoContinue && _conversationMode != 'completed') {
-      await _captureNextOnboardingTurn();
-    }
-  }
-
-  Future<void> _completeOnboardingRegistration() async {
-    if (!mounted) return;
-    setState(() {
-      _isWorking = true;
-      _isListening = false;
-      _isConfirming = false;
-      _statusText = 'Създавам Вашия профил...';
-    });
-
-    try {
-      final payload = await _backendClient.completeOnboarding(
-        sessionId: _onboardingSessionId,
-      );
-      await _handleOnboardingPayload(payload, autoContinue: false);
-    } catch (error) {
-      if (!mounted) return;
-      setState(() {
-        _isWorking = false;
-        _statusText =
-            'Регистрацията не можа да завърши. Натиснете веднъж и ще опитам пак. ${error.toString()}';
-      });
-    }
-  }
-
-  Future<String> _resolveCapturedTranscript(
-    CapturedAudioTurn capturedTurn,
-  ) async {
-    final directTranscript = (capturedTurn.transcript ?? '').trim();
-    if (directTranscript.isNotEmpty) {
-      return directTranscript;
-    }
-    final payload = await _backendClient.transcribeSpeechTurn(
-      audioBase64: capturedTurn.audioBase64,
-      audioMimeType: capturedTurn.mimeType,
-      userId: 'hello_again_onboarding',
-      sessionId: _onboardingSessionId.isEmpty
-          ? 'onboarding_${DateTime.now().millisecondsSinceEpoch}'
-          : _onboardingSessionId,
-      language: capturedTurn.language,
-    );
-    return (payload['transcript'] ?? payload['message'] ?? '')
-        .toString()
-        .trim();
-  }
-
-  bool? _normalizeConfirmationAnswer(String transcript) {
-    final words = transcript
-        .trim()
-        .toLowerCase()
-        .replaceAll(RegExp(r'[^a-zа-я0-9\s]+', caseSensitive: false), ' ')
-        .split(RegExp(r'\s+'))
-        .where((item) => item.isNotEmpty)
-        .toList();
-
-    const yesWords = {
-      'да',
-      'yes',
-      'yep',
-      'correct',
-      'правилно',
-      'точно',
-      'добре',
-      'става',
-    };
-    const noWords = {'не', 'no', 'wrong', 'грешно', 'повтори', 'отново'};
-
-    if (words.any(yesWords.contains)) {
-      return true;
-    }
-    if (words.any(noWords.contains)) {
-      return false;
-    }
-    return null;
-  }
-
-  bool _isRecoverableListeningError(Object error) {
-    final lowered = error.toString().toLowerCase();
-    return lowered.contains('no speech') ||
-        lowered.contains('no-speech') ||
-        lowered.contains('timed out while listening for speech') ||
-        lowered.contains('did not return a transcript') ||
-        lowered.contains('no speech was recognized');
-  }
-
-  Future<void> _speakOnboardingText(String text) async {
-    try {
-      final payload = await _backendClient.speakText(
-        text: text,
-        language: 'bg-BG',
-      );
-      final audioBase64 = (payload['audio_base64'] ?? '').toString().trim();
-      final mimeType = (payload['audio_mime_type'] ?? 'audio/wav')
-          .toString()
-          .trim();
-      if (audioBase64.isNotEmpty) {
-        await _voiceBridge.playBase64Audio(
-          audioBase64: audioBase64,
-          mimeType: mimeType.isEmpty ? 'audio/wav' : mimeType,
-        );
-        return;
-      }
-    } catch (_) {}
-
-    await _voiceBridge.playText(text);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    switch (_stage) {
-      case HelloAgainStage.booting:
-        return const Scaffold(body: Center(child: CircularProgressIndicator()));
-      case HelloAgainStage.intro:
-        return IntroOnboardingScreen(
-          showContinue: _showContinue,
-          statusText: _statusText,
-          onFinished: _handleIntroFinished,
-          onContinue: _startOnboarding,
-        );
-      case HelloAgainStage.onboarding:
-        return RegistrationScreen(
-          assistantReply: _assistantReply,
-          statusText: _statusText,
-          transcript: _transcriptPreview,
-          showVoiceStartPrompt: _waitingForManualVoiceStart,
-          isListening: _isListening,
-          isWorking: _isWorking,
-          isConfirming: _isConfirming,
-          conversationMode: _conversationMode,
-          showPhoneAccessChoices: _showPhoneAccessChoices,
-          retryLabel: _shouldUseAndroidPhoneHint
-              ? 'Избери номера'
-              : 'Повтори разговора',
-          onAllowPhoneThisTime: _allowPhoneAccessThisTime,
-          onAllowPhoneAlways: _allowPhoneAccessAlways,
-          onDenyPhoneAccess: _denyPhoneAccess,
-          onRetry: _captureNextOnboardingTurn,
-        );
-      case HelloAgainStage.board:
-        final session = _session;
-        return AgentBoardScreen(
-          userId: (session?.userId ?? 0).toString(),
-          accountToken: session?.token,
-          welcomeText: session == null
-              ? null
-              : 'Добре дошли, ${session.displayName}. Вашето място е готово.',
-        );
-    }
-  }
-}
-
-class AgentBoardScreen extends StatefulWidget {
-  const AgentBoardScreen({
-    super.key,
-    required this.userId,
-    this.accountToken,
-    this.welcomeText,
-  });
-
-  final String userId;
-  final String? accountToken;
-  final String? welcomeText;
-
-  @override
-  State<AgentBoardScreen> createState() => _AgentBoardScreenState();
-}
-
-class _AgentBoardScreenState extends State<AgentBoardScreen> {
-  @override
-  Widget build(BuildContext context) {
-    return whitespace.AgentBoardScreen(
-      userId: widget.userId,
-      accountToken: widget.accountToken,
-      welcomeText: widget.welcomeText,
-    );
-  }
-}
-
-class IntroOnboardingScreen extends StatefulWidget {
-  const IntroOnboardingScreen({
-    super.key,
-    required this.showContinue,
-    required this.statusText,
-    required this.onFinished,
-    required this.onContinue,
-  });
-
-  final bool showContinue;
-  final String statusText;
-  final VoidCallback onFinished;
-  final Future<void> Function() onContinue;
-
-  @override
-  State<IntroOnboardingScreen> createState() => _IntroOnboardingScreenState();
-}
-
-class _IntroOnboardingScreenState extends State<IntroOnboardingScreen>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
-  bool _finished = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1400),
-    )..forward();
-    _controller.addStatusListener((status) {
-      if (!_finished && status == AnimationStatus.completed) {
-        _finished = true;
-        widget.onFinished();
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final slide = Tween<Offset>(
-      begin: const Offset(0, 1.4),
-      end: Offset.zero,
-    ).animate(CurvedAnimation(parent: _controller, curve: Curves.easeOutCubic));
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFF4EDE3),
-      body: _WarmPaperBackground(
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(24, 24, 24, 30),
-            child: Column(
-              children: [
-                const Spacer(),
-                SlideTransition(
-                  position: slide,
-                  child: const Text(
-                    'Hello Again',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 48,
-                      fontWeight: FontWeight.w700,
-                      color: Color(0xFF3C2A20),
-                      letterSpacing: -1.2,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 18),
-                Text(
-                  widget.statusText,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontSize: 17,
-                    height: 1.45,
-                    color: Color(0xFF6A5447),
-                  ),
-                ),
-                const Spacer(),
-                AnimatedOpacity(
-                  opacity: widget.showContinue ? 1 : 0,
-                  duration: const Duration(milliseconds: 420),
-                  curve: Curves.easeOut,
-                  child: AnimatedSlide(
-                    offset: widget.showContinue
-                        ? Offset.zero
-                        : const Offset(0, 0.16),
-                    duration: const Duration(milliseconds: 420),
-                    curve: Curves.easeOutCubic,
-                    child: IgnorePointer(
-                      ignoring: !widget.showContinue,
-                      child: SizedBox(
-                        width: double.infinity,
-                        child: FilledButton(
-                          onPressed: widget.onContinue,
-                          style: FilledButton.styleFrom(
-                            backgroundColor: const Color(0xFFB56B4D),
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 18),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(22),
-                            ),
-                          ),
-                          child: const Text(
-                            'Продължи',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class RegistrationScreen extends StatelessWidget {
-  const RegistrationScreen({
-    super.key,
-    required this.assistantReply,
-    required this.statusText,
-    required this.transcript,
-    required this.showVoiceStartPrompt,
-    required this.isListening,
-    required this.isWorking,
-    required this.isConfirming,
-    required this.conversationMode,
-    required this.showPhoneAccessChoices,
-    required this.retryLabel,
-    required this.onAllowPhoneThisTime,
-    required this.onAllowPhoneAlways,
-    required this.onDenyPhoneAccess,
-    required this.onRetry,
-  });
-
-  final String assistantReply;
-  final String statusText;
-  final String transcript;
-  final bool showVoiceStartPrompt;
-  final bool isListening;
-  final bool isWorking;
-  final bool isConfirming;
-  final String conversationMode;
-  final bool showPhoneAccessChoices;
-  final String retryLabel;
-  final Future<void> Function() onAllowPhoneThisTime;
-  final Future<void> Function() onAllowPhoneAlways;
-  final Future<void> Function() onDenyPhoneAccess;
-  final Future<void> Function() onRetry;
-
-  String _resolvedHeadlineText() {
-    if (showVoiceStartPrompt) {
-      return 'Ready to hear about you.';
-    }
-    if (assistantReply.isNotEmpty) {
-      return assistantReply;
-    }
-    return 'Кажете ми нещо за себе си, както Ви е удобно.';
-  }
-
-  String _resolvedBodyText() {
-    if (showPhoneAccessChoices) {
-      return 'This step needs access to the phone number stored on the device. Without it, onboarding cannot continue.';
-    }
-    if (showVoiceStartPrompt) {
-      return 'Turn on your audio, raise the volume if needed, and tap Start when you are ready.';
-    }
-    if (transcript.isNotEmpty) {
-      return transcript;
-    }
-    return 'Когато сте готови, говорете спокойно. Аз ще продължа разговора.';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final indicatorColor = isListening
-        ? const Color(0xFFB56B4D)
-        : isConfirming
-        ? const Color(0xFF7A8B67)
-        : const Color(0xFFC8B6A1);
-    final actionLabel = showVoiceStartPrompt ? 'Start' : retryLabel;
-
-    final statusLabel = isListening
-        ? 'Слушам'
-        : isConfirming
-        ? 'Чакам потвърждение'
-        : conversationMode == 'ready_to_register'
-        ? 'Подготвям профила'
-        : 'Разговор';
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFF4EDE3),
-      body: _WarmPaperBackground(
-        child: SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
-            child: Column(
-              children: [
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withValues(alpha: 0.82),
-                    borderRadius: BorderRadius.circular(28),
-                    border: Border.all(color: const Color(0xFFE5D6C7)),
-                    boxShadow: [
-                      BoxShadow(
-                        color: const Color(0xFF8B6A55).withValues(alpha: 0.09),
-                        blurRadius: 26,
-                        offset: const Offset(0, 12),
-                      ),
-                    ],
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        statusLabel,
-                        style: const TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                          color: Color(0xFF8E725F),
-                          letterSpacing: 0.2,
-                        ),
-                      ),
-                      const SizedBox(height: 18),
-                      Text(
-                        _resolvedHeadlineText(),
-                        style: const TextStyle(
-                          fontSize: 28,
-                          height: 1.22,
-                          fontWeight: FontWeight.w700,
-                          color: Color(0xFF2F241D),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 16),
-                Expanded(
+        return Stack(
+          children: [
+            content,
+            Positioned(
+              right: 16,
+              bottom: 16,
+              child: SafeArea(
+                child: Material(
+                  color: Colors.transparent,
                   child: Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(20),
+                    padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.70),
-                      borderRadius: BorderRadius.circular(28),
-                      border: Border.all(color: const Color(0xFFE8DCCF)),
+                      color: HelloAgainPalette.ink.withValues(alpha: 0.92),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: HelloAgainPalette.whiteSmoke.withValues(
+                          alpha: 0.22,
+                        ),
+                      ),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Color(0x22000000),
+                          blurRadius: 18,
+                          offset: Offset(0, 10),
+                        ),
+                      ],
                     ),
                     child: Column(
+                      mainAxisSize: MainAxisSize.min,
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        AnimatedContainer(
-                          duration: const Duration(milliseconds: 220),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: indicatorColor.withValues(alpha: 0.12),
-                            borderRadius: BorderRadius.circular(999),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Container(
-                                width: 10,
-                                height: 10,
-                                decoration: BoxDecoration(
-                                  color: indicatorColor,
-                                  shape: BoxShape.circle,
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                statusLabel,
-                                style: TextStyle(
-                                  fontSize: 14,
-                                  fontWeight: FontWeight.w700,
-                                  color: indicatorColor,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 18),
                         Text(
-                          _resolvedBodyText(),
-                          style: const TextStyle(
-                            fontSize: 24,
-                            height: 1.42,
-                            color: Color(0xFF312620),
-                          ),
+                          'Developer only',
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(
+                                color: HelloAgainPalette.whiteSmoke.withValues(
+                                  alpha: 0.82,
+                                ),
+                                fontWeight: FontWeight.w700,
+                              ),
                         ),
-                        if (showPhoneAccessChoices) ...[
-                          const SizedBox(height: 18),
-                          SizedBox(
-                            width: double.infinity,
-                            child: FilledButton(
-                              onPressed: isWorking
-                                  ? null
-                                  : onAllowPhoneThisTime,
-                              style: FilledButton.styleFrom(
-                                backgroundColor: const Color(0xFFB56B4D),
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(
-                                  vertical: 16,
-                                ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(18),
-                                ),
-                              ),
-                              child: const Text(
-                                'Allow this time',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ),
+                        const SizedBox(height: 8),
+                        FilledButton.icon(
+                          onPressed: _isResettingOnboarding
+                              ? null
+                              : _restartOnboardingForTesting,
+                          icon: const Icon(Icons.science_outlined, size: 18),
+                          label: Text(
+                            _isResettingOnboarding
+                                ? 'Resetting...'
+                                : 'Test onboarding',
                           ),
-                          const SizedBox(height: 10),
-                          SizedBox(
-                            width: double.infinity,
-                            child: FilledButton.tonal(
-                              onPressed: isWorking ? null : onAllowPhoneAlways,
-                              style: FilledButton.styleFrom(
-                                foregroundColor: const Color(0xFF6B5444),
-                                padding: const EdgeInsets.symmetric(
-                                  vertical: 16,
-                                ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(18),
-                                ),
-                              ),
-                              child: const Text(
-                                'Allow always',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          SizedBox(
-                            width: double.infinity,
-                            child: OutlinedButton(
-                              onPressed: isWorking ? null : onDenyPhoneAccess,
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: const Color(0xFF6B5444),
-                                side: const BorderSide(
-                                  color: Color(0xFFD6C4B2),
-                                ),
-                                padding: const EdgeInsets.symmetric(
-                                  vertical: 16,
-                                ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(18),
-                                ),
-                              ),
-                              child: const Text(
-                                'Don’t allow',
-                                style: TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
-                        const Spacer(),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.all(16),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFF8F1E8),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Text(
-                            statusText,
-                            style: const TextStyle(
-                              fontSize: 15,
-                              height: 1.45,
-                              color: Color(0xFF6D5A4E),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: HelloAgainPalette.blushedBrick,
+                            foregroundColor: HelloAgainPalette.whiteSmoke,
+                            visualDensity: VisualDensity.compact,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 10,
                             ),
                           ),
                         ),
@@ -1305,118 +218,14 @@ class RegistrationScreen extends StatelessWidget {
                     ),
                   ),
                 ),
-                const SizedBox(height: 14),
-                SizedBox(
-                  width: double.infinity,
-                  child: OutlinedButton(
-                    onPressed: isListening || showPhoneAccessChoices
-                        ? null
-                        : onRetry,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: const Color(0xFF6B5444),
-                      side: const BorderSide(color: Color(0xFFD6C4B2)),
-                      backgroundColor: Colors.white.withValues(alpha: 0.60),
-                      padding: const EdgeInsets.symmetric(vertical: 18),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(22),
-                      ),
-                    ),
-                    child: showVoiceStartPrompt
-                        ? const Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(Icons.volume_up_rounded, size: 22),
-                              SizedBox(width: 10),
-                              Text(
-                                'Start',
-                                style: TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w700,
-                                ),
-                              ),
-                            ],
-                          )
-                        : Text(
-                            isWorking && !isConfirming
-                                ? 'Please wait...'
-                                : actionLabel,
-                            style: const TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                  ),
-                ),
-              ],
+              ),
             ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _WarmPaperBackground extends StatelessWidget {
-  const _WarmPaperBackground({required this.child});
-
-  final Widget child;
-
-  @override
-  Widget build(BuildContext context) {
-    return Stack(
-      fit: StackFit.expand,
-      children: [
-        const ColoredBox(color: Color(0xFFF4EDE3)),
-        Positioned(
-          top: -28,
-          right: -10,
-          child: _BackdropOrb(diameter: 180, color: const Color(0xFFE8D7C6)),
-        ),
-        Positioned(
-          top: 120,
-          left: -46,
-          child: _BackdropOrb(diameter: 128, color: const Color(0xFFE3D4C3)),
-        ),
-        Positioned(
-          bottom: -44,
-          right: 18,
-          child: _BackdropOrb(diameter: 168, color: const Color(0xFFDDCBB8)),
-        ),
-        Positioned.fill(
-          child: DecoratedBox(
-            decoration: BoxDecoration(
-              color: Colors.white.withValues(alpha: 0.06),
-              border: Border.all(color: Colors.white.withValues(alpha: 0.22)),
-            ),
-          ),
-        ),
-        child,
-      ],
-    );
-  }
-}
-
-class _BackdropOrb extends StatelessWidget {
-  const _BackdropOrb({required this.diameter, required this.color});
-
-  final double diameter;
-  final Color color;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: diameter,
-      height: diameter,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        color: color.withValues(alpha: 0.42),
-        boxShadow: [
-          BoxShadow(
-            color: color.withValues(alpha: 0.22),
-            blurRadius: 48,
-            spreadRadius: 8,
-          ),
-        ],
+          ],
+        );
+      },
+      home: KeyedSubtree(
+        key: ValueKey(_shellVersion),
+        child: const HelloAgainShell(),
       ),
     );
   }

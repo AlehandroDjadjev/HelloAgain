@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 class CapturedAudioTurn {
@@ -28,21 +29,31 @@ class BrowserVoiceBridge {
 
   static const int _sampleRate = 16000;
   static const int _channels = 1;
-  static const double _speechThreshold = 0.035;
+  static const double _speechThreshold = 0.015;
+  static const double _softSpeechThreshold = 0.008;
   static const Duration _maxTurnLength = Duration(seconds: 14);
   static const Duration _minTurnLength = Duration(milliseconds: 450);
   static const Duration _silenceWindow = Duration(milliseconds: 900);
+  static const Duration _speechBootstrapWindow = Duration(seconds: 2);
   static const int _preSpeechChunkLimit = 8;
 
   bool _initialized = false;
+  String? _resolvedTtsLanguage;
 
   bool get isSpeechRecognitionSupported => true;
+
+  Future<void> primeVoiceExperience() async {
+    await _ensureInitialized('bg-BG');
+    await _ensureMicrophonePermission();
+    await _tts.stop();
+    await _player.stop();
+  }
 
   Future<CapturedAudioTurn> captureAudioTurn({
     String language = 'bg-BG',
   }) async {
     await _ensureInitialized(language);
-    if (!await _recorder.hasPermission()) {
+    if (!await _ensureMicrophonePermission()) {
       throw StateError('Microphone permission was not granted.');
     }
 
@@ -65,6 +76,7 @@ class BrowserVoiceBridge {
     var speechDetected = false;
     DateTime? speechStartedAt;
     DateTime? lastVoiceAt;
+    final listeningStartedAt = DateTime.now();
     StreamSubscription<Uint8List>? sub;
 
     Future<void> finishCapture() async {
@@ -130,7 +142,13 @@ class BrowserVoiceBridge {
           preSpeechChunks.removeFirst();
         }
 
-        if (level >= _speechThreshold) {
+        final timeListening = now.difference(listeningStartedAt);
+        final crossedSpeechThreshold =
+            level >= _speechThreshold ||
+            (timeListening >= _speechBootstrapWindow &&
+                level >= _softSpeechThreshold);
+
+        if (crossedSpeechThreshold) {
           speechDetected = true;
           speechStartedAt = now;
           lastVoiceAt = now;
@@ -207,13 +225,65 @@ class BrowserVoiceBridge {
       return;
     }
     await _tts.awaitSpeakCompletion(true);
+    await _tts.setVolume(1.0);
     await _tts.setSpeechRate(0.42);
     await _tts.setPitch(1.0);
+    await _tts.setQueueMode(0);
+    try {
+      await _tts.setAudioAttributesForNavigation();
+    } catch (_) {}
     await _player.setReleaseMode(ReleaseMode.stop);
-    await _tts.setLanguage(
-      preferredLanguage.toLowerCase().startsWith('bg') ? 'bg-BG' : 'en-US',
+    await _player.setAudioContext(
+      AudioContext(
+        android: const AudioContextAndroid(
+          isSpeakerphoneOn: true,
+          contentType: AndroidContentType.speech,
+          usageType: AndroidUsageType.assistant,
+          audioFocus: AndroidAudioFocus.gainTransientMayDuck,
+        ),
+        iOS: AudioContextIOS(
+          category: AVAudioSessionCategory.playAndRecord,
+          options: const {
+            AVAudioSessionOptions.defaultToSpeaker,
+            AVAudioSessionOptions.allowBluetooth,
+            AVAudioSessionOptions.allowBluetoothA2DP,
+            AVAudioSessionOptions.mixWithOthers,
+          },
+        ),
+      ),
     );
+    _resolvedTtsLanguage = await _resolveTtsLanguage(preferredLanguage);
+    await _tts.setLanguage(_resolvedTtsLanguage!);
     _initialized = true;
+  }
+
+  Future<bool> _ensureMicrophonePermission() async {
+    if (await _recorder.hasPermission()) {
+      return true;
+    }
+    final status = await Permission.microphone.request();
+    if (status.isGranted) {
+      return await _recorder.hasPermission();
+    }
+    return false;
+  }
+
+  Future<String> _resolveTtsLanguage(String preferredLanguage) async {
+    final wantsBulgarian = preferredLanguage.toLowerCase().startsWith('bg');
+    final candidates = wantsBulgarian
+        ? const ['bg-BG', 'bg_BG', 'bg', 'en-US']
+        : const ['en-US', 'en_US', 'en'];
+
+    for (final candidate in candidates) {
+      try {
+        final available = await _tts.isLanguageAvailable(candidate);
+        if (available == true) {
+          return candidate;
+        }
+      } catch (_) {}
+    }
+
+    return wantsBulgarian ? 'bg-BG' : 'en-US';
   }
 
   Future<void> _waitForPlaybackToFinish() async {

@@ -162,10 +162,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (command.isEmpty) return;
     _lastSubmittedCommand = command;
     FocusScope.of(context).unfocus();
-    await _orch.prepare(
-      command,
-      reasoningProvider: _defaultReasoningProvider,
-    );
+    await _orch.prepare(command, reasoningProvider: _defaultReasoningProvider);
     if (!mounted) {
       return;
     }
@@ -644,11 +641,11 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (!isNavigationIntent &&
         ambiguityFlags.any(
-      (flag) =>
-          flag.contains('not_actionable') ||
-          flag.contains('unknown') ||
-          flag.contains('ambiguous'),
-    )) {
+          (flag) =>
+              flag.contains('not_actionable') ||
+              flag.contains('unknown') ||
+              flag.contains('ambiguous'),
+        )) {
       return 'The parsed command is still ambiguous.';
     }
     return null;
@@ -803,10 +800,7 @@ class _HomeScreenState extends State<HomeScreen> {
                             Expanded(
                               child: TextField(
                                 controller: _urlCtrl,
-                                style: const TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontSize: 13,
-                                ),
+                                style: const TextStyle(fontSize: 13),
                                 decoration: InputDecoration(
                                   labelText: 'Backend URL',
                                   isDense: true,
@@ -1642,11 +1636,7 @@ class _LogView extends StatelessWidget {
             padding: const EdgeInsets.only(bottom: 2),
             child: RichText(
               text: TextSpan(
-                style: const TextStyle(
-                  fontFamily: 'monospace',
-                  fontSize: 12,
-                  height: 1.5,
-                ),
+                style: const TextStyle(fontSize: 12, height: 1.5),
                 children: [
                   TextSpan(
                     text: '[${entry.timeLabel}] ',
