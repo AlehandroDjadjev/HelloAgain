@@ -15,7 +15,9 @@ import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
 
 const _bloodRed = Color(0xFF8C1C13);
-const _whiteSmoke = Color(0xFFFFFFFF);
+const _almondCream = Color(0xFFE7D7C1);
+const _whiteSmoke = Color(0xFFF7F4F3);
+const _dustGrey = Color(0xFFE6DDDB);
 
 Future<void> main() async {
   await _runWhitespaceApp(
@@ -1991,6 +1993,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                           child: _SpeechTrailOverlay(
                             speech: _lastSpeech,
                             compact: isCompact,
+                            availableWidth:
+                                constraints.maxWidth - (horizontalPadding * 2),
                           ),
                         ),
                       ),
@@ -2064,7 +2068,7 @@ class _VoiceToggleButton extends StatelessWidget {
           ),
         ],
       ),
-        child: Semantics(
+      child: Semantics(
         button: true,
         label: '$label. $semanticsLabel',
         child: Material(
@@ -2085,20 +2089,24 @@ class _VoiceToggleButton extends StatelessWidget {
                       duration: const Duration(milliseconds: 220),
                       transitionBuilder: (child, animation) {
                         return RotationTransition(
-                          turns: Tween<double>(begin: 0.88, end: 1).animate(
-                            animation,
+                          turns: Tween<double>(
+                            begin: 0.88,
+                            end: 1,
+                          ).animate(animation),
+                          child: FadeTransition(
+                            opacity: animation,
+                            child: child,
                           ),
-                          child: FadeTransition(opacity: animation, child: child),
                         );
                       },
-                    child: Icon(
-                      icon,
-                      key: ValueKey(icon),
-                      color: foreground,
-                      size: isActive ? 42 : 38,
+                      child: Icon(
+                        icon,
+                        key: ValueKey(icon),
+                        color: foreground,
+                        size: isActive ? 42 : 38,
+                      ),
                     ),
                   ),
-                ),
                   const SizedBox(height: 10),
                   AnimatedSwitcher(
                     duration: const Duration(milliseconds: 220),
@@ -2137,10 +2145,12 @@ class _SpeechTrailOverlay extends StatefulWidget {
   const _SpeechTrailOverlay({
     required this.speech,
     required this.compact,
+    required this.availableWidth,
   });
 
   final String speech;
   final bool compact;
+  final double availableWidth;
 
   @override
   State<_SpeechTrailOverlay> createState() => _SpeechTrailOverlayState();
@@ -2171,9 +2181,7 @@ class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
     _animationToken = token;
     setState(() {
       _words = words;
-      _activeWordIndex = words.isEmpty
-          ? -1
-          : (animate ? 0 : words.length - 1);
+      _activeWordIndex = words.isEmpty ? -1 : (animate ? 0 : words.length - 1);
     });
     if (animate && words.length > 1) {
       unawaited(_animateSpeechWords(words, token));
@@ -2197,10 +2205,14 @@ class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
 
   @override
   Widget build(BuildContext context) {
-    final width = widget.compact ? 300.0 : 520.0;
-    final height = widget.compact ? 98.0 : 116.0;
-    final fontSize = widget.compact ? 28.0 : 33.0;
-    final gap = widget.compact ? 14.0 : 18.0;
+    final width = widget.availableWidth
+        .clamp(widget.compact ? 220.0 : 320.0, widget.compact ? 360.0 : 560.0)
+        .toDouble();
+    final height = widget.compact ? 86.0 : 104.0;
+    final fontSize = (width / (widget.compact ? 11.8 : 14.5))
+        .clamp(widget.compact ? 18.0 : 22.0, widget.compact ? 26.0 : 31.0)
+        .toDouble();
+    final gap = widget.compact ? 10.0 : 14.0;
     final spokenPrefix =
         _activeWordIndex >= 0 && _activeWordIndex < _words.length
         ? _words.sublist(0, _activeWordIndex + 1)
@@ -2236,6 +2248,7 @@ class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
               compact: widget.compact,
               gap: gap,
               maxWidth: width,
+              fontSize: fontSize,
               slideOffset: const Offset(0.14, 0),
               shaderBuilder: _buildSpeechTrailEntryShader,
             ),
@@ -2246,6 +2259,7 @@ class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
               compact: widget.compact,
               gap: gap,
               maxWidth: width,
+              fontSize: fontSize,
               slideOffset: const Offset(-0.16, 0),
               shaderBuilder: _buildSpeechTrailExitShader,
             ),
@@ -2263,6 +2277,7 @@ class _SpeechTrailRow extends StatelessWidget {
     required this.compact,
     required this.gap,
     required this.maxWidth,
+    required this.fontSize,
     required this.slideOffset,
     required this.shaderBuilder,
   });
@@ -2271,23 +2286,16 @@ class _SpeechTrailRow extends StatelessWidget {
   final bool compact;
   final double gap;
   final double maxWidth;
+  final double fontSize;
   final Offset slideOffset;
   final Shader Function(Rect bounds) shaderBuilder;
 
   @override
   Widget build(BuildContext context) {
-    final fontSize = compact ? 28.0 : 33.0;
-    final contentWidth = _speechTrailContentWidth(
-      words,
-      fontSize: fontSize,
-      gap: gap,
-    );
     if (words.isEmpty) {
-      return SizedBox(
-        width: maxWidth,
-        height: compact ? 30 : 36,
-      );
+      return SizedBox(width: maxWidth, height: compact ? 30 : 36);
     }
+    final text = words.join(' ');
 
     return TweenAnimationBuilder<double>(
       tween: Tween(begin: 0, end: 1),
@@ -2308,68 +2316,32 @@ class _SpeechTrailRow extends StatelessWidget {
       child: Align(
         alignment: Alignment.centerRight,
         child: SizedBox(
-          width: contentWidth,
+          width: maxWidth,
           child: ShaderMask(
             blendMode: BlendMode.dstIn,
             shaderCallback: shaderBuilder,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                for (var index = 0; index < words.length; index++) ...[
-                  _SpeechTrailWord(
-                    word: words[index],
-                    compact: compact,
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerRight,
+                child: Text(
+                  text,
+                  maxLines: 1,
+                  overflow: TextOverflow.visible,
+                  softWrap: false,
+                  textAlign: TextAlign.right,
+                  style: TextStyle(
+                    color: _bloodRed,
+                    fontSize: fontSize,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.5,
+                    height: 1,
                   ),
-                  if (index != words.length - 1) SizedBox(width: gap),
-                ],
-              ],
+                ),
+              ),
             ),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _SpeechTrailWord extends StatelessWidget {
-  const _SpeechTrailWord({
-    required this.word,
-    required this.compact,
-  });
-
-  final String word;
-  final bool compact;
-
-  @override
-  Widget build(BuildContext context) {
-    final fontSize = compact ? 28.0 : 33.0;
-
-    return ShaderMask(
-      blendMode: BlendMode.srcIn,
-      shaderCallback: (bounds) {
-        return const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            Color(0xFFBF4342),
-            Color(0xFF8C1C13),
-            Colors.black,
-          ],
-        ).createShader(bounds);
-      },
-      child: Text(
-        word,
-        maxLines: 1,
-        overflow: TextOverflow.visible,
-        softWrap: false,
-        textAlign: TextAlign.center,
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: fontSize,
-          fontWeight: FontWeight.w800,
-          letterSpacing: -0.6,
-          height: 1,
         ),
       ),
     );
@@ -2403,11 +2375,13 @@ _VisibleSpeechTrailSlice _visibleSpeechTrailSlice(
   for (var index = words.length - 1; index >= 0; index--) {
     final word = words[index];
     final wordWidth = _measureSpeechTrailWordWidth(word, fontSize);
+    final nextWidth =
+        usedWidth + (visibleReversed.isNotEmpty ? gap : 0) + wordWidth;
+    if (visibleReversed.isNotEmpty && nextWidth > maxWidth) {
+      break;
+    }
     if (visibleReversed.isNotEmpty) {
       usedWidth += gap;
-    }
-    if (visibleReversed.isNotEmpty && usedWidth >= maxWidth) {
-      break;
     }
     visibleReversed.add(word);
     usedWidth += wordWidth;
@@ -2421,43 +2395,26 @@ _VisibleSpeechTrailSlice _visibleSpeechTrailSlice(
 }
 
 List<Duration> _estimateSpeechTrailWordTimings(List<String> words) {
-  return words.map((word) {
-    final clean = word.replaceAll(
-      RegExp(r"""[\s\.,!?;:'"()\[\]{}\-_\/\\]+"""),
-      '',
-    );
-    final characterCount = math.max(1, clean.length);
-    final hasPause = word.contains(RegExp(r'[,.!?;:]'));
-    final milliseconds = 160 + (characterCount * 32) + (hasPause ? 120 : 0);
-    return Duration(milliseconds: milliseconds.clamp(180, 520));
-  }).toList(growable: false);
-}
-
-double _speechTrailContentWidth(
-  List<String> words, {
-  required double fontSize,
-  required double gap,
-}) {
-  if (words.isEmpty) {
-    return 0;
-  }
-  return words.fold<double>(
-        0,
-        (sum, word) => sum + _measureSpeechTrailWordWidth(word, fontSize),
-      ) +
-      (gap * math.max(0, words.length - 1));
+  return words
+      .map((word) {
+        final clean = word.replaceAll(
+          RegExp(r"""[\s\.,!?;:'"()\[\]{}\-_\/\\]+"""),
+          '',
+        );
+        final characterCount = math.max(1, clean.length);
+        final hasPause = word.contains(RegExp(r'[,.!?;:]'));
+        final milliseconds = 160 + (characterCount * 32) + (hasPause ? 120 : 0);
+        return Duration(milliseconds: milliseconds.clamp(180, 520));
+      })
+      .toList(growable: false);
 }
 
 Shader _buildSpeechTrailEntryShader(Rect bounds) {
   return ui.Gradient.linear(
     bounds.centerLeft,
     bounds.centerRight,
-    const <Color>[
-      Colors.white,
-      Colors.white,
-      Colors.transparent,
-    ],
-    const <double>[0.0, 0.9, 1.0],
+    const <Color>[Colors.white, Colors.white, Colors.transparent],
+    const <double>[0.0, 0.94, 1.0],
   );
 }
 
@@ -2465,12 +2422,8 @@ Shader _buildSpeechTrailExitShader(Rect bounds) {
   return ui.Gradient.linear(
     bounds.centerLeft,
     bounds.centerRight,
-    const <Color>[
-      Colors.transparent,
-      Colors.white,
-      Colors.white,
-    ],
-    const <double>[0.0, 0.1, 1.0],
+    const <Color>[Colors.transparent, Colors.white, Colors.white],
+    const <double>[0.0, 0.06, 1.0],
   );
 }
 
@@ -4427,17 +4380,17 @@ class GridPainter extends CustomPainter {
 
     return [
       _GridLayer(
-        color: const Color(0x14000000),
+        color: _dustGrey.withValues(alpha: 0.24),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),
       _GridLayer(
-        color: const Color(0x22000000),
+        color: _almondCream.withValues(alpha: 0.38),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),
       _GridLayer(
-        color: const Color(0x30000000),
+        color: _dustGrey.withValues(alpha: 0.52),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),

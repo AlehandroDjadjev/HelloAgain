@@ -252,17 +252,17 @@ class _HomeScreenState extends State<HomeScreen> {
   String _buildConfirmationSpeech(ConfirmationRequest conf) {
     final summary = conf.actionSummary.trim();
     if (summary.isEmpty) {
-      return 'Преди да продължа, искам потвърждение. Правилно ли разбирам, че мога да действам? Кажете да, за да продължа, или не, за да спра.';
+      return 'Нужно ми е потвърждение. Да продължа ли?';
     }
-    return 'Преди да продължа, искам потвърждение. Правилно ли разбирам, че трябва да направя следното: $summary? Кажете да, за да продължа, или не, за да спра.';
+    return 'Да продължа ли с: $summary?';
   }
 
   String _buildIntentConfirmationSpeech() {
     final summary = (_pendingIntentSummary ?? _lastSubmittedCommand).trim();
     if (summary.isEmpty) {
-      return 'Чух команда, но искам първо да потвърдя. Правилно ли разбрах какво искате да направя? Кажете да, ако съм разбрал правилно, или не, ако трябва да опитаме отново.';
+      return 'Искам да потвърдя заявката. Разбрах ли правилно?';
     }
-    return 'Правилно ли разбрах, че искате да направя следното: $summary? Кажете да, ако това е правилно, или не, ако трябва да коригирам командата.';
+    return 'Разбрах го така: $summary. Точно ли е?';
   }
 
   Future<void> _toggleHandsFree() async {
@@ -659,8 +659,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _invalidIntentSpeech() {
-    return 'Това не звучи като ясна команда за действие на телефона. '
-        'Кажете например: отвори Chrome, потърси нещо в Chrome или изпрати съобщение в WhatsApp.';
+    return 'Кажете по-конкретно какво да отворя и какво да направя там.';
   }
 
   Future<void> _handleInvalidPreparedIntent(
