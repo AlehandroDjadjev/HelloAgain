@@ -363,7 +363,10 @@ class StepRunner {
         return gateway.focusElement(_selectorFromParams(params));
 
       case 'TYPE_TEXT':
-        return gateway.typeText(params['text'] as String? ?? '');
+        return gateway.typeText(
+          params['text'] as String? ?? '',
+          append: params['append'] as bool? ?? false,
+        );
 
       case 'CLEAR_TEXT':
         return gateway.clearFocusedField();

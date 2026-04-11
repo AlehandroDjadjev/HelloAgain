@@ -129,8 +129,8 @@ class DeviceControlChannel implements AndroidControlApi {
       _invokeAction('focusElement', selector.toMap());
 
   @override
-  Future<ActionResult> typeText(String text) =>
-      _invokeAction('typeText', {'text': text});
+  Future<ActionResult> typeText(String text, {bool append = false}) =>
+      _invokeAction('typeText', {'text': text, 'append': append});
 
   @override
   Future<ActionResult> clearFocusedField() =>

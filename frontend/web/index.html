@@ -41,14 +41,12 @@
       let playbackAudioContext = null;
 
       const captureConfig = {
-        startThreshold: 0.035,
-        stopThreshold: 0.018,
-        speechFramesToStart: 2,
-        silenceMsToStop: 900,
-        minSpeechMs: 650,
-        startupTimeoutMs: 10000,
-        forceRecordAfterMs: 900,
-        maxCaptureMs: 14000,
+        startThreshold: 0.022,
+        stopThreshold: 0.012,
+        silenceMsToStop: 700,
+        minSpeechMs: 320,
+        startupTimeoutMs: 8000,
+        maxCaptureMs: 18000,
       };
 
       const captureState = {
@@ -61,8 +59,10 @@
         chunks: [],
         recording: false,
         recordingStartedAt: 0,
+        speechDetected: false,
+        firstSpeechAt: 0,
+        lastVoiceAt: 0,
         silenceStartedAt: null,
-        speechFrameCount: 0,
         rafId: null,
         pendingMimeType: '',
       };
@@ -110,10 +110,6 @@
           clearTimeout(activeCapture.startupTimer);
           activeCapture.startupTimer = null;
         }
-        if (activeCapture && activeCapture.forceRecordTimer !== null) {
-          clearTimeout(activeCapture.forceRecordTimer);
-          activeCapture.forceRecordTimer = null;
-        }
         if (activeCapture && activeCapture.maxCaptureTimer !== null) {
           clearTimeout(activeCapture.maxCaptureTimer);
           activeCapture.maxCaptureTimer = null;
@@ -131,8 +127,10 @@
         captureState.chunks = [];
         captureState.recording = false;
         captureState.recordingStartedAt = 0;
+        captureState.speechDetected = false;
+        captureState.firstSpeechAt = 0;
+        captureState.lastVoiceAt = 0;
         captureState.silenceStartedAt = null;
-        captureState.speechFrameCount = 0;
         captureState.pendingMimeType = '';
         captureState.mediaRecorder = null;
       }
@@ -284,12 +282,22 @@
             return;
           }
 
+          const detectedSpeech = captureState.speechDetected;
+          const speechDurationMs =
+            captureState.firstSpeechAt && captureState.lastVoiceAt
+              ? captureState.lastVoiceAt - captureState.firstSpeechAt
+              : 0;
           const blob = new Blob(captureState.chunks, {
             type: recorder.mimeType || mimeType || 'audio/webm',
           });
           const pending = activeCapture;
 
-          if (blob.size < 2048) {
+          if (!detectedSpeech || speechDurationMs < captureConfig.minSpeechMs) {
+            finalizeCaptureFailure('No speech was captured.');
+            return;
+          }
+
+          if (blob.size < 512) {
             finalizeCaptureFailure('No speech was captured.');
             return;
           }
@@ -322,6 +330,9 @@
         recorder.start(250);
         captureState.recording = true;
         captureState.recordingStartedAt = performance.now();
+        captureState.speechDetected = false;
+        captureState.firstSpeechAt = 0;
+        captureState.lastVoiceAt = 0;
         captureState.silenceStartedAt = null;
         if (activeCapture) {
           if (activeCapture.maxCaptureTimer !== null) {
@@ -349,37 +360,45 @@
         const rms = rmsFromAnalyser();
         const now = performance.now();
 
-        if (!captureState.recording) {
-          if (rms >= captureConfig.startThreshold) {
-            captureState.speechFrameCount += 1;
-            if (captureState.speechFrameCount >= captureConfig.speechFramesToStart) {
-              captureState.speechFrameCount = 0;
-              startRecorder();
-            }
-          } else {
-            captureState.speechFrameCount = 0;
-          }
-        } else if (captureState.mediaRecorder) {
+        if (captureState.recording && captureState.mediaRecorder) {
           const elapsed = now - captureState.recordingStartedAt;
-          if (rms < captureConfig.stopThreshold) {
-            if (captureState.silenceStartedAt === null) {
-              captureState.silenceStartedAt = now;
+          if (rms >= captureConfig.startThreshold) {
+            if (!captureState.speechDetected) {
+              captureState.speechDetected = true;
+              captureState.firstSpeechAt = now;
             }
+            captureState.lastVoiceAt = now;
+            captureState.silenceStartedAt = null;
+          } else if (captureState.speechDetected) {
+            if (rms >= captureConfig.stopThreshold) {
+              captureState.lastVoiceAt = now;
+              captureState.silenceStartedAt = null;
+            } else {
+              if (captureState.silenceStartedAt === null) {
+                captureState.silenceStartedAt = now;
+              }
 
-            const silenceElapsed = now - captureState.silenceStartedAt;
-            if (
-              elapsed >= captureConfig.minSpeechMs &&
-              silenceElapsed >= captureConfig.silenceMsToStop
-            ) {
-              try {
-                captureState.mediaRecorder.stop();
-              } catch (_) {
-                finalizeCaptureFailure('Audio recording stopped unexpectedly.');
-                return;
+              const silenceElapsed = now - captureState.silenceStartedAt;
+              const speechElapsed = captureState.lastVoiceAt - captureState.firstSpeechAt;
+              if (
+                speechElapsed >= captureConfig.minSpeechMs &&
+                silenceElapsed >= captureConfig.silenceMsToStop
+              ) {
+                try {
+                  captureState.mediaRecorder.stop();
+                } catch (_) {
+                  finalizeCaptureFailure('Audio recording stopped unexpectedly.');
+                  return;
+                }
               }
             }
-          } else {
-            captureState.silenceStartedAt = null;
+          } else if (elapsed >= captureConfig.startupTimeoutMs) {
+            try {
+              captureState.mediaRecorder.stop();
+            } catch (_) {
+              finalizeCaptureFailure('No speech was captured.');
+              return;
+            }
           }
         }
 
@@ -455,19 +474,24 @@
             done: false,
             language: language || 'bg-BG',
             startupTimer: setTimeout(() => {
-              if (captureState.recording) {
+              if (!activeCapture || activeCapture.done || captureState.speechDetected) {
                 return;
+              }
+              if (
+                captureState.mediaRecorder &&
+                captureState.mediaRecorder.state !== 'inactive'
+              ) {
+                try {
+                  captureState.mediaRecorder.stop();
+                  return;
+                } catch (_) {}
               }
               finalizeCaptureFailure('No speech was captured.');
             }, captureConfig.startupTimeoutMs),
-            forceRecordTimer: setTimeout(() => {
-              if (!activeCapture || activeCapture.done || captureState.recording) {
-                return;
-              }
-              startRecorder();
-            }, captureConfig.forceRecordAfterMs),
+            maxCaptureTimer: null,
           };
 
+          startRecorder();
           monitorCaptureLoop();
         });
       }

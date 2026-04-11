@@ -40,7 +40,7 @@ abstract class AndroidControlApi {
   Future<ActionResult> tapElement(Selector selector);
   Future<ActionResult> longPressElement(Selector selector);
   Future<ActionResult> focusElement(Selector selector);
-  Future<ActionResult> typeText(String text);
+  Future<ActionResult> typeText(String text, {bool append = false});
   Future<ActionResult> clearFocusedField();
   Future<ActionResult> scroll(String direction);
   Future<ActionResult> swipe(

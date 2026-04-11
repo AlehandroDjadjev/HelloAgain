@@ -850,6 +850,8 @@ class SemiAgentService:
             "so be tolerant, explanatory, patient, and helpful. Use the MCP context "
             "only when it helps the answer. This reply will go directly into text to "
             "speech, so keep it natural and easy to say aloud. "
+            "Keep every sentence subtitle-friendly, with no more than 10 words per sentence. "
+            "Prefer several very short sentences over one long sentence. "
             "If an MCP already completed the concrete action, keep the reply semi-short: "
             "briefly acknowledge what was done, mention where the result now lives when relevant, "
             "and do not repeat the full operational payload because the MCP or board object is handling that part. "

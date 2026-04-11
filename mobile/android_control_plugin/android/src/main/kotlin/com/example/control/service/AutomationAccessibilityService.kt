@@ -288,7 +288,7 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
         }
     }
 
-    override fun typeText(text: String): ActionResultDto {
+    override fun typeText(text: String, append: Boolean): ActionResultDto {
         val root = rootInActiveWindow
             ?: return ActionResultDto.failure("NO_ROOT", "rootInActiveWindow is null")
         return try {
@@ -297,14 +297,46 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
                     "ELEMENT_NOT_FOUND", "No focused editable field found"
                 )
             try {
+                val normalizedText = text.replace("\r\n", "\n")
+                if (isSubmitOnlyText(normalizedText)) {
+                    val ok = submitFocusedField(focused)
+                    val screen = snapshotScreenState()
+                    return if (ok) {
+                        ActionResultDto.success("Focused field submitted", screen)
+                    } else {
+                        ActionResultDto.failure(
+                            "ACTION_FAILED",
+                            "Submit/enter action returned false",
+                        )
+                    }
+                }
+
+                val replacementText = if (append) {
+                    val existingText = focused.text?.toString().orEmpty()
+                    existingText + normalizedText
+                } else {
+                    normalizedText
+                }
+
                 val args = Bundle()
                 args.putCharSequence(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text
+                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                    replacementText,
                 )
                 val ok = focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
                 val screen = snapshotScreenState()
-                if (ok) ActionResultDto.success("Text set (${text.length} chars)", screen)
-                else ActionResultDto.failure("ACTION_FAILED", "ACTION_SET_TEXT returned false")
+                if (ok) {
+                    ActionResultDto.success(
+                        if (append) {
+                            "Text appended (${normalizedText.length} chars)"
+                        } else {
+                            "Text set (${normalizedText.length} chars)"
+                        },
+                        screen,
+                    )
+                } else {
+                    ActionResultDto.failure("ACTION_FAILED", "ACTION_SET_TEXT returned false")
+                }
             } finally {
                 focused.recycle()
             }
@@ -574,6 +606,18 @@ class AutomationAccessibilityService : AccessibilityService(), DeviceControlGate
 
         return false
     }
+
+    private fun submitFocusedField(node: AccessibilityNodeInfo): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
+                return true
+            }
+        }
+        return performClickWithAncestorFallback(node)
+    }
+
+    private fun isSubmitOnlyText(text: String): Boolean =
+        text.isNotEmpty() && text.all { it == '\n' || it == '\r' }
 
     private fun selectorSummary(selector: SelectorDto): String = listOfNotNull(
         selector.elementRef?.let { "elementRef=$it" },

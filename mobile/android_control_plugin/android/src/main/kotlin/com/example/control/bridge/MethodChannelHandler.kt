@@ -125,7 +125,8 @@ class MethodChannelHandler(private val appContext: Context) :
             }
             "typeText" -> {
                 val text = call.argument<String>("text") ?: ""
-                service.typeText(text).toMap()
+                val append = call.argument<Boolean>("append") ?: false
+                service.typeText(text, append).toMap()
             }
             "clearFocusedField" -> service.clearFocusedField().toMap()
             "scroll" -> {

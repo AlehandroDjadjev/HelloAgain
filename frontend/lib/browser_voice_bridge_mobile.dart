@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:collection';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:audioplayers/audioplayers.dart';
@@ -29,12 +30,13 @@ class BrowserVoiceBridge {
 
   static const int _sampleRate = 16000;
   static const int _channels = 1;
-  static const double _speechThreshold = 0.015;
-  static const double _softSpeechThreshold = 0.008;
-  static const Duration _maxTurnLength = Duration(seconds: 14);
-  static const Duration _minTurnLength = Duration(milliseconds: 450);
-  static const Duration _silenceWindow = Duration(milliseconds: 900);
-  static const Duration _speechBootstrapWindow = Duration(seconds: 2);
+  static const double _speechThreshold = 0.010;
+  static const double _softSpeechThreshold = 0.0055;
+  static const Duration _maxTurnLength = Duration(seconds: 18);
+  static const Duration _minTurnLength = Duration(milliseconds: 320);
+  static const Duration _silenceWindow = Duration(milliseconds: 700);
+  static const Duration _speechBootstrapWindow = Duration(milliseconds: 1200);
+  static const Duration _noSpeechWindow = Duration(seconds: 8);
   static const int _preSpeechChunkLimit = 8;
 
   bool _initialized = false;
@@ -45,6 +47,9 @@ class BrowserVoiceBridge {
   Future<void> primeVoiceExperience() async {
     await _ensureInitialized('bg-BG');
     await _ensureMicrophonePermission();
+    try {
+      await _recorder.stop();
+    } catch (_) {}
     await _tts.stop();
     await _player.stop();
   }
@@ -57,6 +62,9 @@ class BrowserVoiceBridge {
       throw StateError('Microphone permission was not granted.');
     }
 
+    try {
+      await _recorder.stop();
+    } catch (_) {}
     await _player.stop();
     await _tts.stop();
 
@@ -123,7 +131,7 @@ class BrowserVoiceBridge {
 
         if (speechDetected) {
           turnChunks.add(chunk);
-          if (level >= _speechThreshold) {
+          if (level >= _softSpeechThreshold) {
             lastVoiceAt = now;
           }
 
@@ -157,6 +165,8 @@ class BrowserVoiceBridge {
             ..addAll(preSpeechChunks)
             ..add(chunk);
           preSpeechChunks.clear();
+        } else if (timeListening >= _noSpeechWindow) {
+          unawaited(finishCapture());
         }
       },
       onError: (Object error, StackTrace stackTrace) async {
@@ -314,15 +324,24 @@ class BrowserVoiceBridge {
     }
 
     var maxAmplitude = 0.0;
+    var sumSquares = 0.0;
+    var sampleCount = 0;
     for (var i = 0; i + 1 < bytes.length; i += 2) {
       final sample = bytes[i] | (bytes[i + 1] << 8);
       final signed = sample >= 0x8000 ? sample - 0x10000 : sample;
-      final amplitude = signed.abs() / 32768.0;
+      final normalized = signed / 32768.0;
+      final amplitude = normalized.abs();
       if (amplitude > maxAmplitude) {
         maxAmplitude = amplitude;
       }
+      sumSquares += normalized * normalized;
+      sampleCount += 1;
     }
-    return maxAmplitude;
+    if (sampleCount == 0) {
+      return 0;
+    }
+    final rms = math.sqrt(sumSquares / sampleCount);
+    return math.max(rms, maxAmplitude * 0.55);
   }
 
   Uint8List _wrapPcmAsWav(

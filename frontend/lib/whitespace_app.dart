@@ -1199,6 +1199,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   String _statusText = 'Loading saved board memory...';
   bool _isBusy = false;
   bool _isListening = false;
+  bool _voiceReady = false;
   bool _speechReady = false;
   bool _whitespaceReady = false;
   bool _voiceLoopEnabled = false;
@@ -1220,7 +1221,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     unawaited(_hydrateBoardFromBackend());
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      _ensureVoiceLoopStartedAutomatically();
+      unawaited(_ensureVoiceLoopStartedAutomatically());
     });
   }
 
@@ -1345,7 +1346,41 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     }
   }
 
-  void _ensureVoiceLoopStartedAutomatically() {
+  Future<bool> _ensureVoiceReady({bool userInitiated = false}) async {
+    if (_voiceReady) {
+      return true;
+    }
+    if (!mounted) {
+      return false;
+    }
+    setState(() {
+      _statusText = 'Getting microphone and audio ready on this device...';
+    });
+    try {
+      await _voiceBridge.primeVoiceExperience();
+      if (!mounted) {
+        return false;
+      }
+      setState(() {
+        _voiceReady = true;
+        _statusText = 'Voice is ready. Listening...';
+      });
+      return true;
+    } catch (error) {
+      if (!mounted) {
+        return false;
+      }
+      setState(() {
+        _voiceReady = false;
+        _statusText = userInitiated
+            ? 'Voice could not start yet. Microphone access is required.'
+            : 'Microphone access is required so the app can listen and speak.';
+      });
+      return false;
+    }
+  }
+
+  Future<void> _ensureVoiceLoopStartedAutomatically() async {
     if (_voiceLoopEnabled || _isBusy) {
       return;
     }
@@ -1354,6 +1389,11 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         _statusText =
             'Always-listening voice is unavailable on this device right now.';
       });
+      return;
+    }
+
+    final ready = await _ensureVoiceReady();
+    if (!ready || !mounted || _voiceLoopEnabled || _isBusy) {
       return;
     }
 
@@ -1366,7 +1406,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     unawaited(_runVoiceLoop(token));
   }
 
-  void _toggleVoiceLoop() {
+  Future<void> _toggleVoiceLoop() async {
     if (_voiceLoopEnabled) {
       _stopVoiceLoop(
         statusText: _isBusy
@@ -1381,6 +1421,11 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       setState(() {
         _statusText = 'Speech input is unavailable on this device right now.';
       });
+      return;
+    }
+
+    final ready = await _ensureVoiceReady(userInitiated: true);
+    if (!ready || !mounted) {
       return;
     }
 
@@ -1424,7 +1469,14 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
 
       CapturedAudioTurn capturedTurn;
       try {
-        capturedTurn = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
+        capturedTurn = await _voiceBridge
+            .captureAudioTurn(language: 'bg-BG')
+            .timeout(
+              const Duration(seconds: 22),
+              onTimeout: () => throw TimeoutException(
+                'Timed out while listening for speech.',
+              ),
+            );
       } catch (error) {
         if (!mounted || !_voiceLoopEnabled || token != _voiceLoopToken) {
           return;
@@ -1552,13 +1604,19 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     if (directTranscript.isNotEmpty) {
       return directTranscript;
     }
-    final payload = await _backendClient.transcribeSpeechTurn(
-      audioBase64: capturedTurn.audioBase64,
-      audioMimeType: capturedTurn.mimeType,
-      userId: widget.userId,
-      sessionId: _sessionId,
-      language: capturedTurn.language,
-    );
+    final payload = await _backendClient
+        .transcribeSpeechTurn(
+          audioBase64: capturedTurn.audioBase64,
+          audioMimeType: capturedTurn.mimeType,
+          userId: widget.userId,
+          sessionId: _sessionId,
+          language: capturedTurn.language,
+        )
+        .timeout(
+          const Duration(seconds: 30),
+          onTimeout: () =>
+              throw TimeoutException('Voice transcription timed out.'),
+        );
     final transcript = (payload['transcript'] ?? payload['message'] ?? '')
         .toString()
         .trim();
@@ -1866,6 +1924,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     return lowered.contains('no speech') ||
         lowered.contains('no-speech') ||
         lowered.contains('timed out while listening for speech') ||
+        lowered.contains('voice transcription timed out') ||
         lowered.contains('did not return a transcript') ||
         lowered.contains('aborted') ||
         lowered.contains('audio capture aborted');
@@ -2147,9 +2206,10 @@ class _SpeechTrailOverlay extends StatefulWidget {
 }
 
 class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
-  List<String> _words = const <String>[];
-  int _activeWordIndex = -1;
+  List<String> _sentences = const <String>[];
+  int _activeSentenceIndex = -1;
   int _animationToken = 0;
+  bool _isSentenceVisible = false;
 
   @override
   void initState() {
@@ -2166,322 +2226,245 @@ class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
   }
 
   void _setSpeech(String speech, {required bool animate}) {
-    final words = _speechTrailWords(speech, maxWords: widget.compact ? 12 : 18);
+    final sentences = _speechSubtitleSentences(speech);
     final token = _animationToken + 1;
     _animationToken = token;
     setState(() {
-      _words = words;
-      _activeWordIndex = words.isEmpty
-          ? -1
-          : (animate ? 0 : words.length - 1);
+      _sentences = sentences;
+      _activeSentenceIndex = sentences.isEmpty ? -1 : sentences.length - 1;
+      _isSentenceVisible = sentences.isNotEmpty && !animate;
     });
-    if (animate && words.length > 1) {
-      unawaited(_animateSpeechWords(words, token));
+    if (animate && sentences.isNotEmpty) {
+      unawaited(_animateSpeechSentences(sentences, token));
     }
   }
 
-  Future<void> _animateSpeechWords(List<String> words, int token) async {
-    final timings = _estimateSpeechTrailWordTimings(words);
+  Future<void> _animateSpeechSentences(List<String> sentences, int token) async {
+    final timings = _estimateSpeechSubtitleTimings(sentences);
     for (var index = 0; index < timings.length; index++) {
       if (!mounted || token != _animationToken) {
         return;
       }
-      if (_activeWordIndex != index) {
-        setState(() {
-          _activeWordIndex = index;
-        });
-      }
+      setState(() {
+        _activeSentenceIndex = index;
+        _isSentenceVisible = true;
+      });
       await Future<void>.delayed(timings[index]);
+      if (!mounted || token != _animationToken) {
+        return;
+      }
+      setState(() {
+        _isSentenceVisible = false;
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 220));
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final width = widget.compact ? 300.0 : 520.0;
-    final height = widget.compact ? 98.0 : 116.0;
-    final fontSize = widget.compact ? 28.0 : 33.0;
-    final gap = widget.compact ? 14.0 : 18.0;
-    final spokenPrefix =
-        _activeWordIndex >= 0 && _activeWordIndex < _words.length
-        ? _words.sublist(0, _activeWordIndex + 1)
-        : _words;
-    final topSlice = _visibleSpeechTrailSlice(
-      spokenPrefix,
-      maxWidth: width,
-      fontSize: fontSize,
-      gap: gap,
-    );
-    if (topSlice.words.isEmpty) {
+    if (_activeSentenceIndex < 0 || _activeSentenceIndex >= _sentences.length) {
       return const SizedBox.shrink();
     }
-    final olderPrefix = topSlice.startIndex > 0
-        ? spokenPrefix.sublist(0, topSlice.startIndex)
-        : const <String>[];
-    final bottomSlice = _visibleSpeechTrailSlice(
-      olderPrefix,
+    final width = widget.compact ? 320.0 : 620.0;
+    final fontSize = widget.compact ? 27.0 : 32.0;
+    final lineHeight = widget.compact ? 1.08 : 1.04;
+    final rows = _splitSubtitleRows(
+      _sentences[_activeSentenceIndex],
       maxWidth: width,
       fontSize: fontSize,
-      gap: gap,
+      letterSpacing: -0.5,
     );
+
     return ClipRect(
       child: SizedBox(
         width: width,
-        height: height,
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            _SpeechTrailRow(
-              key: ValueKey('top-${topSlice.words.join(" ")}'),
-              words: topSlice.words,
-              compact: widget.compact,
-              gap: gap,
-              maxWidth: width,
-              slideOffset: const Offset(0.14, 0),
-              shaderBuilder: _buildSpeechTrailEntryShader,
+        child: Center(
+          child: AnimatedOpacity(
+            duration: const Duration(milliseconds: 240),
+            curve: Curves.easeInOutCubic,
+            opacity: _isSentenceVisible ? 1 : 0,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 240),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              transitionBuilder: (child, animation) =>
+                  FadeTransition(opacity: animation, child: child),
+              child: _SubtitleSentenceBlock(
+                key: ValueKey(
+                  'subtitle-$_activeSentenceIndex-${_sentences[_activeSentenceIndex]}',
+                ),
+                rows: rows,
+                maxWidth: width,
+                fontSize: fontSize,
+                lineHeight: lineHeight,
+              ),
             ),
-            SizedBox(height: widget.compact ? 6 : 8),
-            _SpeechTrailRow(
-              key: ValueKey('bottom-${bottomSlice.words.join(" ")}'),
-              words: bottomSlice.words,
-              compact: widget.compact,
-              gap: gap,
-              maxWidth: width,
-              slideOffset: const Offset(-0.16, 0),
-              shaderBuilder: _buildSpeechTrailExitShader,
-            ),
-          ],
+          ),
         ),
       ),
     );
   }
 }
 
-class _SpeechTrailRow extends StatelessWidget {
-  const _SpeechTrailRow({
+class _SubtitleSentenceBlock extends StatelessWidget {
+  const _SubtitleSentenceBlock({
     super.key,
-    required this.words,
-    required this.compact,
-    required this.gap,
+    required this.rows,
     required this.maxWidth,
-    required this.slideOffset,
-    required this.shaderBuilder,
+    required this.fontSize,
+    required this.lineHeight,
   });
 
-  final List<String> words;
-  final bool compact;
-  final double gap;
+  final List<String> rows;
   final double maxWidth;
-  final Offset slideOffset;
-  final Shader Function(Rect bounds) shaderBuilder;
+  final double fontSize;
+  final double lineHeight;
 
   @override
   Widget build(BuildContext context) {
-    final fontSize = compact ? 28.0 : 33.0;
-    final contentWidth = _speechTrailContentWidth(
-      words,
-      fontSize: fontSize,
-      gap: gap,
-    );
-    if (words.isEmpty) {
-      return SizedBox(
-        width: maxWidth,
-        height: compact ? 30 : 36,
-      );
-    }
-
-    return TweenAnimationBuilder<double>(
-      tween: Tween(begin: 0, end: 1),
-      duration: const Duration(milliseconds: 360),
-      curve: Curves.easeOutCubic,
-      builder: (context, value, child) {
-        return Align(
-          alignment: Alignment.center,
-          child: Transform.translate(
-            offset: Offset(
-              slideOffset.dx * (1 - value) * maxWidth * 0.35,
-              slideOffset.dy * (1 - value) * 18,
-            ),
-            child: child,
-          ),
-        );
-      },
-      child: Align(
-        alignment: Alignment.centerRight,
-        child: SizedBox(
-          width: contentWidth,
-          child: ShaderMask(
-            blendMode: BlendMode.dstIn,
-            shaderCallback: shaderBuilder,
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                for (var index = 0; index < words.length; index++) ...[
-                  _SpeechTrailWord(
-                    word: words[index],
-                    compact: compact,
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var index = 0; index < rows.length; index++)
+            Padding(
+              padding: EdgeInsets.only(bottom: index == rows.length - 1 ? 0 : 4),
+              child: ShaderMask(
+                blendMode: BlendMode.srcIn,
+                shaderCallback: (bounds) {
+                  return const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [
+                      Color(0xFFBF4342),
+                      Color(0xFF8C1C13),
+                      Colors.black,
+                    ],
+                  ).createShader(bounds);
+                },
+                child: Text(
+                  rows[index],
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.visible,
+                  softWrap: false,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: fontSize,
+                    fontWeight: FontWeight.w800,
+                    letterSpacing: -0.5,
+                    height: lineHeight,
                   ),
-                  if (index != words.length - 1) SizedBox(width: gap),
-                ],
-              ],
+                ),
+              ),
             ),
-          ),
-        ),
+        ],
       ),
     );
   }
 }
 
-class _SpeechTrailWord extends StatelessWidget {
-  const _SpeechTrailWord({
-    required this.word,
-    required this.compact,
-  });
-
-  final String word;
-  final bool compact;
-
-  @override
-  Widget build(BuildContext context) {
-    final fontSize = compact ? 28.0 : 33.0;
-
-    return ShaderMask(
-      blendMode: BlendMode.srcIn,
-      shaderCallback: (bounds) {
-        return const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [
-            Color(0xFFBF4342),
-            Color(0xFF8C1C13),
-            Colors.black,
-          ],
-        ).createShader(bounds);
-      },
-      child: Text(
-        word,
-        maxLines: 1,
-        overflow: TextOverflow.visible,
-        softWrap: false,
-        textAlign: TextAlign.center,
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: fontSize,
-          fontWeight: FontWeight.w800,
-          letterSpacing: -0.6,
-          height: 1,
-        ),
-      ),
-    );
-  }
-}
-
-class _VisibleSpeechTrailSlice {
-  const _VisibleSpeechTrailSlice({
-    required this.words,
-    required this.startIndex,
-  });
-
-  final List<String> words;
-  final int startIndex;
-}
-
-_VisibleSpeechTrailSlice _visibleSpeechTrailSlice(
-  List<String> words, {
-  required double maxWidth,
-  required double fontSize,
-  required double gap,
-}) {
-  if (words.isEmpty) {
-    return const _VisibleSpeechTrailSlice(words: <String>[], startIndex: 0);
-  }
-
-  var usedWidth = 0.0;
-  final visibleReversed = <String>[];
-  var startIndex = words.length - 1;
-
-  for (var index = words.length - 1; index >= 0; index--) {
-    final word = words[index];
-    final wordWidth = _measureSpeechTrailWordWidth(word, fontSize);
-    if (visibleReversed.isNotEmpty) {
-      usedWidth += gap;
-    }
-    if (visibleReversed.isNotEmpty && usedWidth >= maxWidth) {
-      break;
-    }
-    visibleReversed.add(word);
-    usedWidth += wordWidth;
-    startIndex = index;
-  }
-
-  return _VisibleSpeechTrailSlice(
-    words: visibleReversed.reversed.toList(growable: false),
-    startIndex: startIndex,
-  );
-}
-
-List<Duration> _estimateSpeechTrailWordTimings(List<String> words) {
-  return words.map((word) {
-    final clean = word.replaceAll(
-      RegExp(r"""[\s\.,!?;:'"()\[\]{}\-_\/\\]+"""),
-      '',
-    );
-    final characterCount = math.max(1, clean.length);
-    final hasPause = word.contains(RegExp(r'[,.!?;:]'));
-    final milliseconds = 160 + (characterCount * 32) + (hasPause ? 120 : 0);
-    return Duration(milliseconds: milliseconds.clamp(180, 520));
+List<Duration> _estimateSpeechSubtitleTimings(List<String> sentences) {
+  return sentences.map((sentence) {
+    final words = sentence
+        .split(RegExp(r'\s+'))
+        .where((word) => word.trim().isNotEmpty)
+        .length;
+    final milliseconds = 700 + (words * 155);
+    return Duration(milliseconds: milliseconds.clamp(900, 2400));
   }).toList(growable: false);
 }
 
-double _speechTrailContentWidth(
-  List<String> words, {
-  required double fontSize,
-  required double gap,
-}) {
-  if (words.isEmpty) {
-    return 0;
+List<String> _speechSubtitleSentences(String speech) {
+  final normalized = speech.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.isEmpty) {
+    return const <String>[];
   }
-  return words.fold<double>(
-        0,
-        (sum, word) => sum + _measureSpeechTrailWordWidth(word, fontSize),
-      ) +
-      (gap * math.max(0, words.length - 1));
+
+  final rawSentences = normalized
+      .split(RegExp(r'(?<=[.!?…])\s+'))
+      .map((sentence) => sentence.trim())
+      .where((sentence) => sentence.isNotEmpty)
+      .toList();
+
+  final sentences = <String>[];
+  for (final sentence in rawSentences.isEmpty ? [normalized] : rawSentences) {
+    final words = sentence
+        .split(RegExp(r'\s+'))
+        .map((word) => word.trim())
+        .where((word) => word.isNotEmpty)
+        .toList();
+    if (words.isEmpty) {
+      continue;
+    }
+    for (var index = 0; index < words.length; index += 10) {
+      final chunk = words
+          .sublist(index, math.min(index + 10, words.length))
+          .join(' ')
+          .trim();
+      if (chunk.isNotEmpty) {
+        sentences.add(chunk);
+      }
+    }
+  }
+  return sentences;
 }
 
-Shader _buildSpeechTrailEntryShader(Rect bounds) {
-  return ui.Gradient.linear(
-    bounds.centerLeft,
-    bounds.centerRight,
-    const <Color>[
-      Colors.white,
-      Colors.white,
-      Colors.transparent,
-    ],
-    const <double>[0.0, 0.9, 1.0],
-  );
+List<String> _splitSubtitleRows(
+  String sentence, {
+  required double maxWidth,
+  required double fontSize,
+  required double letterSpacing,
+}) {
+  final words = sentence
+      .split(RegExp(r'\s+'))
+      .map((word) => word.trim())
+      .where((word) => word.isNotEmpty)
+      .toList();
+  if (words.isEmpty) {
+    return const <String>[];
+  }
+
+  final rows = <String>[];
+  final buffer = <String>[];
+  for (final word in words) {
+    final candidateWords = [...buffer, word];
+    final candidate = candidateWords.join(' ');
+    final candidateWidth = _measureSubtitleTextWidth(
+      candidate,
+      fontSize: fontSize,
+      letterSpacing: letterSpacing,
+    );
+    if (buffer.isNotEmpty && candidateWidth > maxWidth) {
+      rows.add(buffer.join(' '));
+      buffer
+        ..clear()
+        ..add(word);
+    } else {
+      buffer
+        ..clear()
+        ..addAll(candidateWords);
+    }
+  }
+  if (buffer.isNotEmpty) {
+    rows.add(buffer.join(' '));
+  }
+  return rows;
 }
 
-Shader _buildSpeechTrailExitShader(Rect bounds) {
-  return ui.Gradient.linear(
-    bounds.centerLeft,
-    bounds.centerRight,
-    const <Color>[
-      Colors.transparent,
-      Colors.white,
-      Colors.white,
-    ],
-    const <double>[0.0, 0.1, 1.0],
-  );
-}
-
-double _measureSpeechTrailWordWidth(String word, double fontSize) {
+double _measureSubtitleTextWidth(
+  String text, {
+  required double fontSize,
+  required double letterSpacing,
+}) {
   final painter = TextPainter(
     text: TextSpan(
-      text: word,
+      text: text,
       style: TextStyle(
         fontSize: fontSize,
         fontWeight: FontWeight.w800,
-        letterSpacing: -0.6,
+        letterSpacing: letterSpacing,
         height: 1,
       ),
     ),
@@ -2489,21 +2472,6 @@ double _measureSpeechTrailWordWidth(String word, double fontSize) {
     textDirection: TextDirection.ltr,
   )..layout();
   return painter.width;
-}
-
-List<String> _speechTrailWords(String speech, {int maxWords = 5}) {
-  final cleaned = speech
-      .split(RegExp(r'\s+'))
-      .map((word) => word.trim())
-      .where((word) => word.isNotEmpty)
-      .toList();
-  if (cleaned.isEmpty) {
-    return const <String>[];
-  }
-  if (cleaned.length <= maxWords) {
-    return cleaned;
-  }
-  return cleaned.sublist(cleaned.length - maxWords);
 }
 
 class _ActiveUserPopup {

@@ -64,9 +64,10 @@ interface DeviceControlGateway {
 
     /**
      * Type text into the currently focused editable field.
-     * Uses ACTION_SET_TEXT (replaces content).
+     * When append=true, the new text is appended to the existing value instead of replacing it.
+     * When text is newline-only, the gateway should treat it as a submit/enter action.
      */
-    fun typeText(text: String): ActionResultDto
+    fun typeText(text: String, append: Boolean = false): ActionResultDto
 
     /** Clear the currently focused editable field via ACTION_SET_TEXT(""). */
     fun clearFocusedField(): ActionResultDto
