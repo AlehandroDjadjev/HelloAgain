@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import secrets
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -24,6 +25,10 @@ DEFAULT_GOOGLE_SPEECH_API_VERSION = "v1"
 DEFAULT_GOOGLE_SPEECH_MODEL = "latest_long"
 DEFAULT_GOOGLE_SPEECH_LOCATION = "global"
 DEFAULT_GOOGLE_SPEECH_RECOGNIZER = "_"
+DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
+DEFAULT_ELEVENLABS_STT_MODEL = "scribe_v2"
+DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
+DEFAULT_ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_SYSTEM_PROMPT = (
@@ -33,6 +38,9 @@ DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "Keep replies concise, natural, easy to understand, and easy to speak aloud. "
     "Keep each sentence to 10 words or fewer. "
     "Prefer short subtitle-friendly sentences. "
+    "Usually answer in 1 or 2 short sentences. "
+    "If important information is missing, ask exactly one clear follow-up question instead of guessing. "
+    "Do not add extra suggestions, warnings, or recommendations unless the user asks for them or safety requires it. "
     "Reply in the same language as the user's most recent message unless asked otherwise. "
     "Prefer short spoken-friendly responses."
 )
@@ -83,6 +91,92 @@ def _read_env_value(key: str, env_path: Optional[Path] = None) -> str:
     return ""
 
 
+def _read_elevenlabs_api_key() -> str:
+    return (
+        _read_env_value("ELEVENLABS_API_KEY")
+        or _read_env_value("LABS_API_KEY")
+        or _read_env_value("ELEVEN_API_KEY")
+    )
+
+
+def _normalize_language_code(language: Optional[str]) -> str:
+    raw_language = (language or "").strip()
+    if not raw_language:
+        return ""
+
+    normalized = raw_language.replace("_", "-").split("-", 1)[0].strip().lower()
+    if len(normalized) in {2, 3} and normalized.isalpha():
+        return normalized
+    return ""
+
+
+def _audio_extension_for_content_type(content_type: Optional[str]) -> str:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    mapping = {
+        "audio/wav": "wav",
+        "audio/wave": "wav",
+        "audio/x-wav": "wav",
+        "audio/mpeg": "mp3",
+        "audio/mp3": "mp3",
+        "audio/ogg": "ogg",
+        "audio/opus": "opus",
+        "audio/webm": "webm",
+        "audio/flac": "flac",
+        "audio/x-flac": "flac",
+        "audio/mp4": "mp4",
+        "video/mp4": "mp4",
+    }
+    return mapping.get(normalized, "bin")
+
+
+def _mime_type_for_elevenlabs_output_format(output_format: str) -> str:
+    prefix = output_format.split("_", 1)[0].strip().lower()
+    if prefix == "mp3":
+        return "audio/mpeg"
+    if prefix in {"wav", "pcm"}:
+        return "audio/wav"
+    if prefix == "ulaw":
+        return "audio/basic"
+    return "application/octet-stream"
+
+
+def _encode_multipart_form_data(
+    *,
+    fields: dict[str, object],
+    files: dict[str, tuple[str, bytes, str]],
+) -> tuple[bytes, str]:
+    boundary = f"----HelloAgain{secrets.token_hex(12)}"
+    body = bytearray()
+
+    for name, value in fields.items():
+        if value is None:
+            continue
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(
+                "utf-8",
+            ),
+        )
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    for name, (filename, content, mime_type) in files.items():
+        safe_filename = filename.replace('"', "")
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{name}"; '
+                f'filename="{safe_filename}"\r\n'
+            ).encode("utf-8"),
+        )
+        body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
+        body.extend(content)
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
 class SpeechToTextProvider(abc.ABC):
     @abc.abstractmethod
     def transcribe(
@@ -116,6 +210,134 @@ class TextToSpeechProvider(abc.ABC):
     @abc.abstractmethod
     def status(self) -> str:
         raise NotImplementedError
+
+
+class ElevenLabsSpeechToTextProvider(SpeechToTextProvider):
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        language: Optional[str] = None,
+    ):
+        self.api_key = (api_key or _read_elevenlabs_api_key()).strip()
+        self.model = (
+            model
+            or _read_env_value("ELEVENLABS_STT_MODEL")
+            or DEFAULT_ELEVENLABS_STT_MODEL
+        ).strip()
+        self.base_url = (
+            base_url
+            or _read_env_value("ELEVENLABS_BASE_URL")
+            or DEFAULT_ELEVENLABS_BASE_URL
+        ).rstrip("/")
+        self.default_language = (
+            language
+            or _read_env_value("ELEVENLABS_STT_LANGUAGE")
+            or os.environ.get("GOOGLE_CLOUD_SPEECH_LANGUAGE", DEFAULT_STT_LANGUAGE)
+        ).strip()
+        self.timeout = int(_read_env_value("ELEVENLABS_TIMEOUT_SECONDS") or "120")
+
+    def _ensure_api_key(self) -> None:
+        if self.api_key:
+            return
+        raise ProviderNotReadyError(
+            "ElevenLabs STT is not ready. Set ELEVENLABS_API_KEY or LABS_API_KEY "
+            "in Backend/.env.",
+        )
+
+    def _normalize_transcript(self, text: str) -> str:
+        cleaned = " ".join(text.split()).strip()
+        if not cleaned:
+            return cleaned
+        if cleaned[-1] not in ".!?":
+            cleaned = f"{cleaned}."
+        return cleaned[0].upper() + cleaned[1:]
+
+    def transcribe(
+        self,
+        audio_data: bytes,
+        language: Optional[str] = None,
+        content_type: Optional[str] = None,
+    ):
+        from voice_gateway.domain.contracts import TranscriptionResult
+
+        self._ensure_api_key()
+
+        normalized_language = _normalize_language_code(
+            language or self.default_language,
+        )
+        extension = _audio_extension_for_content_type(content_type)
+        payload, header_value = _encode_multipart_form_data(
+            fields={
+                "model_id": self.model,
+                "tag_audio_events": "false",
+                "timestamps_granularity": "none",
+                "language_code": normalized_language or None,
+            },
+            files={
+                "file": (
+                    f"speech.{extension}",
+                    audio_data,
+                    content_type or "application/octet-stream",
+                ),
+            },
+        )
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/speech-to-text",
+            data=payload,
+            headers={
+                "Content-Type": header_value,
+                "xi-api-key": self.api_key,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw_response = response.read()
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(error_body)
+                error_message = (
+                    parsed.get("detail")
+                    or parsed.get("message")
+                    or parsed.get("error")
+                    or error_body
+                )
+            except json.JSONDecodeError:
+                error_message = error_body or str(exc)
+            raise RuntimeError(
+                f"ElevenLabs STT request failed: {exc.code} {error_message}",
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"ElevenLabs STT request error: {exc.reason}") from exc
+
+        parsed_response = json.loads(raw_response.decode("utf-8"))
+        text = str(parsed_response.get("text") or "").strip()
+        text = self._normalize_transcript(text)
+        if not text:
+            raise ValueError(
+                "ElevenLabs STT did not produce a transcript. Make sure the "
+                "recording contains audible speech and try again.",
+            )
+
+        return TranscriptionResult(
+            text=text,
+            source=f"elevenlabs_{self.model}",
+            warnings=[
+                f"transcription_language={normalized_language or 'auto'}",
+                f"transcription_model={self.model}",
+                "transcription_provider=elevenlabs",
+            ],
+        )
+
+    def status(self) -> str:
+        if not self.api_key:
+            return "unavailable: api_key_missing"
+        return f"configured: elevenlabs/{self.model}"
 
 
 class GoogleCloudSpeechSTTProvider(SpeechToTextProvider):
@@ -714,6 +936,224 @@ class OpenAILLMProvider(LLMProvider):
         return f"configured: {self.model}"
 
 
+class ElevenLabsTTSProvider(TextToSpeechProvider):
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        voice_id: Optional[str] = None,
+        voice_name: Optional[str] = None,
+        output_format: Optional[str] = None,
+        language: Optional[str] = None,
+    ):
+        self.api_key = (api_key or _read_elevenlabs_api_key()).strip()
+        self.model = (
+            model
+            or _read_env_value("ELEVENLABS_TTS_MODEL")
+            or DEFAULT_ELEVENLABS_TTS_MODEL
+        ).strip()
+        self.base_url = (
+            base_url
+            or _read_env_value("ELEVENLABS_BASE_URL")
+            or DEFAULT_ELEVENLABS_BASE_URL
+        ).rstrip("/")
+        self.voice_id = (
+            voice_id
+            or _read_env_value("ELEVENLABS_TTS_VOICE_ID")
+            or _read_env_value("ELEVENLABS_VOICE_ID")
+        ).strip()
+        self.voice_name = (
+            voice_name
+            or _read_env_value("ELEVENLABS_TTS_VOICE_NAME")
+            or _read_env_value("ELEVENLABS_VOICE_NAME")
+        ).strip()
+        self.output_format = (
+            output_format
+            or _read_env_value("ELEVENLABS_TTS_OUTPUT_FORMAT")
+            or DEFAULT_ELEVENLABS_TTS_OUTPUT_FORMAT
+        ).strip()
+        self.default_language = (
+            language
+            or _read_env_value("ELEVENLABS_TTS_LANGUAGE")
+            or os.environ.get("GOOGLE_CLOUD_SPEECH_LANGUAGE", DEFAULT_STT_LANGUAGE)
+        ).strip()
+        self.timeout = int(_read_env_value("ELEVENLABS_TIMEOUT_SECONDS") or "120")
+        self._resolved_voice_name: Optional[str] = None
+
+    def _ensure_api_key(self) -> None:
+        if self.api_key:
+            return
+        raise ProviderNotReadyError(
+            "ElevenLabs TTS is not ready. Set ELEVENLABS_API_KEY or LABS_API_KEY "
+            "in Backend/.env.",
+        )
+
+    def _normalize_text(self, text: str) -> str:
+        cleaned = unicodedata.normalize("NFC", " ".join(text.split())).strip()
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned = f"{cleaned}."
+        return cleaned
+
+    def _choose_voice(
+        self,
+        voices: list[dict],
+        *,
+        preferred_language: str,
+    ) -> Optional[dict]:
+        if not voices:
+            return None
+
+        if self.voice_name:
+            desired_name = self.voice_name.casefold()
+            for voice in voices:
+                voice_name = str(voice.get("name") or "").strip().casefold()
+                if voice_name == desired_name:
+                    return voice
+
+        if preferred_language:
+            for voice in voices:
+                for verified_language in voice.get("verified_languages", []) or []:
+                    language_code = _normalize_language_code(
+                        verified_language.get("language")
+                        or verified_language.get("locale"),
+                    )
+                    if language_code == preferred_language:
+                        return voice
+
+        return voices[0]
+
+    def _resolve_voice_id(self) -> str:
+        if self.voice_id:
+            return self.voice_id
+
+        request = urllib.request.Request(
+            f"{self.base_url}/v2/voices?page_size=25",
+            headers={"xi-api-key": self.api_key},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw_response = response.read()
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(error_body)
+                error_message = (
+                    parsed.get("detail")
+                    or parsed.get("message")
+                    or parsed.get("error")
+                    or error_body
+                )
+            except json.JSONDecodeError:
+                error_message = error_body or str(exc)
+            raise ProviderNotReadyError(
+                f"ElevenLabs voice lookup failed: {exc.code} {error_message}",
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ProviderNotReadyError(
+                f"ElevenLabs voice lookup error: {exc.reason}",
+            ) from exc
+
+        parsed_response = json.loads(raw_response.decode("utf-8"))
+        voice = self._choose_voice(
+            parsed_response.get("voices", []),
+            preferred_language=_normalize_language_code(self.default_language),
+        )
+        if not isinstance(voice, dict):
+            raise ProviderNotReadyError(
+                "ElevenLabs did not return any voices for this account.",
+            )
+
+        resolved_voice_id = str(voice.get("voice_id") or "").strip()
+        if not resolved_voice_id:
+            raise ProviderNotReadyError(
+                "ElevenLabs voice lookup returned an invalid voice id.",
+            )
+
+        self.voice_id = resolved_voice_id
+        self._resolved_voice_name = str(voice.get("name") or "").strip() or None
+        return resolved_voice_id
+
+    def synthesize(self, text: str, voice_id: Optional[str] = None):
+        from voice_gateway.domain.contracts import SpeechSynthesisResult
+
+        self._ensure_api_key()
+
+        normalized_text = self._normalize_text(text)
+        if not normalized_text:
+            raise ValueError("Text is required for speech synthesis.")
+
+        resolved_voice_id = (voice_id or self.voice_id or "").strip() or self._resolve_voice_id()
+        normalized_language = _normalize_language_code(self.default_language)
+        query = urllib.parse.urlencode({"output_format": self.output_format})
+        request_body = {
+            "text": normalized_text,
+            "model_id": self.model,
+        }
+        if normalized_language:
+            request_body["language_code"] = normalized_language
+
+        request = urllib.request.Request(
+            f"{self.base_url}/v1/text-to-speech/{urllib.parse.quote(resolved_voice_id)}?{query}",
+            data=json.dumps(request_body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "xi-api-key": self.api_key,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                audio_bytes = response.read()
+                mime_type = (
+                    response.headers.get_content_type()
+                    or _mime_type_for_elevenlabs_output_format(self.output_format)
+                )
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(error_body)
+                error_message = (
+                    parsed.get("detail")
+                    or parsed.get("message")
+                    or parsed.get("error")
+                    or error_body
+                )
+            except json.JSONDecodeError:
+                error_message = error_body or str(exc)
+            raise ProviderNotReadyError(
+                f"ElevenLabs TTS request failed: {exc.code} {error_message}",
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ProviderNotReadyError(
+                f"ElevenLabs TTS request error: {exc.reason}",
+            ) from exc
+
+        if not audio_bytes:
+            raise ProviderNotReadyError("ElevenLabs returned an empty audio payload.")
+
+        return SpeechSynthesisResult(
+            audio_bytes=audio_bytes,
+            source=f"elevenlabs_{self.model}",
+            mime_type=mime_type,
+            warnings=[
+                f"tts_voice_id={resolved_voice_id}",
+                f"tts_voice_name={self._resolved_voice_name or self.voice_name or 'auto'}",
+                f"tts_model={self.model}",
+                f"tts_output_format={self.output_format}",
+            ],
+        )
+
+    def status(self) -> str:
+        if not self.api_key:
+            return "unavailable: api_key_missing"
+        voice_hint = self.voice_id or self.voice_name or "auto_voice"
+        return f"configured: elevenlabs/{self.model}/{voice_hint}"
+
+
 class PiperTTSProvider(TextToSpeechProvider):
     def __init__(
         self,
@@ -845,3 +1285,15 @@ class PiperTTSProvider(TextToSpeechProvider):
         if self.model_path.exists() and self.config_path.exists():
             return "configured"
         return "configured: model_will_download_on_first_use"
+
+
+def build_default_stt_provider() -> SpeechToTextProvider:
+    if _read_elevenlabs_api_key():
+        return ElevenLabsSpeechToTextProvider()
+    return GoogleCloudSpeechSTTProvider()
+
+
+def build_default_tts_provider() -> TextToSpeechProvider:
+    if _read_elevenlabs_api_key():
+        return ElevenLabsTTSProvider()
+    return PiperTTSProvider()

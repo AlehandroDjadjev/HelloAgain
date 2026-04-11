@@ -15,9 +15,13 @@ from voice_gateway.services.audio import prepare_audio_for_stt
 from voice_gateway.services.gateway import VoiceGatewayCore
 from voice_gateway.services.providers import (
     BACKEND_ENV_PATH,
+    ElevenLabsSpeechToTextProvider,
+    ElevenLabsTTSProvider,
     GoogleCloudSpeechSTTProvider,
     OpenAILLMProvider,
     ProviderNotReadyError,
+    build_default_stt_provider,
+    build_default_tts_provider,
 )
 from voice_gateway.views import (
     get_response_view,
@@ -220,6 +224,31 @@ class OpenAiProviderTests(SimpleTestCase):
             self.assertEqual(provider.api_key, "test-openai-dotenv")
         finally:
             os.unlink(temp_path)
+
+
+class ElevenLabsProviderTests(SimpleTestCase):
+    def test_stt_provider_reads_labs_api_key_alias_from_backend_env(self):
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp_file:
+            tmp_file.write('LABS_API_KEY="test-elevenlabs-dotenv"\n')
+            temp_path = tmp_file.name
+
+        try:
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("ELEVENLABS_API_KEY", None)
+                os.environ.pop("LABS_API_KEY", None)
+                with patch(
+                    "voice_gateway.services.providers.BACKEND_ENV_PATH",
+                    new=type(BACKEND_ENV_PATH)(temp_path),
+                ):
+                    provider = ElevenLabsSpeechToTextProvider()
+            self.assertEqual(provider.api_key, "test-elevenlabs-dotenv")
+        finally:
+            os.unlink(temp_path)
+
+    def test_default_provider_factories_prefer_elevenlabs_when_key_exists(self):
+        with patch.dict(os.environ, {"LABS_API_KEY": "test-elevenlabs"}, clear=False):
+            self.assertIsInstance(build_default_stt_provider(), ElevenLabsSpeechToTextProvider)
+            self.assertIsInstance(build_default_tts_provider(), ElevenLabsTTSProvider)
 
 
 class VoiceGatewayViewTests(SimpleTestCase):

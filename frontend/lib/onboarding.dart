@@ -11,9 +11,6 @@ import 'whitespace_app.dart' as whitespace show AgentBoardScreen;
 
 enum HelloAgainStage { booting, intro, onboarding, board }
 
-const bool _showOnboardingDeveloperDebugUi =
-    kDebugMode || bool.fromEnvironment('HELLO_AGAIN_FORCE_ONBOARDING_DEBUG_UI');
-
 class HelloAgainShell extends StatefulWidget {
   const HelloAgainShell({super.key});
 
@@ -40,12 +37,9 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   bool _hasCompletedIntroduction = false;
   int _visualStep = 1;
   String _statusText = 'Preparing Hello Again...';
-  String _assistantReply = '';
-  String _transcriptPreview = '';
   String _conversationMode = 'collecting';
   String _onboardingSessionId = '';
   String _recognizedPhone = '';
-  List<String> _missingFields = const [];
   bool _hasCollectedOnboardingInput = false;
   String _pendingVoicePrompt = '';
   Timer? _autoListenRetryTimer;
@@ -108,11 +102,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       _isWorking = false;
       _isConfirming = false;
       _voiceReady = false;
-      _assistantReply = '';
-      _transcriptPreview = '';
       _conversationMode = 'collecting';
       _recognizedPhone = '';
-      _missingFields = const [];
       _hasCollectedOnboardingInput = false;
       _conversationActivated = false;
       _hasCompletedIntroduction = false;
@@ -281,7 +272,6 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         return;
       }
       setState(() {
-        _transcriptPreview = transcript.trim();
         _isListening = false;
         _isWorking = true;
         _statusText = 'Heard you. Processing...';
@@ -377,7 +367,6 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         );
         if (!mounted) return null;
         setState(() {
-          _transcriptPreview = transcript.trim();
           _isListening = false;
         });
         if (normalized != null) return normalized;
@@ -446,10 +435,8 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
     }
     if (!mounted) return;
     setState(() {
-      _assistantReply = assistantReply;
       _conversationMode = mode.isEmpty ? 'collecting' : mode;
       _recognizedPhone = recognizedPhone;
-      _missingFields = missingFields;
       _hasCollectedOnboardingInput = hasCollectedInput;
       _hasCompletedIntroduction = _hasCompletedIntroduction || countAsProgress;
       if (_hasCompletedIntroduction) {
@@ -639,10 +626,6 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   Future<void> _speakOnboardingText(String text) async {
     final clean = text.trim();
     if (clean.isEmpty) return;
-    if (!kIsWeb) {
-      await _voiceBridge.playText(clean);
-      return;
-    }
     try {
       final payload = await _backendClient.speakText(
         text: clean,
@@ -678,11 +661,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         return IntroOnboardingScreen(statusText: _statusText);
       case HelloAgainStage.onboarding:
         return RegistrationScreen(
-          assistantReply: _assistantReply,
           statusText: _statusText,
-          transcript: _transcriptPreview,
-          missingFields: _missingFields,
-          conversationMode: _conversationMode,
           currentStep: _currentStep(),
           voiceReady: _voiceReady,
           isListening: _isListening,
@@ -807,11 +786,7 @@ class IntroOnboardingScreen extends StatelessWidget {
 class RegistrationScreen extends StatelessWidget {
   const RegistrationScreen({
     super.key,
-    required this.assistantReply,
     required this.statusText,
-    required this.transcript,
-    required this.missingFields,
-    required this.conversationMode,
     required this.currentStep,
     required this.voiceReady,
     required this.isListening,
@@ -821,11 +796,7 @@ class RegistrationScreen extends StatelessWidget {
     required this.onPrimaryAction,
   });
 
-  final String assistantReply;
   final String statusText;
-  final String transcript;
-  final List<String> missingFields;
-  final String conversationMode;
   final int currentStep;
   final bool voiceReady;
   final bool isListening;
@@ -879,9 +850,29 @@ class RegistrationScreen extends StatelessWidget {
         child: SafeArea(
           child: LayoutBuilder(
             builder: (context, constraints) {
+              final compactLayout =
+                  constraints.maxWidth < 360 || constraints.maxHeight < 760;
+              final widthFactor = (constraints.maxWidth / 380).clamp(0.84, 1.0);
               final cardHeight = (constraints.maxHeight - 36)
-                  .clamp(560.0, 680.0)
+                  .clamp(compactLayout ? 500.0 : 560.0, 680.0)
                   .toDouble();
+              final titleFontSize =
+                  ((theme.textTheme.headlineLarge?.fontSize ?? 32) *
+                          widthFactor)
+                      .clamp(28.0, 34.0)
+                      .toDouble();
+              final promptFontSize =
+                  ((theme.textTheme.titleMedium?.fontSize ?? 18) * widthFactor)
+                      .clamp(16.0, 20.0)
+                      .toDouble();
+              final speechFontSize =
+                  ((theme.textTheme.titleSmall?.fontSize ?? 14) * widthFactor)
+                      .clamp(13.0, 16.0)
+                      .toDouble();
+              final statusFontSize =
+                  ((theme.textTheme.bodyMedium?.fontSize ?? 14) * widthFactor)
+                      .clamp(13.0, 15.0)
+                      .toDouble();
 
               return Center(
                 child: SingleChildScrollView(
@@ -896,7 +887,12 @@ class RegistrationScreen extends StatelessWidget {
                       children: [
                         Container(
                           height: cardHeight,
-                          padding: const EdgeInsets.fromLTRB(16, 18, 16, 18),
+                          padding: EdgeInsets.fromLTRB(
+                            compactLayout ? 14 : 16,
+                            compactLayout ? 16 : 18,
+                            compactLayout ? 14 : 16,
+                            compactLayout ? 16 : 18,
+                          ),
                           decoration: BoxDecoration(
                             color: HelloAgainPalette.dustGrey.withValues(
                               alpha: 0.42,
@@ -958,35 +954,64 @@ class RegistrationScreen extends StatelessWidget {
                               Center(
                                 child: Image.asset(
                                   'assets/icons/red_hand.png',
-                                  width: 84,
-                                  height: 84,
+                                  width: compactLayout ? 72 : 84,
+                                  height: compactLayout ? 72 : 84,
                                   fit: BoxFit.contain,
                                 ),
                               ),
-                              const SizedBox(height: 18),
+                              SizedBox(height: compactLayout ? 14 : 18),
                               Text(
                                 'HelloAgain',
                                 style: theme.textTheme.headlineLarge?.copyWith(
+                                  fontSize: titleFontSize,
                                   fontWeight: FontWeight.w900,
                                   color: HelloAgainPalette.ink,
                                   letterSpacing: -1.2,
                                 ),
                                 textAlign: TextAlign.center,
                               ),
-                              const SizedBox(height: 10),
+                              SizedBox(height: compactLayout ? 8 : 10),
                               Text(
                                 _body(),
                                 style: theme.textTheme.titleMedium?.copyWith(
+                                  fontSize: promptFontSize,
                                   color: HelloAgainPalette.ink,
                                   fontWeight: FontWeight.w700,
                                   height: 1.35,
                                 ),
                                 textAlign: TextAlign.center,
                               ),
-                              const SizedBox(height: 12),
+                              SizedBox(height: compactLayout ? 10 : 12),
+                              Container(
+                                padding: EdgeInsets.symmetric(
+                                  horizontal: compactLayout ? 12 : 14,
+                                  vertical: compactLayout ? 10 : 12,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.66),
+                                  borderRadius: BorderRadius.circular(18),
+                                  border: Border.all(
+                                    color: HelloAgainPalette.whiteSmoke,
+                                  ),
+                                ),
+                                child: Text(
+                                  statusText,
+                                  style: theme.textTheme.titleSmall?.copyWith(
+                                    fontSize: speechFontSize,
+                                    color: HelloAgainPalette.ink,
+                                    fontWeight: FontWeight.w600,
+                                    height: 1.35,
+                                  ),
+                                  textAlign: TextAlign.center,
+                                  maxLines: compactLayout ? 4 : 5,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              SizedBox(height: compactLayout ? 10 : 12),
                               Text(
                                 _statusTextLine(),
                                 style: theme.textTheme.bodyMedium?.copyWith(
+                                  fontSize: statusFontSize,
                                   color: HelloAgainPalette.ink.withValues(
                                     alpha: 0.66,
                                   ),
@@ -1023,13 +1048,6 @@ class RegistrationScreen extends StatelessWidget {
                             ],
                           ),
                         ),
-                        if (_showOnboardingDeveloperDebugUi) ...[
-                          const SizedBox(height: 18),
-                          OnboardingDeveloperDebugPanel(
-                            assistantReply: assistantReply,
-                            transcript: transcript,
-                          ),
-                        ],
                       ],
                     ),
                   ),
@@ -1038,95 +1056,6 @@ class RegistrationScreen extends StatelessWidget {
             },
           ),
         ),
-      ),
-    );
-  }
-}
-
-class OnboardingDeveloperDebugPanel extends StatelessWidget {
-  const OnboardingDeveloperDebugPanel({
-    super.key,
-    required this.assistantReply,
-    required this.transcript,
-  });
-
-  final String assistantReply;
-  final String transcript;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Container(
-      padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        color: HelloAgainPalette.dustGrey.withValues(alpha: 0.5),
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-          color: HelloAgainPalette.blushedBrick.withValues(alpha: 0.26),
-        ),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Temporary developer panel',
-            style: theme.textTheme.titleMedium?.copyWith(
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'These raw text panels are only for input debugging and are not part of the real interface.',
-            style: theme.textTheme.bodyMedium?.copyWith(
-              color: HelloAgainPalette.ink.withValues(alpha: 0.72),
-            ),
-          ),
-          const SizedBox(height: 14),
-          _OnboardingDebugBox(
-            title: 'Model text response',
-            value: assistantReply,
-          ),
-          const SizedBox(height: 12),
-          _OnboardingDebugBox(
-            title: 'Recognized voice text',
-            value: transcript,
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _OnboardingDebugBox extends StatelessWidget {
-  const _OnboardingDebugBox({required this.title, required this.value});
-
-  final String title;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final resolvedValue = value.trim().isEmpty ? 'No value yet.' : value.trim();
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.72),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: HelloAgainPalette.dustGrey),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            title,
-            style: theme.textTheme.labelLarge?.copyWith(
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-          const SizedBox(height: 8),
-          SelectableText(resolvedValue, style: theme.textTheme.bodyMedium),
-        ],
       ),
     );
   }

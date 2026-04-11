@@ -21,7 +21,11 @@ from .semi_agent_prompts import (
 )
 from .user_context import ActiveUserTracker, TemporaryChatHistoryStore
 from .whiteboard_memory import WhiteboardMemoryStore
-from voice_gateway.services.providers import OpenAILLMProvider, PiperTTSProvider
+from voice_gateway.services.providers import (
+    OpenAILLMProvider,
+    TextToSpeechProvider,
+    build_default_tts_provider,
+)
 
 if TYPE_CHECKING:
     from .graph_service import GraphService
@@ -55,7 +59,7 @@ class SemiAgentService:
         registry: CustomMcpRegistry | None = None,
         board_memory: WhiteboardMemoryStore | None = None,
         llm_provider: OpenAILLMProvider | None = None,
-        tts_provider: PiperTTSProvider | None = None,
+        tts_provider: TextToSpeechProvider | None = None,
         connections_service: Any | None = None,
         user_tracker: ActiveUserTracker | None = None,
         speech_history_store: TemporaryChatHistoryStore | None = None,
@@ -65,7 +69,7 @@ class SemiAgentService:
         self.registry = registry or CustomMcpRegistry()
         self.board_memory = board_memory or WhiteboardMemoryStore()
         self.llm_provider = llm_provider or OpenAILLMProvider()
-        self.tts_provider = tts_provider or PiperTTSProvider()
+        self.tts_provider = tts_provider or build_default_tts_provider()
         self.user_tracker = user_tracker or ActiveUserTracker()
         self.speech_history_store = speech_history_store or TemporaryChatHistoryStore()
         if connections_service is None:
@@ -808,6 +812,15 @@ class SemiAgentService:
             warnings.append(f"llm_fallback={exc}")
             llm_source = "fallback"
 
+        normalized_assistant_text = self._normalize_parallel_speech_response(
+            assistant_text,
+            clean_prompt=clean_prompt,
+            mcp_results=mcp_results,
+        )
+        if normalized_assistant_text != assistant_text:
+            warnings.append("speech_text_normalized=bulgarian_user_facing")
+            assistant_text = normalized_assistant_text
+
         self.speech_history_store.append_turn(
             history_key=history_key,
             session_id=clean_session_id,
@@ -843,11 +856,44 @@ class SemiAgentService:
             "warnings": warnings,
         }
 
+    def _normalize_parallel_speech_response(
+        self,
+        text: str,
+        *,
+        clean_prompt: str,
+        mcp_results: List[Dict[str, Any]],
+    ) -> str:
+        cleaned = self._clean_text(text)
+        if not cleaned:
+            return self._fallback_parallel_speech_response(clean_prompt)
+
+        has_cyrillic = bool(re.search(r"[\u0400-\u04FF]", cleaned))
+        has_latin = bool(re.search(r"[A-Za-z]", cleaned))
+        internal_markers = (
+            "the user",
+            "expected to",
+            "prompt to clarify",
+            "assistant should",
+            "mcp",
+            "payload",
+            "json",
+        )
+        lower = cleaned.lower()
+        looks_internal = any(marker in lower for marker in internal_markers)
+        if has_cyrillic and not looks_internal:
+            return cleaned
+
+        if mcp_results:
+            return "Готово. Подготвих резултата и го показвам на дъската."
+        if has_latin or looks_internal:
+            return "Имам нужда от още малко уточнение, за да го направя правилно."
+        return cleaned
+
     def _build_parallel_speech_system_prompt(self) -> str:
         return (
             "You are HelloAgain speaking for a semi-agent that has already finished "
             "stage 1 MCP work. You are generally having a conversation with the user, "
-            "so be tolerant, explanatory, patient, and helpful. Use the MCP context "
+            "so be tolerant, patient, and helpful. Use the MCP context "
             "only when it helps the answer. This reply will go directly into text to "
             "speech, so keep it natural and easy to say aloud. "
             "Keep every sentence subtitle-friendly, with no more than 10 words per sentence. "
@@ -855,6 +901,11 @@ class SemiAgentService:
             "If an MCP already completed the concrete action, keep the reply semi-short: "
             "briefly acknowledge what was done, mention where the result now lives when relevant, "
             "and do not repeat the full operational payload because the MCP or board object is handling that part. "
+            "If the request is missing something needed to act, ask one direct follow-up question. "
+            "If an MCP already completed the concrete action, briefly acknowledge what was done, "
+            "mention where the result now lives when relevant, and do not repeat the full operational payload "
+            "because the MCP or board object is handling that part. "
+            "Do not add extra tips or recommendations unless the user asked for them. "
             "THIS IS EXTREMELY IMPORTANT: you MUST answer in Bulgarian written in "
             "Bulgarian Cyrillic. Do not answer in English unless the user explicitly "
             "asks you to switch languages."

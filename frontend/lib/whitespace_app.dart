@@ -15,7 +15,9 @@ import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
 
 const _bloodRed = Color(0xFF8C1C13);
-const _whiteSmoke = Color(0xFFFFFFFF);
+const _almondCream = Color(0xFFE7D7C1);
+const _whiteSmoke = Color(0xFFF7F4F3);
+const _dustGrey = Color(0xFFE6DDDB);
 
 Future<void> main() async {
   await _runWhitespaceApp(
@@ -2050,6 +2052,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                           child: _SpeechTrailOverlay(
                             speech: _lastSpeech,
                             compact: isCompact,
+                            availableWidth:
+                                constraints.maxWidth - (horizontalPadding * 2),
                           ),
                         ),
                       ),
@@ -2123,7 +2127,7 @@ class _VoiceToggleButton extends StatelessWidget {
           ),
         ],
       ),
-        child: Semantics(
+      child: Semantics(
         button: true,
         label: '$label. $semanticsLabel',
         child: Material(
@@ -2144,20 +2148,24 @@ class _VoiceToggleButton extends StatelessWidget {
                       duration: const Duration(milliseconds: 220),
                       transitionBuilder: (child, animation) {
                         return RotationTransition(
-                          turns: Tween<double>(begin: 0.88, end: 1).animate(
-                            animation,
+                          turns: Tween<double>(
+                            begin: 0.88,
+                            end: 1,
+                          ).animate(animation),
+                          child: FadeTransition(
+                            opacity: animation,
+                            child: child,
                           ),
-                          child: FadeTransition(opacity: animation, child: child),
                         );
                       },
-                    child: Icon(
-                      icon,
-                      key: ValueKey(icon),
-                      color: foreground,
-                      size: isActive ? 42 : 38,
+                      child: Icon(
+                        icon,
+                        key: ValueKey(icon),
+                        color: foreground,
+                        size: isActive ? 42 : 38,
+                      ),
                     ),
                   ),
-                ),
                   const SizedBox(height: 10),
                   AnimatedSwitcher(
                     duration: const Duration(milliseconds: 220),
@@ -2196,10 +2204,12 @@ class _SpeechTrailOverlay extends StatefulWidget {
   const _SpeechTrailOverlay({
     required this.speech,
     required this.compact,
+    required this.availableWidth,
   });
 
   final String speech;
   final bool compact;
+  final double availableWidth;
 
   @override
   State<_SpeechTrailOverlay> createState() => _SpeechTrailOverlayState();
@@ -4395,17 +4405,17 @@ class GridPainter extends CustomPainter {
 
     return [
       _GridLayer(
-        color: const Color(0x14000000),
+        color: _dustGrey.withValues(alpha: 0.24),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),
       _GridLayer(
-        color: const Color(0x22000000),
+        color: _almondCream.withValues(alpha: 0.38),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),
       _GridLayer(
-        color: const Color(0x30000000),
+        color: _dustGrey.withValues(alpha: 0.52),
         verticalPositions: buildPositions(5000),
         horizontalPositions: buildPositions(5000),
       ),

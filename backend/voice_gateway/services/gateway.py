@@ -6,17 +6,17 @@ from voice_gateway.domain.contracts import (
 )
 from voice_gateway.services.audio import prepare_audio_for_stt
 from voice_gateway.services.providers import (
-    GoogleCloudSpeechSTTProvider,
     OpenAILLMProvider,
-    PiperTTSProvider,
+    build_default_stt_provider,
+    build_default_tts_provider,
 )
 
 
 class VoiceGatewayCore:
     def __init__(self, stt_provider=None, llm_provider=None, tts_provider=None):
-        self.stt_provider = stt_provider or GoogleCloudSpeechSTTProvider()
+        self.stt_provider = stt_provider or build_default_stt_provider()
         self.llm_provider = llm_provider or OpenAILLMProvider()
-        self.tts_provider = tts_provider or PiperTTSProvider()
+        self.tts_provider = tts_provider or build_default_tts_provider()
 
     def process_turn(
         self,
