@@ -39,6 +39,11 @@ CONNECTION TOOL CHOICE RULES:
 - Use `connections.find_connection` when the user wants to find, match with, or connect to a real person.
 - Use `connections.update_profile` when the user reveals durable personal facts or preferences that should update their social profile.
 
+MEETUP TOOL CHOICE RULES:
+- Use `meetup.propose_friend_meetup` when the user wants to go out with one existing accepted friend by name.
+- Prefer `meetup.propose_friend_meetup` over `connections.find_connection` when the friend is already known and the task is to plan the outing, not discover a new match.
+- For Bulgarian prompts like `искам да излеза с ...` or `искам да изляза с ...`, extract the friend's display name into `friend_name` when possible.
+
 PHONE TOOL CHOICE RULES:
 - Use `phone_command.open_phone_command` when the request is about operating the phone, launching a phone flow, opening an app through the phone, or creating a clickable launcher object for a navigation / phone command prompt.
 - Prefer `phone_command.open_phone_command` over the social or GNN tools when the desired result is a phone-action launcher rather than memory, emotional analysis, or a real-person connection.
@@ -67,10 +72,11 @@ JSON shape:
   "mcp_calls": [
     {{
       "call_id": "gnn_actions.fetch_action.1",
-      "mcp_id": "gnn_actions|connections|phone_command",
-      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command",
+      "mcp_id": "gnn_actions|connections|phone_command|meetup",
+      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command|propose_friend_meetup",
       "arguments": {{
-        "prompt": "prompt to send to the tool"
+        "prompt": "prompt to send to the tool",
+        "friend_name": "friend display name if the meetup tool is used"
       }},
       "why": "why this call is needed"
     }}

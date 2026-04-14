@@ -1,0 +1,19 @@
+{
+  "id": "meetup",
+  "protocol": "at_home_mcp",
+  "kind": "backend_integrated_toolset",
+  "description": "Plans a meetup with one accepted friend and returns a whiteboard-friendly invite result. Use it when the user wants to go out with a specific existing friend.",
+  "invoke_url": "/api/agent/mcps/meetup/invoke/",
+  "tools": [
+    {
+      "name": "propose_friend_meetup",
+      "method": "POST",
+      "path": "/api/meetup/friends/propose/",
+      "description": "Use this when the user wants to go out with exactly one accepted friend. Pass friend_name when it can be extracted from the prompt.",
+      "body_schema": {
+        "prompt": "string",
+        "friend_name": "string"
+      }
+    }
+  ]
+}

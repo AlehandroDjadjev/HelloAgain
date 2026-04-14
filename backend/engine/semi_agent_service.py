@@ -36,6 +36,7 @@ class SemiAgentService:
         "gnn_actions": {"add_action", "fetch_action", "conversation"},
         "connections": {"update_profile", "find_connection"},
         "phone_command": {"open_phone_command"},
+        "meetup": {"propose_friend_meetup"},
     }
     SUPPORTED_TOOL_NAMES = {
         tool_name
@@ -61,6 +62,7 @@ class SemiAgentService:
         llm_provider: OpenAILLMProvider | None = None,
         tts_provider: TextToSpeechProvider | None = None,
         connections_service: Any | None = None,
+        meetup_service: Any | None = None,
         user_tracker: ActiveUserTracker | None = None,
         speech_history_store: TemporaryChatHistoryStore | None = None,
     ) -> None:
@@ -80,6 +82,11 @@ class SemiAgentService:
                 user_tracker=self.user_tracker,
             )
         self.connections_service = connections_service
+        if meetup_service is None:
+            from meetup.agent_service import MeetupAgentService
+
+            meetup_service = MeetupAgentService()
+        self.meetup_service = meetup_service
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
@@ -1353,6 +1360,13 @@ class SemiAgentService:
                 tool_name=tool_name,
                 prompt=prompt,
             )
+        if mcp_id == "meetup":
+            return self._dispatch_meetup_tool(
+                tool_name=tool_name,
+                prompt=prompt,
+                arguments=arguments,
+                user_id=user_id,
+            )
         raise ValueError(f"Unsupported MCP '{mcp_id}'.")
 
     def _dispatch_gnn_tool(
@@ -1421,6 +1435,23 @@ class SemiAgentService:
             **launch_metadata,
         }
 
+    def _dispatch_meetup_tool(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+        user_id: str,
+    ) -> Dict[str, Any]:
+        if tool_name != "propose_friend_meetup":
+            raise ValueError(f"Unsupported tool '{tool_name}'.")
+        friend_name = self._clean_text(arguments.get("friend_name"))
+        return self.meetup_service.propose_friend_meetup_for_prompt(
+            agent_user_id=user_id,
+            prompt=prompt,
+            friend_name=friend_name,
+        )
+
     def _summarize_mcp_result(self, mcp_id: str, tool_name: str, result: Dict[str, Any]) -> str:
         if mcp_id == "connections":
             if tool_name == "find_connection":
@@ -1440,6 +1471,19 @@ class SemiAgentService:
             if launch_prompt:
                 return f"Prepared the phone command handoff for {launch_prompt}."
             return self._clean_text(result.get("message")) or "Phone command handoff is ready."
+        if mcp_id == "meetup":
+            invite = result.get("invite") if isinstance(result.get("invite"), dict) else {}
+            friend_name = self._clean_text(
+                result.get("friend_name")
+                or invite.get("invited_display_name")
+                or invite.get("requester_display_name")
+            )
+            place_name = self._clean_text(invite.get("place_name"))
+            if friend_name and place_name:
+                return f"Planned a meetup with {friend_name} at {place_name}."
+            if friend_name:
+                return f"Prepared a meetup proposal with {friend_name}."
+            return self._clean_text(result.get("message")) or "Meetup planning finished."
         if tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             chosen_name = self._clean_text(chosen.get("name"))
@@ -1620,6 +1664,20 @@ class SemiAgentService:
                 **phone_command_launch,
             }
 
+        meetup_viewer = self._extract_meetup_invite_viewer(
+            object_payload=object_payload,
+            binding=binding,
+        )
+        if meetup_viewer is not None:
+            return {
+                "title": self._clean_text(meetup_viewer.get("title")) or default_title,
+                "summary": self._clean_text(meetup_viewer.get("summary")) or default_summary,
+                "memory_type": binding.get("memory_type"),
+                "linked_call_ids": binding.get("linked_call_ids", []),
+                "payload": default_payload,
+                **meetup_viewer,
+            }
+
         return {
             "title": default_title,
             "summary": default_summary,
@@ -1710,6 +1768,84 @@ class SemiAgentService:
             return launch_metadata
         return None
 
+    def _extract_meetup_invite_viewer(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        candidates = [
+            object_payload.get("extraData"),
+            object_payload.get("extra_data"),
+        ]
+        payload = binding.get("payload") if isinstance(binding.get("payload"), dict) else {}
+        candidates.append(payload.get("object") if isinstance(payload.get("object"), dict) else {})
+        for linked in payload.get("linked_results", []):
+            if not isinstance(linked, dict):
+                continue
+            result = linked.get("result") if isinstance(linked.get("result"), dict) else {}
+            candidates.append(result.get("board_object"))
+            candidates.append(result)
+
+        selected_result: Dict[str, Any] | None = None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            extra_data = (
+                candidate.get("extra_data")
+                if isinstance(candidate.get("extra_data"), dict)
+                else candidate.get("extraData")
+                if isinstance(candidate.get("extraData"), dict)
+                else candidate
+            )
+            kind = self._clean_text(extra_data.get("kind")).lower()
+            widget_type = self._clean_text(candidate.get("widget_type")).lower()
+            if kind != "meetup_invite" and widget_type != "meetup_invite":
+                continue
+            if isinstance(candidate.get("invite"), dict):
+                selected_result = candidate
+                break
+            if selected_result is None:
+                selected_result = candidate
+
+        if not isinstance(selected_result, dict):
+            return None
+
+        invite = (
+            selected_result.get("invite")
+            if isinstance(selected_result.get("invite"), dict)
+            else {}
+        )
+        notification = (
+            selected_result.get("notification")
+            if isinstance(selected_result.get("notification"), dict)
+            else {}
+        )
+        if not invite:
+            return None
+
+        friend_name = self._clean_text(
+            selected_result.get("friend_name")
+            or invite.get("invited_display_name")
+            or invite.get("requester_display_name")
+        )
+        meeting_when = self._clean_text(invite.get("meeting_when_bg"))
+        place_name = self._clean_text(invite.get("place_name"))
+        summary_bits = [bit for bit in (meeting_when, place_name) if bit]
+        summary = " | ".join(summary_bits)
+        if friend_name and summary:
+            summary = f"{friend_name} | {summary}"
+        elif friend_name:
+            summary = friend_name
+        return {
+            "widget_type": "meetup_invite",
+            "title": self._clean_text(f"Meetup with {friend_name}") if friend_name else "Meetup Invite",
+            "summary": summary,
+            "invite": invite,
+            "notification": notification,
+            "friend_name": friend_name,
+        }
+
     def _build_phone_command_launch_metadata(self, prompt: str) -> Dict[str, Any]:
         clean_prompt = self._clean_text(prompt)
         encoded_prompt = quote_plus(clean_prompt)
@@ -1775,7 +1911,13 @@ class SemiAgentService:
         request_kind = self._clean_text(raw.get("request_kind")).lower()
         if request_kind not in {"mechanical", "profile", "mixed"}:
             request_kind = self._default_request_kind(prompt)
+        used_default_calls = False
+        if not calls:
+            calls = self._default_mcp_calls(prompt, request_kind)
+            used_default_calls = bool(calls)
         needs_mcps = self._to_bool(raw.get("needs_mcps"), default=bool(calls))
+        if used_default_calls:
+            needs_mcps = True
         memory_hint = self._normalize_memory_type(raw.get("memory_hint") or self._default_memory_type(prompt, request_kind))
 
         if request_kind == "mechanical" and not calls:
@@ -2401,6 +2543,20 @@ class SemiAgentService:
         }
 
     def _default_mcp_calls(self, prompt: str, request_kind: str) -> List[Dict[str, Any]]:
+        friend_name = self._extract_bulgarian_meetup_friend_name(prompt)
+        if friend_name:
+            return [
+                {
+                    "call_id": "meetup.propose_friend_meetup.1",
+                    "mcp_id": "meetup",
+                    "tool_name": "propose_friend_meetup",
+                    "arguments": {
+                        "prompt": prompt,
+                        "friend_name": friend_name,
+                    },
+                    "why": "The user wants to go out with one existing friend by name.",
+                }
+            ]
         return []
 
     def _looks_like_new_action_memory_request(self, prompt: str) -> bool:
@@ -2521,6 +2677,23 @@ class SemiAgentService:
             return "memory"
         return "instant"
 
+    def _extract_bulgarian_meetup_friend_name(self, prompt: str) -> str:
+        clean_prompt = " ".join(self._clean_text(prompt).split())
+        if not clean_prompt:
+            return ""
+        patterns = (
+            r"\bискам\s+да\s+изл(?:е|я)за\s+с\s+(.+)$",
+            r"\bискам\s+да\s+изляза\s+с\s+(.+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, clean_prompt, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1).strip().strip("\"'`.,!?;:- ")
+            if candidate:
+                return candidate
+        return ""
+
     def _generate_focus_object_name(self, prompt: str, current_results: List[Dict[str, Any]]) -> str:
         base = self._slugify(self._default_focus_text(prompt, current_results))
         return base or f"agent_object_{uuid.uuid4().hex[:8]}"
@@ -2551,6 +2724,14 @@ class SemiAgentService:
             return "Profile Update"
         elif mcp_id == "phone_command" and tool_name == "open_phone_command":
             return "Phone Command"
+        elif mcp_id == "meetup" and tool_name == "propose_friend_meetup":
+            friend_name = self._clean_text(result.get("friend_name"))
+            if friend_name:
+                return self._clip_focus_title(f"Meet {friend_name}")
+            invite = result.get("invite") if isinstance(result.get("invite"), dict) else {}
+            candidate = self._clean_text(invite.get("place_name"))
+            if candidate:
+                return self._clip_focus_title(candidate)
         elif tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             candidate = self._clean_text(chosen.get("name"))

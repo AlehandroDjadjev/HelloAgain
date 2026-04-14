@@ -2958,6 +2958,19 @@ class AgentResultDialog extends StatelessWidget {
                   ),
                 ),
               )
+            else if (widgetType == 'meetup_invite' && viewer['invite'] is Map)
+              SizedBox(
+                width: 520,
+                child: SingleChildScrollView(
+                  child: AgentMeetupInviteView(
+                    invite: Map<String, dynamic>.from(viewer['invite'] as Map),
+                    notification: viewer['notification'] is Map
+                        ? Map<String, dynamic>.from(viewer['notification'] as Map)
+                        : const <String, dynamic>{},
+                    friendName: (viewer['friend_name'] ?? '').toString(),
+                  ),
+                ),
+              )
             else
               SizedBox(
                 height: 320,
@@ -3037,6 +3050,59 @@ class AgentUserProfileView extends StatelessWidget {
           _UserSectionLabel(text: 'Email', value: email),
         if (phoneNumber != null && phoneNumber.isNotEmpty)
           _UserSectionLabel(text: 'Phone', value: phoneNumber),
+      ],
+    );
+  }
+}
+
+class AgentMeetupInviteView extends StatelessWidget {
+  const AgentMeetupInviteView({
+    super.key,
+    required this.invite,
+    required this.notification,
+    required this.friendName,
+  });
+
+  final Map<String, dynamic> invite;
+  final Map<String, dynamic> notification;
+  final String friendName;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = (invite['status'] ?? 'pending').toString();
+    final when = (invite['meeting_when_bg'] ?? '').toString();
+    final placeName = (invite['place_name'] ?? '').toString();
+    final weather = (invite['weather'] ?? '').toString();
+    final temperature = invite['temperature']?.toString() ?? '';
+    final score = invite['score']?.toString() ?? '';
+    final notificationBody = (notification['body'] ?? '').toString();
+    final visibleFriend = friendName.isNotEmpty
+        ? friendName
+        : (invite['invited_display_name'] ?? invite['requester_display_name'] ?? '')
+              .toString();
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (visibleFriend.isNotEmpty)
+          _UserSectionLabel(text: 'Friend', value: visibleFriend),
+        if (status.isNotEmpty) _UserSectionLabel(text: 'Status', value: status),
+        if (when.isNotEmpty) _UserSectionLabel(text: 'When', value: when),
+        if (placeName.isNotEmpty)
+          _UserSectionLabel(text: 'Place', value: placeName),
+        if (weather.isNotEmpty || temperature.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Weather',
+            value: [
+              if (weather.isNotEmpty) weather,
+              if (temperature.isNotEmpty) '$temperature°C',
+            ].join(' • '),
+          ),
+        if (score.isNotEmpty)
+          _UserSectionLabel(text: 'Match score', value: score),
+        if (notificationBody.isNotEmpty)
+          _UserSectionLabel(text: 'Invite message', value: notificationBody),
       ],
     );
   }

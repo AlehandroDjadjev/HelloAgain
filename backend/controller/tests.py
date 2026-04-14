@@ -48,6 +48,7 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertTrue(payload["mcps"][0]["descriptor_url"].endswith("/api/agent/mcps/gnn_actions/"))
         self.assertTrue(any(item["id"] == "connections" for item in payload["mcps"]))
         self.assertTrue(any(item["id"] == "phone_command" for item in payload["mcps"]))
+        self.assertTrue(any(item["id"] == "meetup" for item in payload["mcps"]))
 
         descriptor = registry.load_descriptor("gnn_actions", base_url="http://localhost:8000")
         self.assertEqual(descriptor["id"], "gnn_actions")
@@ -64,6 +65,12 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertEqual(len(phone_command_descriptor["tools"]), 1)
         self.assertTrue(phone_command_descriptor["invoke_url"].endswith("/api/agent/mcps/phone_command/invoke/"))
         self.assertEqual(phone_command_descriptor["tools"][0]["path"], "/api/agent/mcps/phone_command/invoke/")
+
+        meetup_descriptor = registry.load_descriptor("meetup", base_url="http://localhost:8000")
+        self.assertEqual(meetup_descriptor["id"], "meetup")
+        self.assertEqual(len(meetup_descriptor["tools"]), 1)
+        self.assertTrue(meetup_descriptor["invoke_url"].endswith("/api/agent/mcps/meetup/invoke/"))
+        self.assertEqual(meetup_descriptor["tools"][0]["path"], "/api/meetup/friends/propose/")
 
     def test_step_one_prompt_explicitly_teaches_phone_command_tool_usage(self) -> None:
         registry = CustomMcpRegistry()
@@ -85,6 +92,9 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertIn("PHONE TOOL CHOICE RULES", prompt)
         self.assertIn("phone_command.open_phone_command", prompt)
         self.assertIn("operating the phone", prompt)
+        self.assertIn("MEETUP TOOL CHOICE RULES", prompt)
+        self.assertIn("meetup.propose_friend_meetup", prompt)
+        self.assertIn("искам да излеза с", prompt)
 
     def test_service_builds_tool_catalog_from_registry_descriptors(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -946,6 +956,166 @@ class SemiAgentServiceTests(SimpleTestCase):
             self.assertEqual(payload["viewer"]["widget_type"], "phone_command_launcher")
             self.assertEqual(payload["viewer"]["prompt"], "Open Chrome")
             self.assertTrue(payload["viewer"]["auto_run_on_open"])
+
+    def test_meetup_mcp_infers_single_tool_and_returns_invite_metadata(self) -> None:
+        fake_meetup_service = SimpleNamespace(
+            propose_friend_meetup_for_prompt=lambda **kwargs: {
+                "ok": True,
+                "widget_type": "meetup_invite",
+                "message": "Meetup proposal created with Bob.",
+                "friend_name": "Bob",
+                "invite": {
+                    "id": 7,
+                    "status": "pending",
+                    "place_name": "South Park",
+                    "meeting_when_bg": "събота, 12.04.2026 в 18:00",
+                },
+                "notification": {
+                    "id": 11,
+                    "body": "Покана за среща.",
+                },
+                "board_object": {
+                    "extra_data": {
+                        "kind": "meetup_invite",
+                        "invite_id": 7,
+                        "friend_name": "Bob",
+                    }
+                },
+            }
+        )
+        service = SemiAgentService(
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+            meetup_service=fake_meetup_service,
+        )
+
+        payload = service.invoke_mcp(
+            mcp_id="meetup",
+            tool_name="",
+            arguments={
+                "prompt": "искам да излеза с Bob",
+                "friend_name": "Bob",
+            },
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["tool_name"], "propose_friend_meetup")
+        self.assertEqual(payload["result"]["widget_type"], "meetup_invite")
+        self.assertEqual(payload["result"]["friend_name"], "Bob")
+        self.assertEqual(payload["result"]["board_object"]["extra_data"]["kind"], "meetup_invite")
+
+    def test_opening_meetup_object_returns_meetup_viewer(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            service = SemiAgentService(
+                board_memory=store,
+                connections_service=SimpleNamespace(
+                    save_board_state_for_user=lambda *args, **kwargs: None,
+                    apply_board_commands_for_user=lambda *args, **kwargs: None,
+                    build_user_widget_payload=lambda **kwargs: {},
+                ),
+            )
+            store.register_result_bindings(
+                [
+                    {
+                        "result_id": "result_meetup",
+                        "object_name": "meet_bob",
+                        "memory_type": "memory",
+                        "delete_after_click": False,
+                        "result_title": "Meet Bob",
+                        "result_summary": "Planned meetup details.",
+                        "payload": {
+                            "linked_results": [
+                                {
+                                    "result": {
+                                        "widget_type": "meetup_invite",
+                                        "friend_name": "Bob",
+                                        "invite": {
+                                            "id": 7,
+                                            "status": "pending",
+                                            "place_name": "South Park",
+                                            "meeting_when_bg": "събота, 12.04.2026 в 18:00",
+                                        },
+                                        "notification": {
+                                            "id": 11,
+                                            "body": "Покана за среща.",
+                                        },
+                                        "board_object": {
+                                            "extra_data": {
+                                                "kind": "meetup_invite",
+                                                "invite_id": 7,
+                                                "friend_name": "Bob",
+                                            }
+                                        },
+                                    }
+                                }
+                            ],
+                            "object": {
+                                "name": "meet_bob",
+                                "text": "Meet Bob",
+                                "extraData": {
+                                    "kind": "meetup_invite",
+                                    "invite_id": 7,
+                                    "friend_name": "Bob",
+                                },
+                            },
+                        },
+                    }
+                ]
+            )
+
+            payload = service.open_board_object(
+                object_payload={
+                    "name": "meet_bob",
+                    "resultId": "result_meetup",
+                    "memoryType": "memory",
+                    "deleteAfterClick": False,
+                    "extraData": {
+                        "kind": "meetup_invite",
+                        "invite_id": 7,
+                        "friend_name": "Bob",
+                    },
+                }
+            )
+
+            self.assertTrue(payload["found"])
+            self.assertEqual(payload["board_commands"], [])
+            self.assertEqual(payload["viewer"]["widget_type"], "meetup_invite")
+            self.assertEqual(payload["viewer"]["friend_name"], "Bob")
+
+    def test_normalize_step_one_uses_bulgarian_meetup_fallback(self) -> None:
+        service = SemiAgentService(
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+        )
+
+        normalized = service._normalize_step_one_plan(
+            {
+                "stage": "step_1_mcp",
+                "step_number": 1,
+                "chain_position": "mcp layer",
+                "needs_mcps": False,
+                "request_kind": "profile",
+                "memory_hint": "memory",
+                "reasoning_summary": "fallback",
+                "why_this_is_part_of_the_chain": "fallback",
+                "board_intent": "fallback",
+                "speech_intent": "fallback",
+                "mcp_calls": [],
+            },
+            "искам да излеза с Bob",
+        )
+
+        self.assertTrue(normalized["needs_mcps"])
+        self.assertEqual(normalized["mcp_calls"][0]["mcp_id"], "meetup")
+        self.assertEqual(normalized["mcp_calls"][0]["tool_name"], "propose_friend_meetup")
+        self.assertEqual(normalized["mcp_calls"][0]["arguments"]["friend_name"], "Bob")
 
     def test_run_speech_stage_includes_recent_temp_history_and_short_mcp_guidance(self) -> None:
         class RecordingLlmProvider:
