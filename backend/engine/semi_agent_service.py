@@ -24,6 +24,7 @@ from .semi_agent_prompts import (
 from .user_context import ActiveUserTracker, TemporaryChatHistoryStore
 from .whiteboard_memory import WhiteboardMemoryStore
 from services.google_calendar_service import GoogleCalendarService
+from weather.agent_service import WeatherAgentService
 from voice_gateway.services.providers import (
     OpenAILLMProvider,
     TextToSpeechProvider,
@@ -74,7 +75,7 @@ class SemiAgentService:
         weather_service: WeatherService | None = None,
         time_service: TimeService | None = None,
         search_service: SearchService | None = None,
-        weather_service: Any | None = None,
+        weather_agent_service: WeatherAgentService | None = None,
         user_tracker: ActiveUserTracker | None = None,
         speech_history_store: TemporaryChatHistoryStore | None = None,
     ) -> None:
@@ -105,11 +106,7 @@ class SemiAgentService:
         self.weather_service = weather_service or WeatherService()
         self.time_service = time_service or TimeService()
         self.search_service = search_service or SearchService()
-        if weather_service is None:
-            from weather.agent_service import WeatherAgentService
-
-            weather_service = WeatherAgentService()
-        self.weather_service = weather_service
+        self.weather_agent_service = weather_agent_service or WeatherAgentService()
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
@@ -2187,14 +2184,6 @@ class SemiAgentService:
                 prompt=prompt,
                 arguments=arguments,
                 user_id=user_id,
-                location=location,
-            )
-        if mcp_id == "calendar":
-            return self._dispatch_calendar_tool(
-                tool_name=tool_name,
-                prompt=prompt,
-                arguments=arguments,
-                user_id=user_id,
             )
         raise ValueError(f"Unsupported MCP '{mcp_id}'.")
 
@@ -2273,7 +2262,7 @@ class SemiAgentService:
             arguments.get("location") if isinstance(arguments.get("location"), dict) else None
         )
         timezone_name = self._clean_text(arguments.get("timezone"))
-        return self.weather_service.get_current_weather_for_prompt(
+        return self.weather_agent_service.get_current_weather_for_prompt(
             agent_user_id=user_id,
             prompt=prompt,
             location=argument_location or location,
