@@ -51,6 +51,18 @@
         "Prefer it over connections.find_connection when the friend is already known by name.",
         "Pass only one friend selector, usually friend_name extracted from the prompt."
       ]
+    },
+    {
+      "id": "calendar",
+      "name": "calendar",
+      "description": "Creates a Google Calendar reminder for an already accepted meetup with full details.",
+      "descriptor_file": "calendar.json",
+      "descriptor_url": "/api/agent/mcps/calendar/",
+      "notes": [
+        "Use this only after a meetup is already accepted.",
+        "Only use it when the meetup has a time and place.",
+        "If Google Calendar is not connected, the tool should fail gracefully."
+      ]
     }
   ]
 }

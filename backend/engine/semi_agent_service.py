@@ -9,18 +9,21 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
 from .custom_mcp_registry import CustomMcpRegistry
+from .live_tool_services import LiveToolError, SearchService, TimeService, WeatherService
 from .llm_parser import QwenPromptParser
 from .qwen_worker_client import QwenWorkerClient
+from .routing_models import RouteDecision
 from .semi_agent_prompts import (
     build_step_one_mcp_prompt,
     build_step_two_board_prompt,
 )
 from .user_context import ActiveUserTracker, TemporaryChatHistoryStore
 from .whiteboard_memory import WhiteboardMemoryStore
+from services.google_calendar_service import GoogleCalendarService
 from voice_gateway.services.providers import (
     OpenAILLMProvider,
     TextToSpeechProvider,
@@ -37,6 +40,7 @@ class SemiAgentService:
         "connections": {"update_profile", "find_connection"},
         "phone_command": {"open_phone_command"},
         "meetup": {"propose_friend_meetup"},
+        "calendar": {"create_meetup_reminder"},
     }
     SUPPORTED_TOOL_NAMES = {
         tool_name
@@ -60,9 +64,15 @@ class SemiAgentService:
         registry: CustomMcpRegistry | None = None,
         board_memory: WhiteboardMemoryStore | None = None,
         llm_provider: OpenAILLMProvider | None = None,
+        router_llm_provider: OpenAILLMProvider | None = None,
+        reasoning_llm_provider: OpenAILLMProvider | None = None,
         tts_provider: TextToSpeechProvider | None = None,
         connections_service: Any | None = None,
         meetup_service: Any | None = None,
+        calendar_service: GoogleCalendarService | None = None,
+        weather_service: WeatherService | None = None,
+        time_service: TimeService | None = None,
+        search_service: SearchService | None = None,
         user_tracker: ActiveUserTracker | None = None,
         speech_history_store: TemporaryChatHistoryStore | None = None,
     ) -> None:
@@ -71,6 +81,8 @@ class SemiAgentService:
         self.registry = registry or CustomMcpRegistry()
         self.board_memory = board_memory or WhiteboardMemoryStore()
         self.llm_provider = llm_provider or OpenAILLMProvider()
+        self.router_llm_provider = router_llm_provider or OpenAILLMProvider(model="gpt-5.4-mini")
+        self.reasoning_llm_provider = reasoning_llm_provider or OpenAILLMProvider(model="gpt-5.4")
         self.tts_provider = tts_provider or build_default_tts_provider()
         self.user_tracker = user_tracker or ActiveUserTracker()
         self.speech_history_store = speech_history_store or TemporaryChatHistoryStore()
@@ -87,6 +99,10 @@ class SemiAgentService:
 
             meetup_service = MeetupAgentService()
         self.meetup_service = meetup_service
+        self.calendar_service = calendar_service or GoogleCalendarService()
+        self.weather_service = weather_service or WeatherService()
+        self.time_service = time_service or TimeService()
+        self.search_service = search_service or SearchService()
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
@@ -502,6 +518,523 @@ class SemiAgentService:
             "board_state": persisted,
         }
 
+    def _build_route_response_format(self) -> Dict[str, Any]:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "semi_agent_route_decision",
+                "strict": True,
+                "schema": self._strict_openai_schema(RouteDecision.model_json_schema()),
+            },
+        }
+
+    def _route_request(self, prompt: str, board_state: Dict[str, Any] | None) -> RouteDecision:
+        clean_prompt = self._clean_text(prompt)
+        fallback = self._fallback_route_decision(clean_prompt, board_state)
+        try:
+            llm_result = self.router_llm_provider.generate_reply_with_messages(
+                system_prompt=self._build_route_system_prompt(),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_route_user_prompt(
+                            clean_prompt=clean_prompt,
+                            board_state=board_state,
+                        ),
+                    }
+                ],
+                session_id="router",
+                user_id="router",
+                include_history=False,
+                store_history=False,
+                response_format=self._build_route_response_format(),
+            )
+            raw_payload = json.loads(self._clean_text(llm_result.text) or "{}")
+            decision = RouteDecision.model_validate(raw_payload)
+            clean_tool_name = self._clean_text(decision.tool_name).lower() or None
+            if decision.route == "live_tool":
+                if clean_tool_name not in {"weather", "time", "search"}:
+                    clean_tool_name = "search"
+                decision = decision.model_copy(
+                    update={
+                        "tool_name": clean_tool_name,
+                        "location": self._clean_text(decision.location) or None,
+                    }
+                )
+            else:
+                decision = decision.model_copy(update={"tool_name": None, "location": None})
+            return decision
+        except Exception:
+            return fallback
+
+    def _build_route_system_prompt(self) -> str:
+        return (
+            "You are a strict router for HelloAgain. "
+            "Choose exactly one route for the incoming request. "
+            "Return only valid JSON matching the schema.\n\n"
+            "Route direct_reasoning for explanations, comparisons, math, logic, planning, summaries, and general knowledge.\n"
+            "Route live_tool for weather, current time in a place, prices, news, fresh web data, or anything requiring current external information.\n"
+            "Route semi_agent for whiteboard or board actions, persistent memory, meetups, friend finding, graph or GNN actions, phone-command launchers, and existing MCP workflows.\n"
+            "Only set tool_name for live_tool. Allowed live tools: weather, time, search.\n"
+            "Set location only when a concrete place is clearly present for weather or time."
+        )
+
+    def _build_route_user_prompt(
+        self,
+        *,
+        clean_prompt: str,
+        board_state: Dict[str, Any] | None,
+    ) -> str:
+        payload = {
+            "prompt": clean_prompt,
+            "board_context": self._summarize_board_for_router(board_state),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _summarize_board_for_router(self, board_state: Dict[str, Any] | None) -> Dict[str, Any]:
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        objects = normalized_board_state.get("objects", [])
+        summarized_objects: List[Dict[str, Any]] = []
+        for raw_object in objects[:6]:
+            if not isinstance(raw_object, dict):
+                continue
+            extra_data = raw_object.get("extraData") if isinstance(raw_object.get("extraData"), dict) else {}
+            summarized_objects.append(
+                {
+                    "name": self._clean_text(raw_object.get("name")),
+                    "text": self._clean_text(raw_object.get("text")),
+                    "tags": raw_object.get("tags") if isinstance(raw_object.get("tags"), list) else [],
+                    "kind": self._clean_text(extra_data.get("kind")),
+                }
+            )
+        return {
+            "object_count": len(objects) if isinstance(objects, list) else 0,
+            "objects": summarized_objects,
+        }
+
+    def _fallback_route_decision(
+        self,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+    ) -> RouteDecision:
+        lowered = self._clean_text(prompt).lower()
+        location_hint = self._extract_location_hint(prompt)
+        live_markers = {
+            "weather": "weather",
+            "temperature": "weather",
+            "forecast": "weather",
+            "time in": "time",
+            "current time": "time",
+            "what time": "time",
+            "latest": "search",
+            "today": "search",
+            "news": "search",
+            "price": "search",
+            "stock": "search",
+            "search": "search",
+            "look up": "search",
+        }
+        for marker, tool_name in live_markers.items():
+            if marker in lowered:
+                return RouteDecision(
+                    route="live_tool",
+                    reason=f"Fallback routed to live_tool because the prompt mentions {marker}.",
+                    tool_name=tool_name,
+                    location=location_hint if tool_name in {"weather", "time"} else None,
+                )
+
+        board_summary = self._summarize_board_for_router(board_state)
+        semi_agent_markers = (
+            "board",
+            "whiteboard",
+            "remember",
+            "memory",
+            "friend",
+            "connection",
+            "meetup",
+            "go out with",
+            "phone command",
+            "open the phone",
+            "gnn",
+            "graph",
+            "show this on",
+            "move this",
+            "delete this",
+            "find me",
+            "connect me",
+        )
+        if any(marker in lowered for marker in semi_agent_markers):
+            return RouteDecision(
+                route="semi_agent",
+                reason="Fallback routed to semi_agent because the prompt matches an existing board or MCP workflow.",
+            )
+        if board_summary.get("object_count") and any(
+            marker in lowered for marker in {"this", "that", "move", "delete", "open it", "show it"}
+        ):
+            return RouteDecision(
+                route="semi_agent",
+                reason="Fallback routed to semi_agent because the prompt appears to refer to board state.",
+            )
+        return RouteDecision(
+            route="direct_reasoning",
+            reason="Fallback routed to direct_reasoning because the prompt looks like a self-contained knowledge request.",
+        )
+
+    def _extract_location_hint(self, prompt: str) -> Optional[str]:
+        clean_prompt = self._clean_text(prompt)
+        if not clean_prompt:
+            return None
+        patterns = (
+            r"\b(?:in|for|at)\s+([A-ZА-Я][^?.!,]+)$",
+            r"\b(?:weather|time)\s+(?:for|in)\s+([A-ZА-Я][^?.!,]+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, clean_prompt, flags=re.IGNORECASE)
+            if not match:
+                continue
+            location = self._clean_text(match.group(1)).strip(" .?!,;:")
+            if location:
+                return location
+        return None
+
+    def _build_completed_future(self, payload: Dict[str, Any]) -> Future:
+        future: Future = Future()
+        future.set_result(payload)
+        return future
+
+    def _build_routed_whitespace_payload(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        route_decision: RouteDecision,
+        reasoning_provider: str,
+    ) -> Dict[str, Any]:
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        return {
+            "ok": True,
+            "status": "completed",
+            "prompt": self._clean_text(prompt),
+            "route": route_decision.route,
+            "route_decision": route_decision.model_dump(),
+            "reasoning_provider": reasoning_provider,
+            "step_one": {
+                "stage": "router",
+                "needs_mcps": False,
+                "request_kind": "mechanical",
+                "memory_hint": "ram",
+                "reasoning_summary": route_decision.reason,
+                "why_this_is_part_of_the_chain": "A pre-router answered before the semi-agent pipeline.",
+                "board_intent": "No board changes are needed for this route.",
+                "speech_intent": "Answer directly to the user.",
+                "mcp_calls": [],
+            },
+            "mcp_results": [],
+            "step_two": {
+                "stage": "router_bypass",
+                "cycle_back_to_step_one": False,
+                "reasoning_summary": "Router bypassed whitespace generation.",
+                "board_explanation": "No whiteboard interaction was needed.",
+                "memory_plan": {
+                    "default_memory_type": "ram",
+                    "why": "The routed request is answer-only and should not mutate board state.",
+                },
+                "focus_object": {
+                    "name": "",
+                    "text": "",
+                    "width": 0,
+                    "height": 0,
+                    "memory_type": "ram",
+                    "delete_after_click": False,
+                    "linked_call_ids": [],
+                    "result_title": "",
+                    "result_summary": "",
+                },
+                "board_commands": [],
+                "result_bindings": [],
+            },
+            "board_commands": [],
+            "board_state": normalized_board_state,
+            "persisted_board_state": normalized_board_state,
+            "result_bindings": [],
+        }
+
+    def _build_speech_payload_from_text(
+        self,
+        *,
+        assistant_text: str,
+        llm_source: str,
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        normalized_text = self._clean_text(assistant_text)
+        assistant_audio_base64 = ""
+        assistant_audio_mime_type = ""
+        tts_source = self.tts_provider.status()
+        try:
+            synthesis = self.tts_provider.synthesize(normalized_text)
+        except Exception as exc:
+            warnings = [*warnings, f"tts_unavailable={exc}"]
+        else:
+            warnings = [*warnings, *synthesis.warnings]
+            assistant_audio_base64 = base64.b64encode(synthesis.audio_bytes).decode("ascii")
+            assistant_audio_mime_type = synthesis.mime_type
+            tts_source = synthesis.source
+        return {
+            "ok": True,
+            "status": "completed",
+            "speech_response": normalized_text,
+            "assistant_text": normalized_text,
+            "assistant_audio_base64": assistant_audio_base64,
+            "assistant_audio_mime_type": assistant_audio_mime_type,
+            "provider_status": {
+                "llm": llm_source,
+                "tts": tts_source,
+            },
+            "warnings": warnings,
+        }
+
+    def _build_recent_history_payload(
+        self,
+        *,
+        user_context: Dict[str, str],
+        session_id: str,
+    ) -> List[Dict[str, str]]:
+        history_key = self._clean_text(user_context.get("history_key")) or "anonymous"
+        clean_session_id = self._clean_text(session_id) or "default_session"
+        return self.speech_history_store.get_messages(
+            history_key=history_key,
+            session_id=clean_session_id,
+        )
+
+    def _store_speech_turn(
+        self,
+        *,
+        user_context: Dict[str, str],
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        history_key = self._clean_text(user_context.get("history_key")) or "anonymous"
+        clean_session_id = self._clean_text(session_id) or "default_session"
+        self.speech_history_store.append_turn(
+            history_key=history_key,
+            session_id=clean_session_id,
+            user_text=self._clean_text(user_text),
+            assistant_text=self._clean_text(assistant_text),
+        )
+
+    def _run_direct_reasoning(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        user_context: Dict[str, str],
+        session_id: str,
+        route_decision: RouteDecision,
+        reasoning_provider: str,
+    ) -> Dict[str, Any]:
+        speech_payload = self._run_direct_reasoning_speech_stage(
+            prompt=prompt,
+            user_context=user_context,
+            session_id=session_id,
+        )
+        whitespace_payload = self._build_routed_whitespace_payload(
+            prompt=prompt,
+            board_state=board_state,
+            route_decision=route_decision,
+            reasoning_provider=reasoning_provider,
+        )
+        return {
+            **whitespace_payload,
+            "speech_response": self._clean_text(speech_payload.get("assistant_text")),
+            "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
+            "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
+            "speech_provider_status": speech_payload.get("provider_status", {}),
+            "speech_warnings": speech_payload.get("warnings", []),
+        }
+
+    def _run_live_tool(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        user_context: Dict[str, str],
+        session_id: str,
+        route_decision: RouteDecision,
+        reasoning_provider: str,
+    ) -> Dict[str, Any]:
+        speech_payload = self._run_live_tool_speech_stage(
+            prompt=prompt,
+            user_context=user_context,
+            session_id=session_id,
+            route_decision=route_decision,
+        )
+        whitespace_payload = self._build_routed_whitespace_payload(
+            prompt=prompt,
+            board_state=board_state,
+            route_decision=route_decision,
+            reasoning_provider=reasoning_provider,
+        )
+        return {
+            **whitespace_payload,
+            "speech_response": self._clean_text(speech_payload.get("assistant_text")),
+            "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
+            "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
+            "speech_provider_status": speech_payload.get("provider_status", {}),
+            "speech_warnings": speech_payload.get("warnings", []),
+        }
+
+    def _fetch_live_tool_payload(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        location: str,
+    ) -> Dict[str, Any]:
+        if tool_name == "weather":
+            return self.weather_service.get_current_weather(location)
+        if tool_name == "time":
+            return self.time_service.get_current_time(location)
+        return self.search_service.search(prompt)
+
+    def _summarize_live_tool_payload(
+        self,
+        *,
+        prompt: str,
+        tool_payload: Dict[str, Any],
+        route_decision: RouteDecision,
+        user_context: Dict[str, str],
+        session_id: str,
+    ) -> tuple[str, str, List[str]]:
+        warnings: List[str] = []
+        try:
+            llm_result = self.reasoning_llm_provider.generate_reply_with_messages(
+                system_prompt=self._build_live_tool_summary_system_prompt(),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_live_tool_summary_user_prompt(
+                            prompt=prompt,
+                            route_decision=route_decision,
+                            tool_payload=tool_payload,
+                            recent_history=self._build_recent_history_payload(
+                                user_context=user_context,
+                                session_id=session_id,
+                            ),
+                        ),
+                    }
+                ],
+                session_id=f"{self._clean_text(session_id) or 'default_session'}_live_tool",
+                user_id=self._clean_text(user_context.get("resolved_user_id")) or "anonymous",
+                include_history=False,
+                store_history=False,
+            )
+            warnings.extend(llm_result.warnings)
+            text = self._clean_text(llm_result.text)
+            if text:
+                return text, llm_result.source, warnings
+        except Exception as exc:
+            warnings.append(f"live_tool_summary_fallback={exc}")
+        return self._fallback_live_tool_response(tool_payload), "fallback", warnings
+
+    def _build_direct_reasoning_system_prompt(self) -> str:
+        return (
+            "You are HelloAgain's direct reasoning layer. "
+            "Answer clearly, accurately, and helpfully. "
+            "Use the same language as the user's latest message. "
+            "Do not mention whiteboards, MCPs, tools, or hidden routing. "
+            "If essential information is missing, ask exactly one short follow-up question."
+        )
+
+    def _build_direct_reasoning_user_prompt(
+        self,
+        *,
+        prompt: str,
+        recent_history: List[Dict[str, str]],
+    ) -> str:
+        return json.dumps(
+            {
+                "user_request": self._clean_text(prompt),
+                "recent_chat_history": recent_history,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def _build_live_tool_summary_system_prompt(self) -> str:
+        return (
+            "You are HelloAgain's live-data response layer. "
+            "Use only the provided live tool payload as factual grounding. "
+            "Never invent current data. "
+            "Answer naturally in the same language as the user's latest message. "
+            "If the tool payload contains an error or missing data, say so plainly and ask at most one short follow-up question."
+        )
+
+    def _build_live_tool_summary_user_prompt(
+        self,
+        *,
+        prompt: str,
+        route_decision: RouteDecision,
+        tool_payload: Dict[str, Any],
+        recent_history: List[Dict[str, str]],
+    ) -> str:
+        return json.dumps(
+            {
+                "user_request": self._clean_text(prompt),
+                "recent_chat_history": recent_history,
+                "route_decision": route_decision.model_dump(),
+                "tool_payload": tool_payload,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def _fallback_direct_reasoning_response(self, prompt: str) -> str:
+        return (
+            "I can help with that. "
+            "Please ask it one more time in a short sentence."
+        )
+
+    def _missing_location_follow_up(self, tool_name: str) -> str:
+        if tool_name == "weather":
+            return "Which location should I check the weather for?"
+        return "Which location should I check the time for?"
+
+    def _fallback_live_tool_response(self, tool_payload: Dict[str, Any]) -> str:
+        tool_name = self._clean_text(tool_payload.get("tool_name")).lower()
+        if self._clean_text(tool_payload.get("error")):
+            return (
+                "I couldn't fetch the live data right now. "
+                "Please try again in a moment."
+            )
+        if tool_name == "weather":
+            location = (
+                tool_payload.get("location")
+                if isinstance(tool_payload.get("location"), dict)
+                else {}
+            )
+            name = self._clean_text(location.get("name")) or "that place"
+            description = self._clean_text(tool_payload.get("weather_description")) or "unknown conditions"
+            temperature = tool_payload.get("temperature_c")
+            if temperature is not None:
+                return f"The weather in {name} is {description}, around {temperature} degrees Celsius."
+            return f"The weather in {name} is {description}."
+        if tool_name == "time":
+            location = (
+                tool_payload.get("location")
+                if isinstance(tool_payload.get("location"), dict)
+                else {}
+            )
+            name = self._clean_text(location.get("name")) or "that place"
+            clock = self._clean_text(tool_payload.get("local_clock"))
+            if clock:
+                return f"The current time in {name} is {clock}."
+        heading = self._clean_text(tool_payload.get("heading") or tool_payload.get("query"))
+        abstract = self._clean_text(tool_payload.get("abstract") or tool_payload.get("answer"))
+        if heading and abstract:
+            return f"{heading}: {abstract}"
+        return "I fetched live data, but I need one more try to phrase it clearly."
+
     def run(
         self,
         *,
@@ -512,13 +1045,51 @@ class SemiAgentService:
         session_id: str = "default_session",
         reasoning_provider: str = "openai",
     ) -> Dict[str, Any]:
+        clean_prompt = self._clean_text(prompt)
+        if not clean_prompt:
+            raise ValueError("prompt required")
+        normalized_reasoning_provider = self._normalize_reasoning_provider(reasoning_provider)
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        route_decision = self._route_request(clean_prompt, normalized_board_state)
+
+        if route_decision.route == "direct_reasoning":
+            return {
+                **self._run_direct_reasoning(
+                    prompt=clean_prompt,
+                    board_state=normalized_board_state,
+                    user_context=user_context,
+                    session_id=session_id,
+                    route_decision=route_decision,
+                    reasoning_provider=normalized_reasoning_provider,
+                ),
+                "user_context": user_context,
+                "route": route_decision.route,
+                "route_decision": route_decision.model_dump(),
+            }
+
+        if route_decision.route == "live_tool":
+            return {
+                **self._run_live_tool(
+                    prompt=clean_prompt,
+                    board_state=normalized_board_state,
+                    user_context=user_context,
+                    session_id=session_id,
+                    route_decision=route_decision,
+                    reasoning_provider=normalized_reasoning_provider,
+                ),
+                "user_context": user_context,
+                "route": route_decision.route,
+                "route_decision": route_decision.model_dump(),
+            }
+
         context = self._prepare_run_context(
-            prompt=prompt,
-            board_state=board_state,
+            prompt=clean_prompt,
+            board_state=normalized_board_state,
             largest_empty_space=largest_empty_space,
             user_id=user_id,
             session_id=session_id,
-            reasoning_provider=reasoning_provider,
+            reasoning_provider=normalized_reasoning_provider,
         )
         speech_future = self._executor.submit(
             self._run_speech_stage,
@@ -547,6 +1118,8 @@ class SemiAgentService:
             **board_payload,
             "user_context": context["user_context"],
             "reasoning_provider": context["reasoning_provider"],
+            "route": "semi_agent",
+            "route_decision": route_decision.model_dump(),
             "speech_response": self._clean_text(speech_payload.get("assistant_text")),
             "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
             "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
@@ -565,13 +1138,73 @@ class SemiAgentService:
         reasoning_provider: str = "openai",
     ) -> Dict[str, Any]:
         self._prune_run_jobs()
+        clean_prompt = self._clean_text(prompt)
+        if not clean_prompt:
+            raise ValueError("prompt required")
+        normalized_reasoning_provider = self._normalize_reasoning_provider(reasoning_provider)
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        route_decision = self._route_request(clean_prompt, normalized_board_state)
+
+        if route_decision.route in {"direct_reasoning", "live_tool"}:
+            run_id = f"run_{uuid.uuid4().hex}"
+            if route_decision.route == "direct_reasoning":
+                speech_future = self._executor.submit(
+                    self._run_direct_reasoning_speech_stage,
+                    prompt=clean_prompt,
+                    user_context=user_context,
+                    session_id=session_id,
+                )
+            else:
+                speech_future = self._executor.submit(
+                    self._run_live_tool_speech_stage,
+                    prompt=clean_prompt,
+                    user_context=user_context,
+                    session_id=session_id,
+                    route_decision=route_decision,
+                )
+            whitespace_future = self._build_completed_future(
+                self._build_routed_whitespace_payload(
+                    prompt=clean_prompt,
+                    board_state=normalized_board_state,
+                    route_decision=route_decision,
+                    reasoning_provider=normalized_reasoning_provider,
+                )
+            )
+            with self._run_jobs_lock:
+                self._run_jobs[run_id] = {
+                    "created_at": time.time(),
+                    "prompt": clean_prompt,
+                    "reasoning_provider": normalized_reasoning_provider,
+                    "user_context": user_context,
+                    "speech_future": speech_future,
+                    "whitespace_future": whitespace_future,
+                }
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "prompt": clean_prompt,
+                "user_context": user_context,
+                "reasoning_provider": normalized_reasoning_provider,
+                "route": route_decision.route,
+                "route_decision": route_decision.model_dump(),
+                "step_one": {
+                    "stage": "router",
+                    "needs_mcps": False,
+                    "mcp_calls": [],
+                },
+                "mcp_results": [],
+                "speech_status": "running",
+                "whitespace_status": "completed",
+            }
+
         context = self._prepare_run_context(
-            prompt=prompt,
-            board_state=board_state,
+            prompt=clean_prompt,
+            board_state=normalized_board_state,
             largest_empty_space=largest_empty_space,
             user_id=user_id,
             session_id=session_id,
-            reasoning_provider=reasoning_provider,
+            reasoning_provider=normalized_reasoning_provider,
         )
         run_id = f"run_{uuid.uuid4().hex}"
         speech_future = self._executor.submit(
@@ -612,6 +1245,8 @@ class SemiAgentService:
             "prompt": context["prompt"],
             "user_context": context["user_context"],
             "reasoning_provider": context["reasoning_provider"],
+            "route": "semi_agent",
+            "route_decision": route_decision.model_dump(),
             "step_one": context["step_one"],
             "mcp_results": context["mcp_results"],
             "speech_status": "running",
@@ -702,6 +1337,107 @@ class SemiAgentService:
             "step_one": step_one,
             "mcp_results": mcp_results,
         }
+
+    def _run_direct_reasoning_speech_stage(
+        self,
+        *,
+        prompt: str,
+        user_context: Dict[str, str],
+        session_id: str,
+    ) -> Dict[str, Any]:
+        recent_history = self._build_recent_history_payload(
+            user_context=user_context,
+            session_id=session_id,
+        )
+        warnings: List[str] = []
+        try:
+            llm_result = self.reasoning_llm_provider.generate_reply_with_messages(
+                system_prompt=self._build_direct_reasoning_system_prompt(),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_direct_reasoning_user_prompt(
+                            prompt=prompt,
+                            recent_history=recent_history,
+                        ),
+                    }
+                ],
+                session_id=f"{self._clean_text(session_id) or 'default_session'}_direct",
+                user_id=self._clean_text(user_context.get("resolved_user_id")) or "anonymous",
+                include_history=False,
+                store_history=False,
+            )
+            assistant_text = self._clean_text(llm_result.text)
+            warnings.extend(llm_result.warnings)
+            llm_source = llm_result.source
+        except Exception as exc:
+            assistant_text = self._fallback_direct_reasoning_response(prompt)
+            warnings.append(f"direct_reasoning_fallback={exc}")
+            llm_source = "fallback"
+
+        if not assistant_text:
+            assistant_text = self._fallback_direct_reasoning_response(prompt)
+            warnings.append("direct_reasoning_empty_response")
+
+        self._store_speech_turn(
+            user_context=user_context,
+            session_id=session_id,
+            user_text=prompt,
+            assistant_text=assistant_text,
+        )
+        return self._build_speech_payload_from_text(
+            assistant_text=assistant_text,
+            llm_source=llm_source,
+            warnings=warnings,
+        )
+
+    def _run_live_tool_speech_stage(
+        self,
+        *,
+        prompt: str,
+        user_context: Dict[str, str],
+        session_id: str,
+        route_decision: RouteDecision,
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+        tool_name = self._clean_text(route_decision.tool_name).lower() or "search"
+        if tool_name in {"weather", "time"} and not self._clean_text(route_decision.location):
+            assistant_text = self._missing_location_follow_up(tool_name)
+            warnings.append(f"{tool_name}_missing_location")
+            llm_source = "rule_based"
+        else:
+            try:
+                tool_payload = self._fetch_live_tool_payload(
+                    tool_name=tool_name,
+                    prompt=prompt,
+                    location=self._clean_text(route_decision.location),
+                )
+            except Exception as exc:
+                tool_payload = {
+                    "tool_name": tool_name,
+                    "error": str(exc),
+                }
+                warnings.append(f"live_tool_error={exc}")
+            assistant_text, llm_source, summary_warnings = self._summarize_live_tool_payload(
+                prompt=prompt,
+                tool_payload=tool_payload,
+                route_decision=route_decision,
+                user_context=user_context,
+                session_id=session_id,
+            )
+            warnings.extend(summary_warnings)
+
+        self._store_speech_turn(
+            user_context=user_context,
+            session_id=session_id,
+            user_text=prompt,
+            assistant_text=assistant_text,
+        )
+        return self._build_speech_payload_from_text(
+            assistant_text=assistant_text,
+            llm_source=llm_source,
+            warnings=warnings,
+        )
 
     def _run_board_stage(
         self,
@@ -1367,6 +2103,13 @@ class SemiAgentService:
                 arguments=arguments,
                 user_id=user_id,
             )
+        if mcp_id == "calendar":
+            return self._dispatch_calendar_tool(
+                tool_name=tool_name,
+                prompt=prompt,
+                arguments=arguments,
+                user_id=user_id,
+            )
         raise ValueError(f"Unsupported MCP '{mcp_id}'.")
 
     def _dispatch_gnn_tool(
@@ -1452,6 +2195,53 @@ class SemiAgentService:
             friend_name=friend_name,
         )
 
+    def _dispatch_calendar_tool(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+        user_id: str,
+    ) -> Dict[str, Any]:
+        if tool_name != "create_meetup_reminder":
+            raise ValueError(f"Unsupported tool '{tool_name}'.")
+
+        target_user_id = self._clean_text(arguments.get("user_id") or user_id)
+        title = self._clean_text(arguments.get("title"))
+        start_time = self._clean_text(arguments.get("start_time"))
+        end_time = self._clean_text(arguments.get("end_time"))
+        location = self._clean_text(arguments.get("location"))
+        description = self._clean_text(arguments.get("description")) or "Meetup planned through HelloAgain"
+        reminder_minutes = int(arguments.get("reminder_minutes") or 30)
+
+        if not title or not start_time or not end_time or not location:
+            raise ValueError("Accepted meetup reminder requires title, start_time, end_time, and location.")
+
+        result = self.calendar_service.create_meetup_reminder(
+            user_id=target_user_id,
+            title=title,
+            start_time=start_time,
+            end_time=end_time,
+            location=location,
+            description=description,
+            reminder_minutes=reminder_minutes,
+        )
+        speech_text = (
+            "Добавих срещата в календарът ти."
+            if result.get("success")
+            else "Срещата бе приета,но календарът не работи в момента."
+        )
+        return {
+            **result,
+            "message": result.get("message") or speech_text,
+            "speech_text": speech_text,
+            "title": title,
+            "location": location,
+            "start_time": start_time,
+            "end_time": end_time,
+            "prompt": prompt,
+        }
+
     def _summarize_mcp_result(self, mcp_id: str, tool_name: str, result: Dict[str, Any]) -> str:
         if mcp_id == "connections":
             if tool_name == "find_connection":
@@ -1484,6 +2274,13 @@ class SemiAgentService:
             if friend_name:
                 return f"Prepared a meetup proposal with {friend_name}."
             return self._clean_text(result.get("message")) or "Meetup planning finished."
+        if mcp_id == "calendar":
+            if result.get("success"):
+                return "Added the accepted meetup to Google Calendar."
+            error_code = self._clean_text(result.get("error"))
+            if error_code == "google_calendar_not_connected":
+                return "Accepted meetup could not be added because Google Calendar is not connected."
+            return self._clean_text(result.get("message")) or "Calendar reminder failed."
         if tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             chosen_name = self._clean_text(chosen.get("name"))
@@ -2732,6 +3529,11 @@ class SemiAgentService:
             candidate = self._clean_text(invite.get("place_name"))
             if candidate:
                 return self._clip_focus_title(candidate)
+        elif mcp_id == "calendar" and tool_name == "create_meetup_reminder":
+            title = self._clean_text(result.get("title"))
+            if title:
+                return self._clip_focus_title(title)
+            return "Calendar Reminder"
         elif tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             candidate = self._clean_text(chosen.get("name"))

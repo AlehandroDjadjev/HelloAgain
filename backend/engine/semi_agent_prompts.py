@@ -44,6 +44,12 @@ MEETUP TOOL CHOICE RULES:
 - Prefer `meetup.propose_friend_meetup` over `connections.find_connection` when the friend is already known and the task is to plan the outing, not discover a new match.
 - For Bulgarian prompts like `искам да излеза с ...` or `искам да изляза с ...`, extract the friend's display name into `friend_name` when possible.
 
+CALENDAR TOOL CHOICE RULES:
+- Use `calendar.create_meetup_reminder` only after a meetup is already accepted.
+- Only use it when the meetup has confirmed `start_time`, `end_time`, and `location`.
+- Do not use it for tentative, suggested, pending, or incomplete meetups.
+- If the tool returns a Google-connection error, do not retry with fake data.
+
 PHONE TOOL CHOICE RULES:
 - Use `phone_command.open_phone_command` when the request is about operating the phone, launching a phone flow, opening an app through the phone, or creating a clickable launcher object for a navigation / phone command prompt.
 - Prefer `phone_command.open_phone_command` over the social or GNN tools when the desired result is a phone-action launcher rather than memory, emotional analysis, or a real-person connection.
@@ -72,11 +78,16 @@ JSON shape:
   "mcp_calls": [
     {{
       "call_id": "gnn_actions.fetch_action.1",
-      "mcp_id": "gnn_actions|connections|phone_command|meetup",
-      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command|propose_friend_meetup",
+      "mcp_id": "gnn_actions|connections|phone_command|meetup|calendar",
+      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command|propose_friend_meetup|create_meetup_reminder",
       "arguments": {{
         "prompt": "prompt to send to the tool",
-        "friend_name": "friend display name if the meetup tool is used"
+        "friend_name": "friend display name if the meetup tool is used",
+        "user_id": "target user id if the calendar tool is used",
+        "title": "calendar event title",
+        "start_time": "ISO start timestamp",
+        "end_time": "ISO end timestamp",
+        "location": "calendar event location"
       }},
       "why": "why this call is needed"
     }}

@@ -418,6 +418,59 @@ class MeetupInviteNotificationApiTests(TestCase):
 		for reminder in reminders:
 			self.assertEqual(reminder.scheduled_for, expected_time)
 
+	@patch('meetup.views.calendar_service.create_meetup_reminder')
+	@patch('meetup.views.calendar_service.build_meetup_reminder_payload')
+	def test_accept_attempts_google_calendar_for_both_participants(self, mock_build_payload, mock_create_reminder):
+		proposed = timezone.now() + timedelta(hours=1)
+		invite = MeetupInvite.objects.create(
+			requester_profile=self.requester_profile,
+			invited_profile=self.invited_profile,
+			proposed_time=proposed,
+			place_name='Talk Cafe',
+			place_lat=42.688,
+			place_lng=23.335,
+			center_lat=42.689,
+			center_lng=23.336,
+		)
+		mock_build_payload.side_effect = [
+			{
+				'user_id': str(self.requester_user.id),
+				'title': 'Meetup with Bob',
+				'start_time': proposed.isoformat(),
+				'end_time': (proposed + timedelta(hours=1)).isoformat(),
+				'location': 'Talk Cafe',
+				'description': 'Meetup planned through HelloAgain',
+				'reminder_minutes': 30,
+			},
+			{
+				'user_id': str(self.invited_user.id),
+				'title': 'Meetup with Alice',
+				'start_time': proposed.isoformat(),
+				'end_time': (proposed + timedelta(hours=1)).isoformat(),
+				'location': 'Talk Cafe',
+				'description': 'Meetup planned through HelloAgain',
+				'reminder_minutes': 30,
+			},
+		]
+		mock_create_reminder.side_effect = [
+			{'success': True, 'event_id': 'evt_1', 'html_link': 'https://calendar/evt_1'},
+			{'success': False, 'error': 'google_calendar_not_connected'},
+		]
+
+		response = self.client.post(
+			f'/api/meetup/friends/invites/{invite.id}/respond/',
+			data=json.dumps({'action': 'accept'}),
+			content_type='application/json',
+			**self._headers(self.invited_token.key),
+		)
+
+		self.assertEqual(response.status_code, 200)
+		body = response.json()
+		self.assertEqual(mock_create_reminder.call_count, 2)
+		self.assertEqual(len(body['calendar_results']), 2)
+		self.assertTrue(body['calendar_results'][0]['success'])
+		self.assertEqual(body['calendar_results'][1]['error'], 'google_calendar_not_connected')
+
 	def test_notifications_feed_hides_future_reminders_until_due(self):
 		invite = MeetupInvite.objects.create(
 			requester_profile=self.requester_profile,
