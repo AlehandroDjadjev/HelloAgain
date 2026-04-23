@@ -41,6 +41,17 @@
       ]
     },
     {
+      "id": "weather",
+      "name": "weather",
+      "description": "Fetches a clean current weather snapshot for the user's current or saved location.",
+      "descriptor_file": "weather.json",
+      "descriptor_url": "/api/agent/mcps/weather/",
+      "notes": [
+        "Use this for direct weather questions.",
+        "Prefer a popup-friendly result instead of a generic board memory object."
+      ]
+    },
+    {
       "id": "meetup",
       "name": "meetup",
       "description": "Wraps the meetup planner so the agent can propose going out with exactly one accepted friend and return a whiteboard-openable invite.",

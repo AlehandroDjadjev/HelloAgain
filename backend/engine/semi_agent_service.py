@@ -36,7 +36,8 @@ class SemiAgentService:
         "gnn_actions": {"add_action", "fetch_action", "conversation"},
         "connections": {"update_profile", "find_connection"},
         "phone_command": {"open_phone_command"},
-        "meetup": {"propose_friend_meetup"},
+        "weather": {"get_current_weather"},
+        "meetup": {"propose_friend_meetup", "suggest_outdoor_place"},
     }
     SUPPORTED_TOOL_NAMES = {
         tool_name
@@ -63,6 +64,7 @@ class SemiAgentService:
         tts_provider: TextToSpeechProvider | None = None,
         connections_service: Any | None = None,
         meetup_service: Any | None = None,
+        weather_service: Any | None = None,
         user_tracker: ActiveUserTracker | None = None,
         speech_history_store: TemporaryChatHistoryStore | None = None,
     ) -> None:
@@ -87,6 +89,11 @@ class SemiAgentService:
 
             meetup_service = MeetupAgentService()
         self.meetup_service = meetup_service
+        if weather_service is None:
+            from weather.agent_service import WeatherAgentService
+
+            weather_service = WeatherAgentService()
+        self.weather_service = weather_service
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
@@ -166,6 +173,24 @@ class SemiAgentService:
         ]
         if len(matches) == 1:
             return matches[0]
+        return ""
+
+    def _infer_default_tool_for_mcp(
+        self,
+        *,
+        mcp_id: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+    ) -> str:
+        if mcp_id == "weather":
+            return "get_current_weather"
+        if mcp_id != "meetup":
+            return ""
+        friend_name = self._clean_text(arguments.get("friend_name"))
+        if friend_name or self._extract_bulgarian_meetup_friend_name(prompt):
+            return "propose_friend_meetup"
+        if self._looks_like_outdoor_place_request(prompt):
+            return "suggest_outdoor_place"
         return ""
 
     def _json_schema_for_body_type(self, raw_type: Any) -> Dict[str, Any]:
@@ -508,6 +533,7 @@ class SemiAgentService:
         prompt: str,
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
+        location: Dict[str, Any] | None = None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
         reasoning_provider: str = "openai",
@@ -516,6 +542,7 @@ class SemiAgentService:
             prompt=prompt,
             board_state=board_state,
             largest_empty_space=largest_empty_space,
+            location=location,
             user_id=user_id,
             session_id=session_id,
             reasoning_provider=reasoning_provider,
@@ -541,6 +568,7 @@ class SemiAgentService:
             user_id=context["effective_user_id"],
             session_id=session_id,
             reasoning_provider=context["reasoning_provider"],
+            location=context["location"],
         )
         speech_payload = speech_future.result()
         return {
@@ -560,6 +588,7 @@ class SemiAgentService:
         prompt: str,
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
+        location: Dict[str, Any] | None = None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
         reasoning_provider: str = "openai",
@@ -569,6 +598,7 @@ class SemiAgentService:
             prompt=prompt,
             board_state=board_state,
             largest_empty_space=largest_empty_space,
+            location=location,
             user_id=user_id,
             session_id=session_id,
             reasoning_provider=reasoning_provider,
@@ -596,6 +626,7 @@ class SemiAgentService:
             user_id=context["effective_user_id"],
             session_id=session_id,
             reasoning_provider=context["reasoning_provider"],
+            location=context["location"],
         )
         with self._run_jobs_lock:
             self._run_jobs[run_id] = {
@@ -638,6 +669,7 @@ class SemiAgentService:
         prompt: str,
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
+        location: Dict[str, Any] | None,
         user_id: str,
         session_id: str,
         reasoning_provider: str,
@@ -661,6 +693,7 @@ class SemiAgentService:
         chain_history: List[Dict[str, Any]] = []
         registry_payload = self.get_registry_payload()
         tool_catalog = self._build_mcp_tool_catalog()
+        normalized_location = self._normalize_location_payload(location)
 
         step_one_raw = self._generate_json(
             system_prompt=build_step_one_mcp_prompt(
@@ -685,6 +718,7 @@ class SemiAgentService:
             clean_prompt,
             user_id=effective_user_id,
             board_state=normalized_board_state,
+            location=normalized_location,
         )
         if mcp_results:
             chain_history.append({"stage": "mcp_results", "payload": mcp_results})
@@ -698,6 +732,7 @@ class SemiAgentService:
             "mcp_tool_catalog": tool_catalog,
             "user_context": user_context,
             "effective_user_id": effective_user_id,
+            "location": normalized_location,
             "reasoning_provider": normalized_reasoning_provider,
             "step_one": step_one,
             "mcp_results": mcp_results,
@@ -717,6 +752,7 @@ class SemiAgentService:
         user_id: str,
         session_id: str,
         reasoning_provider: str,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         step_two, final_mcp_results = self._run_step_two_loop(
             prompt=clean_prompt,
@@ -729,20 +765,39 @@ class SemiAgentService:
             user_id=user_id,
             session_id=session_id,
             reasoning_provider=reasoning_provider,
+            location=location,
         )
 
-        final_board_commands = step_two.get("board_commands", [])
-        final_board_state = self.board_memory.apply_commands(
-            normalized_board_state,
-            final_board_commands,
+        auto_open_viewer = self._extract_auto_open_viewer(
+            final_mcp_results,
+            user_id=user_id,
         )
-        registered_bindings = self._prepare_result_bindings(
-            step_two=step_two,
-            executed_results=final_mcp_results,
-            final_board_state=final_board_state,
-        )
-        self._attach_bindings_to_commands(final_board_commands, registered_bindings)
-        self.board_memory.register_result_bindings(registered_bindings)
+        if not final_mcp_results:
+            final_board_commands: List[Dict[str, Any]] = []
+            final_board_state = normalized_board_state
+            registered_bindings: List[Dict[str, Any]] = []
+        else:
+            final_board_commands = step_two.get("board_commands", [])
+            if self._viewer_prefers_popup_only(auto_open_viewer):
+                final_board_commands = [
+                    command
+                    for command in final_board_commands
+                    if self._clean_text(command.get("action")) not in {"create", "click"}
+                ]
+            final_board_state = self.board_memory.apply_commands(
+                normalized_board_state,
+                final_board_commands,
+            )
+            registered_bindings = self._prepare_result_bindings(
+                step_two=step_two,
+                executed_results=final_mcp_results,
+                final_board_state=final_board_state,
+            )
+            self._attach_bindings_to_commands(final_board_commands, registered_bindings)
+            if self._viewer_prefers_popup_only(auto_open_viewer):
+                registered_bindings = []
+            self.board_memory.register_result_bindings(registered_bindings)
+
         persisted_board_state = self.connections_service.save_board_state_for_user(
             user_id,
             final_board_state,
@@ -762,6 +817,7 @@ class SemiAgentService:
             "board_commands": final_board_commands,
             "board_state": final_board_state,
             "persisted_board_state": persisted_board_state,
+            "auto_open_viewer": auto_open_viewer,
             "result_bindings": [
                 {
                     "object_name": binding.get("object_name"),
@@ -1051,23 +1107,29 @@ class SemiAgentService:
         fallback_prompt: str = "",
         user_id: str = "anonymous",
         board_state: Dict[str, Any] | None = None,
+        location: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         user_context = self.user_tracker.resolve(user_id=user_id)
         effective_user_id = user_context["resolved_user_id"]
         clean_mcp_id = self._clean_text(mcp_id)
         clean_tool_name = self._normalize_tool_name(tool_name)
+        arguments = self._clean_jsonish(arguments) if isinstance(arguments, dict) else {}
+        tool_prompt = self._clean_text(arguments.get("prompt") or fallback_prompt)
         if not clean_mcp_id:
             clean_mcp_id = self._infer_mcp_id_from_tool_name(clean_tool_name)
         supported_tools = self._supported_mcp_tools().get(clean_mcp_id)
         if supported_tools is None:
             raise ValueError(f"Unsupported MCP '{clean_mcp_id}'.")
+        if not clean_tool_name:
+            clean_tool_name = self._infer_default_tool_for_mcp(
+                mcp_id=clean_mcp_id,
+                prompt=tool_prompt,
+                arguments=arguments,
+            )
         if not clean_tool_name and len(supported_tools) == 1:
             clean_tool_name = sorted(supported_tools)[0]
         if clean_tool_name not in supported_tools:
             raise ValueError(f"Unsupported tool '{clean_tool_name}'.")
-
-        arguments = self._clean_jsonish(arguments) if isinstance(arguments, dict) else {}
-        tool_prompt = self._clean_text(arguments.get("prompt") or fallback_prompt)
         if not tool_prompt:
             raise ValueError("prompt required for MCP invocation")
 
@@ -1078,6 +1140,7 @@ class SemiAgentService:
             arguments=arguments,
             user_id=effective_user_id,
             board_state=board_state,
+            location=location,
         )
         summary = self._summarize_mcp_result(clean_mcp_id, clean_tool_name, result)
         return {
@@ -1237,6 +1300,7 @@ class SemiAgentService:
         user_id: str,
         session_id: str,
         reasoning_provider: str,
+        location: Dict[str, Any] | None = None,
     ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         current_results = list(mcp_results)
         current_history = list(chain_history)
@@ -1278,6 +1342,7 @@ class SemiAgentService:
                 prompt,
                 user_id=user_id,
                 board_state=board_state,
+                location=location,
             )
             if not extra_results:
                 break
@@ -1295,6 +1360,7 @@ class SemiAgentService:
         *,
         user_id: str,
         board_state: Dict[str, Any] | None,
+        location: Dict[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         executed: List[Dict[str, Any]] = []
         seen_call_ids: set[str] = set()
@@ -1319,6 +1385,7 @@ class SemiAgentService:
                     fallback_prompt=fallback_prompt,
                     user_id=user_id,
                     board_state=board_state,
+                    location=location,
                 )
             except Exception as exc:
                 payload = {
@@ -1344,6 +1411,7 @@ class SemiAgentService:
         arguments: Dict[str, Any],
         user_id: str,
         board_state: Dict[str, Any] | None,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         if mcp_id == "gnn_actions":
             return self._dispatch_gnn_tool(tool_name, prompt, user_id=user_id)
@@ -1354,11 +1422,20 @@ class SemiAgentService:
                 arguments=arguments,
                 user_id=user_id,
                 board_state=board_state,
+                location=location,
             )
         if mcp_id == "phone_command":
             return self._dispatch_phone_command_tool(
                 tool_name=tool_name,
                 prompt=prompt,
+            )
+        if mcp_id == "weather":
+            return self._dispatch_weather_tool(
+                tool_name=tool_name,
+                prompt=prompt,
+                arguments=arguments,
+                user_id=user_id,
+                location=location,
             )
         if mcp_id == "meetup":
             return self._dispatch_meetup_tool(
@@ -1366,6 +1443,7 @@ class SemiAgentService:
                 prompt=prompt,
                 arguments=arguments,
                 user_id=user_id,
+                location=location,
             )
         raise ValueError(f"Unsupported MCP '{mcp_id}'.")
 
@@ -1393,6 +1471,7 @@ class SemiAgentService:
         arguments: Dict[str, Any],
         user_id: str,
         board_state: Dict[str, Any] | None,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         if tool_name == "update_profile":
             return self.connections_service.update_profile_from_prompt(
@@ -1403,13 +1482,52 @@ class SemiAgentService:
                 board_state=board_state,
             )
         if tool_name == "find_connection":
-            return self.connections_service.find_connection_for_prompt(
+            result = self.connections_service.find_connection_for_prompt(
                 agent_user_id=user_id,
                 prompt=prompt,
                 limit=int(arguments.get("limit") or 1),
                 board_state=board_state,
             )
+            if (
+                isinstance(result, dict)
+                and isinstance(result.get("user"), dict)
+                and self._looks_like_outdoor_social_request(prompt)
+            ):
+                try:
+                    outing = self.meetup_service.suggest_outing_for_match(
+                        agent_user_id=user_id,
+                        prompt=prompt,
+                        match_user_id=result["user"]["user_id"],
+                        viewer_location=location,
+                    )
+                except Exception:
+                    outing = None
+                if isinstance(outing, dict):
+                    result.update(outing)
+            return result
         raise ValueError(f"Unsupported tool '{tool_name}'.")
+
+    def _dispatch_weather_tool(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+        user_id: str,
+        location: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if tool_name != "get_current_weather":
+            raise ValueError(f"Unsupported tool '{tool_name}'.")
+        argument_location = (
+            arguments.get("location") if isinstance(arguments.get("location"), dict) else None
+        )
+        timezone_name = self._clean_text(arguments.get("timezone"))
+        return self.weather_service.get_current_weather_for_prompt(
+            agent_user_id=user_id,
+            prompt=prompt,
+            location=argument_location or location,
+            timezone_name=timezone_name or None,
+        )
 
     def _dispatch_phone_command_tool(
         self,
@@ -1442,21 +1560,41 @@ class SemiAgentService:
         prompt: str,
         arguments: Dict[str, Any],
         user_id: str,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
-        if tool_name != "propose_friend_meetup":
-            raise ValueError(f"Unsupported tool '{tool_name}'.")
-        friend_name = self._clean_text(arguments.get("friend_name"))
-        return self.meetup_service.propose_friend_meetup_for_prompt(
-            agent_user_id=user_id,
-            prompt=prompt,
-            friend_name=friend_name,
-        )
+        if tool_name == "propose_friend_meetup":
+            friend_name = self._clean_text(arguments.get("friend_name"))
+            return self.meetup_service.propose_friend_meetup_for_prompt(
+                agent_user_id=user_id,
+                prompt=prompt,
+                friend_name=friend_name,
+            )
+        if tool_name == "suggest_outdoor_place":
+            argument_location = (
+                arguments.get("location") if isinstance(arguments.get("location"), dict) else None
+            )
+            return self.meetup_service.suggest_outdoor_place_for_prompt(
+                agent_user_id=user_id,
+                prompt=prompt,
+                viewer_location=argument_location or location,
+            )
+        raise ValueError(f"Unsupported tool '{tool_name}'.")
 
     def _summarize_mcp_result(self, mcp_id: str, tool_name: str, result: Dict[str, Any]) -> str:
         if mcp_id == "connections":
             if tool_name == "find_connection":
                 user = result.get("user") if isinstance(result.get("user"), dict) else {}
+                outing = (
+                    result.get("outing")
+                    if isinstance(result.get("outing"), dict)
+                    else result.get("suggestion")
+                    if isinstance(result.get("suggestion"), dict)
+                    else {}
+                )
                 display_name = self._clean_text(user.get("display_name") or user.get("name"))
+                place_name = self._clean_text(outing.get("place_name"))
+                if display_name and place_name:
+                    return f"Found {display_name} and a place to go: {place_name}."
                 if display_name:
                     return f"Found a close connection match: {display_name}."
                 return self._clean_text(result.get("message")) or "Connection search finished."
@@ -1471,8 +1609,16 @@ class SemiAgentService:
             if launch_prompt:
                 return f"Prepared the phone command handoff for {launch_prompt}."
             return self._clean_text(result.get("message")) or "Phone command handoff is ready."
+        if mcp_id == "weather":
+            weather = result.get("weather") if isinstance(result.get("weather"), dict) else {}
+            summary = self._clean_text(weather.get("summary"))
+            if summary:
+                return f"Weather ready: {summary}"
+            return self._clean_text(result.get("message")) or "Weather is ready."
         if mcp_id == "meetup":
             invite = result.get("invite") if isinstance(result.get("invite"), dict) else {}
+            outing = result.get("outing") if isinstance(result.get("outing"), dict) else {}
+            search_location = result.get("search_location") if isinstance(result.get("search_location"), dict) else {}
             friend_name = self._clean_text(
                 result.get("friend_name")
                 or invite.get("invited_display_name")
@@ -1481,6 +1627,15 @@ class SemiAgentService:
             place_name = self._clean_text(invite.get("place_name"))
             if friend_name and place_name:
                 return f"Planned a meetup with {friend_name} at {place_name}."
+            if tool_name == "suggest_outdoor_place":
+                place_name = self._clean_text(outing.get("place_name"))
+                location_label = self._clean_text(
+                    search_location.get("label") or outing.get("location_label")
+                )
+                if place_name and location_label:
+                    return f"Found an outdoor place in {location_label}: {place_name}."
+                if place_name:
+                    return f"Found an outdoor place: {place_name}."
             if friend_name:
                 return f"Prepared a meetup proposal with {friend_name}."
             return self._clean_text(result.get("message")) or "Meetup planning finished."
@@ -1678,7 +1833,36 @@ class SemiAgentService:
                 **meetup_viewer,
             }
 
+        outing_viewer = self._extract_outing_suggestion_viewer(
+            object_payload=object_payload,
+            binding=binding,
+        )
+        if outing_viewer is not None:
+            return {
+                "title": self._clean_text(outing_viewer.get("title")) or default_title,
+                "summary": self._clean_text(outing_viewer.get("summary")) or default_summary,
+                "memory_type": binding.get("memory_type"),
+                "linked_call_ids": binding.get("linked_call_ids", []),
+                "payload": default_payload,
+                **outing_viewer,
+            }
+
+        weather_viewer = self._extract_weather_viewer(
+            object_payload=object_payload,
+            binding=binding,
+        )
+        if weather_viewer is not None:
+            return {
+                "title": self._clean_text(weather_viewer.get("title")) or default_title,
+                "summary": self._clean_text(weather_viewer.get("summary")) or default_summary,
+                "memory_type": binding.get("memory_type"),
+                "linked_call_ids": binding.get("linked_call_ids", []),
+                "payload": default_payload,
+                **weather_viewer,
+            }
+
         return {
+            "widget_type": "summary_only",
             "title": default_title,
             "summary": default_summary,
             "memory_type": binding.get("memory_type"),
@@ -1845,6 +2029,124 @@ class SemiAgentService:
             "notification": notification,
             "friend_name": friend_name,
         }
+
+    def _extract_outing_suggestion_viewer(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        selected_result = self._select_linked_widget_result(
+            object_payload=object_payload,
+            binding=binding,
+            widget_type="outing_suggestion",
+            kind="outing_suggestion",
+        )
+        if not isinstance(selected_result, dict):
+            return None
+        outing = (
+            selected_result.get("outing")
+            if isinstance(selected_result.get("outing"), dict)
+            else {}
+        )
+        user = (
+            selected_result.get("user")
+            if isinstance(selected_result.get("user"), dict)
+            else {}
+        )
+        if not outing:
+            return None
+        friend_name = self._clean_text(user.get("display_name") or user.get("name"))
+        place_name = self._clean_text(outing.get("place_name"))
+        location_label = self._clean_text(
+            (selected_result.get("search_location") or {}).get("label")
+            if isinstance(selected_result.get("search_location"), dict)
+            else outing.get("location_label")
+        ) or self._clean_text(outing.get("location_label"))
+        when = self._clean_text(
+            outing.get("recommended_when_bg")
+            or outing.get("meeting_when_bg")
+            or outing.get("recommended_time")
+        )
+        summary_bits = [bit for bit in (friend_name, place_name, when, location_label) if bit]
+        return {
+            "widget_type": "outing_suggestion",
+            "title": self._clean_text(f"Навън с {friend_name}") if friend_name else "Предложение за излизане",
+            "summary": " | ".join(summary_bits),
+            "user": user,
+            "outing": outing,
+        }
+
+    def _extract_weather_viewer(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        selected_result = self._select_linked_widget_result(
+            object_payload=object_payload,
+            binding=binding,
+            widget_type="weather_snapshot",
+            kind="weather_snapshot",
+        )
+        if not isinstance(selected_result, dict):
+            return None
+        weather = (
+            selected_result.get("weather")
+            if isinstance(selected_result.get("weather"), dict)
+            else {}
+        )
+        if not weather:
+            return None
+        return {
+            "widget_type": "weather_snapshot",
+            "title": self._clean_text(selected_result.get("title")) or "Времето сега",
+            "summary": self._clean_text(selected_result.get("summary") or weather.get("summary")),
+            "surface_preference": self._clean_text(
+                selected_result.get("surface_preference")
+            ) or "popup_only",
+            "weather": weather,
+        }
+
+    def _select_linked_widget_result(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+        widget_type: str,
+        kind: str,
+    ) -> Dict[str, Any] | None:
+        candidates = [
+            object_payload.get("extraData"),
+            object_payload.get("extra_data"),
+        ]
+        payload = binding.get("payload") if isinstance(binding.get("payload"), dict) else {}
+        candidates.append(payload.get("object") if isinstance(payload.get("object"), dict) else {})
+        for linked in payload.get("linked_results", []):
+            if not isinstance(linked, dict):
+                continue
+            result = linked.get("result") if isinstance(linked.get("result"), dict) else {}
+            candidates.append(result)
+            candidates.append(result.get("board_object"))
+
+        selected_result: Dict[str, Any] | None = None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            extra_data = (
+                candidate.get("extra_data")
+                if isinstance(candidate.get("extra_data"), dict)
+                else candidate.get("extraData")
+                if isinstance(candidate.get("extraData"), dict)
+                else candidate
+            )
+            candidate_kind = self._clean_text(extra_data.get("kind")).lower()
+            candidate_widget_type = self._clean_text(candidate.get("widget_type")).lower()
+            if candidate_kind != kind and candidate_widget_type != widget_type:
+                continue
+            if selected_result is None or candidate_widget_type == widget_type:
+                selected_result = candidate
+        return selected_result
 
     def _build_phone_command_launch_metadata(self, prompt: str) -> Dict[str, Any]:
         clean_prompt = self._clean_text(prompt)
@@ -2495,6 +2797,153 @@ class SemiAgentService:
         except Exception:
             return fallback
 
+    def _normalize_location_payload(
+        self,
+        payload: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        try:
+            lat = float(payload.get("lat"))
+            lng = float(payload.get("lng"))
+        except (TypeError, ValueError):
+            return {}
+        result = {"lat": lat, "lng": lng}
+        timezone_name = self._clean_text(payload.get("timezone"))
+        if timezone_name:
+            result["timezone"] = timezone_name
+        return result
+
+    def _viewer_prefers_popup_only(self, viewer: Dict[str, Any] | None) -> bool:
+        if not isinstance(viewer, dict):
+            return False
+        return self._clean_text(viewer.get("surface_preference")).lower() == "popup_only"
+
+    def _extract_auto_open_viewer(
+        self,
+        results: List[Dict[str, Any]],
+        *,
+        user_id: str,
+    ) -> Dict[str, Any] | None:
+        for item in results:
+            viewer = self._direct_viewer_from_result(item, user_id=user_id)
+            if isinstance(viewer, dict):
+                return viewer
+        return None
+
+    def _direct_viewer_from_result(
+        self,
+        item: Dict[str, Any],
+        *,
+        user_id: str,
+    ) -> Dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        widget_type = self._clean_text(result.get("widget_type"))
+        if widget_type in {
+            "phone_command_launcher",
+            "meetup_invite",
+            "weather_snapshot",
+            "outing_suggestion",
+        }:
+            return deepcopy(result)
+        target_user_id = None
+        user_payload = result.get("user") if isinstance(result.get("user"), dict) else {}
+        if user_payload.get("user_id") is not None:
+            try:
+                target_user_id = int(user_payload.get("user_id"))
+            except (TypeError, ValueError):
+                target_user_id = None
+        if target_user_id is None:
+            return None
+        try:
+            return self.connections_service.build_user_widget_payload(
+                agent_user_id=user_id,
+                target_user_id=target_user_id,
+            )
+        except Exception:
+            return None
+
+    def _looks_like_direct_weather_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        weather_markers = (
+            "weather",
+            "forecast",
+            "temperature",
+            "rain",
+            "sunny",
+            "cloudy",
+            "времето",
+            "температура",
+            "вали",
+            "дъжд",
+            "слънчево",
+            "облачно",
+        )
+        return any(marker in lowered for marker in weather_markers)
+
+    def _looks_like_outdoor_social_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        outdoor_markers = (
+            "outside",
+            "outdoors",
+            "go outside",
+            "place to go",
+            "hang out",
+            "park",
+            "навън",
+            "на открито",
+            "да изляза",
+            "да излезем",
+            "разходка",
+            "парк",
+        )
+        social_markers = (
+            "person",
+            "someone",
+            "with who",
+            "with whom",
+            "friend",
+            "човек",
+            "някого",
+            "с кого",
+            "приятел",
+        )
+        return any(marker in lowered for marker in outdoor_markers) and any(
+            marker in lowered for marker in social_markers
+        )
+
+    def _looks_like_outdoor_place_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        outdoor_markers = (
+            "outside",
+            "outdoors",
+            "go outside",
+            "park",
+            "навън",
+            "на открито",
+            "разходка",
+            "парк",
+        )
+        place_markers = (
+            "place to go",
+            "where can i go",
+            "where should i go",
+            "recommend a place",
+            "find me a place",
+            "spot",
+            "place",
+            "where",
+            "къде",
+            "място",
+            "препоръчай",
+            "предложи",
+        )
+        return any(marker in lowered for marker in outdoor_markers) and any(
+            marker in lowered for marker in place_markers
+        )
+
     def _default_step_one_plan(self, prompt: str) -> Dict[str, Any]:
         request_kind = self._default_request_kind(prompt)
         return {
@@ -2543,6 +2992,18 @@ class SemiAgentService:
         }
 
     def _default_mcp_calls(self, prompt: str, request_kind: str) -> List[Dict[str, Any]]:
+        if self._looks_like_direct_weather_request(prompt):
+            return [
+                {
+                    "call_id": "weather.get_current_weather.1",
+                    "mcp_id": "weather",
+                    "tool_name": "get_current_weather",
+                    "arguments": {
+                        "prompt": prompt,
+                    },
+                    "why": "The user is asking directly about the weather.",
+                }
+            ]
         friend_name = self._extract_bulgarian_meetup_friend_name(prompt)
         if friend_name:
             return [
@@ -2555,6 +3016,18 @@ class SemiAgentService:
                         "friend_name": friend_name,
                     },
                     "why": "The user wants to go out with one existing friend by name.",
+                }
+            ]
+        if self._looks_like_outdoor_place_request(prompt) and not self._looks_like_outdoor_social_request(prompt):
+            return [
+                {
+                    "call_id": "meetup.suggest_outdoor_place.1",
+                    "mcp_id": "meetup",
+                    "tool_name": "suggest_outdoor_place",
+                    "arguments": {
+                        "prompt": prompt,
+                    },
+                    "why": "The user wants an outdoor place recommendation based on explicit city or available location.",
                 }
             ]
         return []
@@ -2716,14 +3189,19 @@ class SemiAgentService:
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
 
         if mcp_id == "connections" and tool_name == "find_connection":
+            outing = result.get("outing") if isinstance(result.get("outing"), dict) else {}
             user = result.get("user") if isinstance(result.get("user"), dict) else {}
-            candidate = self._clean_text(user.get("display_name") or user.get("name"))
-            if candidate:
-                return self._clip_focus_title(candidate)
+            friend_name = self._clean_text(user.get("display_name") or user.get("name"))
+            if outing and friend_name:
+                return self._clip_focus_title(f"Навън с {friend_name}")
+            if friend_name:
+                return self._clip_focus_title(friend_name)
         elif mcp_id == "connections" and tool_name == "update_profile":
             return "Profile Update"
         elif mcp_id == "phone_command" and tool_name == "open_phone_command":
             return "Phone Command"
+        elif mcp_id == "weather" and tool_name == "get_current_weather":
+            return "Времето сега"
         elif mcp_id == "meetup" and tool_name == "propose_friend_meetup":
             friend_name = self._clean_text(result.get("friend_name"))
             if friend_name:
@@ -2732,6 +3210,18 @@ class SemiAgentService:
             candidate = self._clean_text(invite.get("place_name"))
             if candidate:
                 return self._clip_focus_title(candidate)
+        elif mcp_id == "meetup" and tool_name == "suggest_outdoor_place":
+            outing = result.get("outing") if isinstance(result.get("outing"), dict) else {}
+            location_label = self._clean_text(
+                (result.get("search_location") or {}).get("label")
+                if isinstance(result.get("search_location"), dict)
+                else outing.get("location_label")
+            )
+            candidate = self._clean_text(outing.get("place_name"))
+            if candidate:
+                return self._clip_focus_title(candidate)
+            if location_label:
+                return self._clip_focus_title(f"Навън в {location_label}")
         elif tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             candidate = self._clean_text(chosen.get("name"))

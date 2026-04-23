@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "voice_gateway",
     "meetup",
+    "weather",
     "apps.accounts",
     "apps.agent_core",
     "apps.agent_sessions",
@@ -78,6 +79,7 @@ INSTALLED_APPS = [
     # Platform
     'controller',
     'meetup',
+    'weather',
     "apps.accounts",
     # Agent apps
     'apps.agent_core',
@@ -150,7 +152,7 @@ else:
             "USER": os.environ.get("POSTGRES_USER", "app_user"),
             "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "set_in_env"),
             "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
-            "PORT": int(os.environ.get("POSTGRES_PORT", "5432")),
+            "PORT": int(os.environ.get("POSTGRES_PORT", "5433")),
             "CONN_MAX_AGE": int(os.environ.get("POSTGRES_CONN_MAX_AGE", "60")),
         }
     }
