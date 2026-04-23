@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from apps.accounts.models import AccountProfile, FriendRequest
 from apps.accounts.services import issue_token
+from .agent_service import MeetupAgentService
 from .models import MeetupInvite, MeetupNotification
 
 from .services import get_ranked_meetup_spots
@@ -195,6 +196,97 @@ class MeetupSemanticRankingTests(TestCase):
 		self.assertTrue(rows)
 		self.assertEqual(rows[0]['weather'], 'Ясно')
 		self.assertEqual(rows[0]['score_breakdown']['weather_weight'], 0.2)
+
+
+class MeetupAgentLocationResolutionTests(TestCase):
+	def setUp(self):
+		super().setUp()
+		self.user = User.objects.create_user(username='walker', password='x')
+		self.profile = AccountProfile.objects.create(
+			user=self.user,
+			display_name='Walker',
+			description='Likes calm parks and outdoor walks.',
+			home_lat=42.681,
+			home_lng=23.318,
+		)
+		self.service = MeetupAgentService()
+
+	@patch('meetup.agent_service.get_best_meetup_spot')
+	def test_suggest_outdoor_place_prefers_explicit_city_over_device_location(self, mock_best):
+		mock_best.return_value = {
+			'place_name': 'South Park',
+			'recommended_when_bg': 'today at 18:00',
+			'recommended_time': '2026-04-23 18:00',
+			'weather': 'Clear',
+			'score': 88,
+		}
+
+		payload = self.service.suggest_outdoor_place_for_prompt(
+			agent_user_id=str(self.user.id),
+			prompt='find me a place to go outside in Sofia',
+			viewer_location={'lat': 41.998, 'lng': 21.425},
+		)
+
+		participants = mock_best.call_args.args[0]
+		self.assertAlmostEqual(participants[0]['lat'], 42.6977, places=4)
+		self.assertAlmostEqual(participants[0]['lng'], 23.3219, places=4)
+		self.assertEqual(payload['search_location']['label'], 'Sofia')
+		self.assertEqual(payload['search_location']['source'], 'explicit_city')
+
+	@patch('meetup.agent_service.get_best_meetup_spot')
+	def test_suggest_outdoor_place_uses_device_location_when_available(self, mock_best):
+		mock_best.return_value = {
+			'place_name': 'North Park',
+			'recommended_when_bg': 'today at 17:00',
+			'recommended_time': '2026-04-23 17:00',
+			'weather': 'Clouds',
+			'score': 80,
+		}
+
+		payload = self.service.suggest_outdoor_place_for_prompt(
+			agent_user_id=str(self.user.id),
+			prompt='find me a place to go outside',
+			viewer_location={'lat': 42.7, 'lng': 23.33, 'timezone': 'Europe/Sofia'},
+		)
+
+		participants = mock_best.call_args.args[0]
+		self.assertAlmostEqual(participants[0]['lat'], 42.7, places=4)
+		self.assertAlmostEqual(participants[0]['lng'], 23.33, places=4)
+		self.assertEqual(payload['search_location']['source'], 'current_location')
+
+	@patch('meetup.agent_service.get_best_meetup_spot')
+	def test_suggest_outdoor_place_falls_back_to_saved_home_location(self, mock_best):
+		mock_best.return_value = {
+			'place_name': 'Home Park',
+			'recommended_when_bg': 'today at 16:00',
+			'recommended_time': '2026-04-23 16:00',
+			'weather': 'Clear',
+			'score': 79,
+		}
+
+		payload = self.service.suggest_outdoor_place_for_prompt(
+			agent_user_id=str(self.user.id),
+			prompt='find me a place to go outside',
+		)
+
+		participants = mock_best.call_args.args[0]
+		self.assertAlmostEqual(participants[0]['lat'], 42.681, places=4)
+		self.assertAlmostEqual(participants[0]['lng'], 23.318, places=4)
+		self.assertEqual(payload['search_location']['source'], 'profile_home')
+
+	def test_suggest_outdoor_place_raises_clear_error_without_any_location(self):
+		self.profile.home_lat = None
+		self.profile.home_lng = None
+		self.profile.save(update_fields=['home_lat', 'home_lng'])
+
+		with self.assertRaisesMessage(
+			ValueError,
+			'Mention a city like Sofia, send current location, or save home coordinates.',
+		):
+			self.service.suggest_outdoor_place_for_prompt(
+				agent_user_id=str(self.user.id),
+				prompt='find me a place to go outside',
+			)
 
 
 class MeetupInviteNotificationApiTests(TestCase):

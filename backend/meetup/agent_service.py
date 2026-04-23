@@ -352,23 +352,64 @@ def create_friend_meetup_proposal(
 
 
 class MeetupAgentService:
+    CITY_LOCATIONS = (
+        (
+            ("sofia", "sofiya", "софия"),
+            {
+                "label": "Sofia",
+                "lat": 42.6977,
+                "lng": 23.3219,
+                "timezone": "Europe/Sofia",
+            },
+        ),
+        (
+            ("plovdiv", "пловдив"),
+            {
+                "label": "Plovdiv",
+                "lat": 42.1354,
+                "lng": 24.7453,
+                "timezone": "Europe/Sofia",
+            },
+        ),
+        (
+            ("varna", "варна"),
+            {
+                "label": "Varna",
+                "lat": 43.2141,
+                "lng": 27.9147,
+                "timezone": "Europe/Sofia",
+            },
+        ),
+        (
+            ("burgas", "бургас"),
+            {
+                "label": "Burgas",
+                "lat": 42.5048,
+                "lng": 27.4626,
+                "timezone": "Europe/Sofia",
+            },
+        ),
+    )
     BULGARIAN_MEETUP_PATTERNS = (
         r"\bискам\s+да\s+изл(?:е|я)за\s+с\s+(.+)$",
         r"\bискам\s+да\s+изляза\s+с\s+(.+)$",
     )
 
     def resolve_profile(self, agent_user_id: str | None) -> AccountProfile:
+        profile = self.resolve_optional_profile(agent_user_id)
+        if profile is None:
+            raise ValueError("Account profile not found for meetup flow.")
+        return profile
+
+    def resolve_optional_profile(self, agent_user_id: str | None) -> AccountProfile | None:
         clean_user_id = str(agent_user_id or "").strip()
         if not clean_user_id:
-            raise ValueError("Authenticated meetup actions require a user id.")
-        profile = (
+            return None
+        return (
             AccountProfile.objects.select_related("user", "elder_profile")
             .filter(user_id=clean_user_id)
             .first()
         )
-        if profile is None:
-            raise ValueError("Account profile not found for meetup flow.")
-        return profile
 
     def extract_friend_name(self, prompt: str) -> str:
         clean_prompt = " ".join(str(prompt or "").split()).strip()
@@ -379,6 +420,81 @@ class MeetupAgentService:
             if match:
                 return self._clean_friend_name(match.group(1))
         return ""
+
+    def extract_explicit_city_location(self, prompt: str) -> dict[str, Any] | None:
+        clean_prompt = " ".join(str(prompt or "").split()).strip().lower()
+        if not clean_prompt:
+            return None
+        for aliases, payload in self.CITY_LOCATIONS:
+            for alias in aliases:
+                escaped_alias = re.escape(alias.lower())
+                english_match = re.search(
+                    rf"(?:^|[\s,])(?:in|near|around|at|within)\s+{escaped_alias}(?:$|[\s,.!?])",
+                    clean_prompt,
+                    flags=re.IGNORECASE,
+                )
+                bulgarian_match = re.search(
+                    rf"(?:^|[\s,])(?:в|до|около|край|из)\s+{escaped_alias}(?:$|[\s,.!?])",
+                    clean_prompt,
+                    flags=re.IGNORECASE,
+                )
+                if english_match or bulgarian_match:
+                    return {
+                        **payload,
+                        "source": "explicit_city",
+                    }
+        return None
+
+    def _normalize_coordinate_payload(
+        self,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        try:
+            lat = float(payload.get("lat"))
+            lng = float(payload.get("lng"))
+        except (TypeError, ValueError):
+            return None
+        result = {
+            "lat": lat,
+            "lng": lng,
+        }
+        timezone_name = str(payload.get("timezone") or "").strip()
+        if timezone_name:
+            result["timezone"] = timezone_name
+        return result
+
+    def resolve_outdoor_location(
+        self,
+        *,
+        prompt: str,
+        viewer: AccountProfile | None = None,
+        viewer_location: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        explicit_city = self.extract_explicit_city_location(prompt)
+        if explicit_city is not None:
+            return explicit_city
+
+        normalized_viewer_location = self._normalize_coordinate_payload(viewer_location)
+        if normalized_viewer_location is not None:
+            return {
+                **normalized_viewer_location,
+                "label": "your current area",
+                "source": "current_location",
+            }
+
+        if viewer is not None and viewer.home_lat is not None and viewer.home_lng is not None:
+            return {
+                "lat": float(viewer.home_lat),
+                "lng": float(viewer.home_lng),
+                "label": "your saved area",
+                "source": "profile_home",
+            }
+
+        raise ValueError(
+            "Location is required for outdoor place suggestions. Mention a city like Sofia, send current location, or save home coordinates."
+        )
 
     def propose_friend_meetup_for_prompt(
         self,
@@ -433,6 +549,175 @@ class MeetupAgentService:
                     "place_name": invite.place_name,
                     "meeting_when_bg": invite_data.get("meeting_when_bg"),
                     "status": invite.status,
+                },
+            },
+        }
+
+    def suggest_outing_for_match(
+        self,
+        *,
+        agent_user_id: str | None,
+        prompt: str,
+        match_user_id: int,
+        viewer_location: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        clean_prompt = " ".join(str(prompt or "").split()).strip()
+        if not clean_prompt:
+            raise ValueError("prompt required")
+
+        viewer = self.resolve_profile(agent_user_id)
+        match_profile = (
+            AccountProfile.objects.select_related("user", "elder_profile")
+            .filter(user_id=int(match_user_id))
+            .first()
+        )
+        if match_profile is None:
+            raise ValueError("Matched profile not found for outing suggestion.")
+
+        resolved_location = self.resolve_outdoor_location(
+            prompt=clean_prompt,
+            viewer=viewer,
+            viewer_location=viewer_location,
+        )
+        req_lat = resolved_location["lat"]
+        req_lng = resolved_location["lng"]
+        fr_lat = match_profile.home_lat
+        fr_lng = match_profile.home_lng
+        if None in {req_lat, req_lng, fr_lat, fr_lng}:
+            raise ValueError("Location is required for outing suggestions.")
+
+        participants = [
+            {"lat": float(req_lat), "lng": float(req_lng)},
+            {"lat": float(fr_lat), "lng": float(fr_lng)},
+        ]
+        participant_vectors = [
+            (viewer.elder_profile.feature_vector if viewer.elder_profile_id else {}) or {},
+            (match_profile.elder_profile.feature_vector if match_profile.elder_profile_id else {}) or {},
+        ]
+        participant_descriptions = [
+            viewer.effective_description or viewer.description or clean_prompt,
+            match_profile.effective_description or match_profile.description or "",
+        ]
+        best_match = get_best_meetup_spot(
+            participants,
+            participant_vectors=participant_vectors,
+            participant_descriptions=participant_descriptions,
+        )
+        center = get_central_point(participants)
+        if not best_match or not center:
+            raise ValueError("Could not find a suitable outing suggestion.")
+
+        friend_status = get_friendship_status(viewer, match_profile)
+        return {
+            "ok": True,
+            "widget_type": "outing_suggestion",
+            "message": f"Found a place and time suggestion with {match_profile.display_name}.",
+            "user": {
+                "user_id": match_profile.user_id,
+                "display_name": match_profile.display_name,
+                "description": match_profile.effective_description or match_profile.description,
+                "friend_status": friend_status,
+            },
+            "outing": {
+                **best_match,
+                "center_lat": round(float(center["lat"]), 6),
+                "center_lng": round(float(center["lng"]), 6),
+                "location_label": str(resolved_location.get("label") or "").strip(),
+                "location_source": str(resolved_location.get("source") or "").strip(),
+            },
+            "board_object": {
+                "tags": [
+                    "kind:outing_suggestion",
+                    "source:meetup",
+                    "entity:outing_suggestion",
+                ],
+                "extra_data": {
+                    "kind": "outing_suggestion",
+                    "friend_name": match_profile.display_name,
+                    "target_user_id": match_profile.user_id,
+                    "place_name": best_match.get("place_name"),
+                    "recommended_when_bg": best_match.get("recommended_when_bg"),
+                },
+            },
+        }
+
+    def suggest_outdoor_place_for_prompt(
+        self,
+        *,
+        agent_user_id: str | None,
+        prompt: str,
+        viewer_location: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        clean_prompt = " ".join(str(prompt or "").split()).strip()
+        if not clean_prompt:
+            raise ValueError("prompt required")
+
+        viewer = self.resolve_optional_profile(agent_user_id)
+        resolved_location = self.resolve_outdoor_location(
+            prompt=clean_prompt,
+            viewer=viewer,
+            viewer_location=viewer_location,
+        )
+        participants = [
+            {
+                "lat": float(resolved_location["lat"]),
+                "lng": float(resolved_location["lng"]),
+            }
+        ]
+        participant_vectors = []
+        if viewer is not None and viewer.elder_profile_id:
+            participant_vectors.append((viewer.elder_profile.feature_vector or {}).copy())
+        participant_descriptions = []
+        viewer_description = ""
+        if viewer is not None:
+            viewer_description = viewer.effective_description or viewer.description or ""
+        if viewer_description:
+            participant_descriptions.append(viewer_description)
+        participant_descriptions.append(clean_prompt)
+
+        best_match = get_best_meetup_spot(
+            participants,
+            participant_vectors=participant_vectors,
+            participant_descriptions=participant_descriptions,
+        )
+        center = get_central_point(participants)
+        if not best_match or not center:
+            raise ValueError("Could not find a suitable outdoor place suggestion.")
+
+        location_label = str(resolved_location.get("label") or "").strip()
+        title = f"Навън в {location_label}" if location_label else "Предложение за излизане"
+        return {
+            "ok": True,
+            "widget_type": "outing_suggestion",
+            "title": title,
+            "summary": str(best_match.get("place_name") or "").strip(),
+            "message": f"Suggested an outdoor place in {location_label}." if location_label else "Suggested an outdoor place.",
+            "user": {},
+            "search_location": {
+                "label": location_label,
+                "source": str(resolved_location.get("source") or "").strip(),
+                "lat": round(float(resolved_location["lat"]), 6),
+                "lng": round(float(resolved_location["lng"]), 6),
+                "timezone": str(resolved_location.get("timezone") or "").strip(),
+            },
+            "outing": {
+                **best_match,
+                "center_lat": round(float(center["lat"]), 6),
+                "center_lng": round(float(center["lng"]), 6),
+                "location_label": location_label,
+                "location_source": str(resolved_location.get("source") or "").strip(),
+            },
+            "board_object": {
+                "tags": [
+                    "kind:outing_suggestion",
+                    "source:meetup",
+                    "entity:outing_suggestion",
+                ],
+                "extra_data": {
+                    "kind": "outing_suggestion",
+                    "place_name": best_match.get("place_name"),
+                    "recommended_when_bg": best_match.get("recommended_when_bg"),
+                    "location_label": location_label,
                 },
             },
         }

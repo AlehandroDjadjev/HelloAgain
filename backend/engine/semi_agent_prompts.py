@@ -41,6 +41,7 @@ CONNECTION TOOL CHOICE RULES:
 
 MEETUP TOOL CHOICE RULES:
 - Use `meetup.propose_friend_meetup` when the user wants to go out with one existing accepted friend by name.
+- Use `meetup.suggest_outdoor_place` when the user wants a place recommendation for going outside and the request is about the city or area rather than choosing a friend.
 - Prefer `meetup.propose_friend_meetup` over `connections.find_connection` when the friend is already known and the task is to plan the outing, not discover a new match.
 - For Bulgarian prompts like `искам да излеза с ...` or `искам да изляза с ...`, extract the friend's display name into `friend_name` when possible.
 
@@ -54,6 +55,10 @@ PHONE TOOL CHOICE RULES:
 - Use `phone_command.open_phone_command` when the request is about operating the phone, launching a phone flow, opening an app through the phone, or creating a clickable launcher object for a navigation / phone command prompt.
 - Prefer `phone_command.open_phone_command` over the social or GNN tools when the desired result is a phone-action launcher rather than memory, emotional analysis, or a real-person connection.
 - Pass the user's phone prompt through as the `prompt` argument with minimal rewriting.
+
+WEATHER TOOL CHOICE RULES:
+- Use `weather.get_current_weather` when the user asks directly about the weather, temperature, rain, sun, clouds, or forecast at their current location.
+- Prefer it over the social and GNN tools for direct weather questions.
 
 GNN TOOL CHOICE RULES:
 - Use `gnn_actions.add_action` when the user describes a concrete activity, behavior, or coping thing they did and it should become remembered action memory.
@@ -78,11 +83,12 @@ JSON shape:
   "mcp_calls": [
     {{
       "call_id": "gnn_actions.fetch_action.1",
-      "mcp_id": "gnn_actions|connections|phone_command|meetup|calendar",
-      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command|propose_friend_meetup|create_meetup_reminder",
+      "mcp_id": "gnn_actions|connections|phone_command|weather|meetup|calendar",
+      "tool_name": "add_action|fetch_action|conversation|find_connection|update_profile|open_phone_command|get_current_weather|propose_friend_meetup|create_meetup_reminder|suggest_outdoor_place",
       "arguments": {{
         "prompt": "prompt to send to the tool",
         "friend_name": "friend display name if the meetup tool is used",
+        "location": {{"lat": 42.0, "lng": 23.0}},
         "user_id": "target user id if the calendar tool is used",
         "title": "calendar event title",
         "start_time": "ISO start timestamp",

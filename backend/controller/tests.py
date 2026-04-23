@@ -48,6 +48,7 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertTrue(payload["mcps"][0]["descriptor_url"].endswith("/api/agent/mcps/gnn_actions/"))
         self.assertTrue(any(item["id"] == "connections" for item in payload["mcps"]))
         self.assertTrue(any(item["id"] == "phone_command" for item in payload["mcps"]))
+        self.assertTrue(any(item["id"] == "weather" for item in payload["mcps"]))
         self.assertTrue(any(item["id"] == "meetup" for item in payload["mcps"]))
         self.assertTrue(any(item["id"] == "calendar" for item in payload["mcps"]))
 
@@ -67,11 +68,18 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertTrue(phone_command_descriptor["invoke_url"].endswith("/api/agent/mcps/phone_command/invoke/"))
         self.assertEqual(phone_command_descriptor["tools"][0]["path"], "/api/agent/mcps/phone_command/invoke/")
 
+        weather_descriptor = registry.load_descriptor("weather", base_url="http://localhost:8000")
+        self.assertEqual(weather_descriptor["id"], "weather")
+        self.assertEqual(len(weather_descriptor["tools"]), 1)
+        self.assertTrue(weather_descriptor["invoke_url"].endswith("/api/agent/mcps/weather/invoke/"))
+        self.assertEqual(weather_descriptor["tools"][0]["path"], "/api/weather/current/")
+
         meetup_descriptor = registry.load_descriptor("meetup", base_url="http://localhost:8000")
         self.assertEqual(meetup_descriptor["id"], "meetup")
-        self.assertEqual(len(meetup_descriptor["tools"]), 1)
+        self.assertEqual(len(meetup_descriptor["tools"]), 2)
         self.assertTrue(meetup_descriptor["invoke_url"].endswith("/api/agent/mcps/meetup/invoke/"))
         self.assertEqual(meetup_descriptor["tools"][0]["path"], "/api/meetup/friends/propose/")
+        self.assertEqual(meetup_descriptor["tools"][1]["name"], "suggest_outdoor_place")
 
         calendar_descriptor = registry.load_descriptor("calendar", base_url="http://localhost:8000")
         self.assertEqual(calendar_descriptor["id"], "calendar")
@@ -1233,6 +1241,58 @@ class SemiAgentServiceTests(SimpleTestCase):
         self.assertTrue(payload["result"]["success"])
         self.assertEqual(payload["summary"], "Added the accepted meetup to Google Calendar.")
 
+    def test_meetup_mcp_infers_outdoor_place_tool_and_passes_location(self) -> None:
+        calls: list[dict] = []
+
+        def _suggest_outdoor_place_for_prompt(**kwargs):
+            calls.append(kwargs)
+            return {
+                "ok": True,
+                "widget_type": "outing_suggestion",
+                "title": "Навън в Sofia",
+                "message": "Suggested an outdoor place in Sofia.",
+                "user": {},
+                "search_location": {"label": "Sofia", "source": "explicit_city"},
+                "outing": {
+                    "place_name": "South Park",
+                    "recommended_when_bg": "today at 18:00",
+                    "location_label": "Sofia",
+                },
+                "board_object": {
+                    "extra_data": {
+                        "kind": "outing_suggestion",
+                        "place_name": "South Park",
+                    }
+                },
+            }
+
+        fake_meetup_service = SimpleNamespace(
+            propose_friend_meetup_for_prompt=lambda **kwargs: {},
+            suggest_outdoor_place_for_prompt=_suggest_outdoor_place_for_prompt,
+        )
+        service = SemiAgentService(
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+            meetup_service=fake_meetup_service,
+        )
+
+        payload = service.invoke_mcp(
+            mcp_id="meetup",
+            tool_name="",
+            arguments={
+                "prompt": "find me a place to go outside in Sofia",
+            },
+            location={"lat": 42.7, "lng": 23.32},
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["tool_name"], "suggest_outdoor_place")
+        self.assertEqual(payload["result"]["widget_type"], "outing_suggestion")
+        self.assertEqual(calls[0]["viewer_location"], {"lat": 42.7, "lng": 23.32})
+
     def test_opening_meetup_object_returns_meetup_viewer(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
@@ -1582,6 +1642,18 @@ class SemiAgentServiceTests(SimpleTestCase):
 
         self.assertEqual(calls, [])
 
+    def test_default_mcp_calls_returns_outdoor_place_tool_for_location_request(self) -> None:
+        service = SemiAgentService()
+
+        calls = service._default_mcp_calls(
+            "find me a place to go outside in Sofia",
+            "mechanical",
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["mcp_id"], "meetup")
+        self.assertEqual(calls[0]["tool_name"], "suggest_outdoor_place")
+
 
 class GnnParserFallbackTests(SimpleTestCase):
     def test_parser_uses_openai_before_qwen_for_json_steps(self) -> None:
@@ -1857,3 +1929,158 @@ class AuthenticatedIdentityFlowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["user_id"], str(viewer_profile.user_id))
+
+
+class SemiAgentWeatherFlowTests(SimpleTestCase):
+    def test_weather_mcp_infers_single_tool_and_returns_snapshot(self) -> None:
+        fake_weather_service = SimpleNamespace(
+            get_current_weather_for_prompt=lambda **kwargs: {
+                "ok": True,
+                "widget_type": "weather_snapshot",
+                "title": "Времето сега",
+                "summary": "Слънчево, 24°C",
+                "surface_preference": "popup_only",
+                "weather": {
+                    "label": "Слънчево",
+                    "summary": "Слънчево, 24°C",
+                    "icon_key": "sun",
+                    "advice": "Подходящо е за кратка разходка.",
+                },
+            }
+        )
+        service = SemiAgentService(
+            weather_service=fake_weather_service,
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+        )
+
+        payload = service.invoke_mcp(
+            mcp_id="weather",
+            tool_name="",
+            arguments={
+                "prompt": "Какво е времето навън?",
+                "location": {"lat": 42.6977, "lng": 23.3219},
+            },
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["tool_name"], "get_current_weather")
+        self.assertEqual(payload["result"]["widget_type"], "weather_snapshot")
+        self.assertEqual(payload["result"]["surface_preference"], "popup_only")
+
+    def test_opening_weather_object_returns_weather_viewer_without_raw_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            service = SemiAgentService(
+                board_memory=store,
+                connections_service=SimpleNamespace(
+                    save_board_state_for_user=lambda *args, **kwargs: None,
+                    apply_board_commands_for_user=lambda *args, **kwargs: None,
+                    build_user_widget_payload=lambda **kwargs: {},
+                ),
+            )
+            store.register_result_bindings(
+                [
+                    {
+                        "result_id": "result_weather",
+                        "object_name": "weather_now",
+                        "memory_type": "memory",
+                        "delete_after_click": False,
+                        "result_title": "Времето сега",
+                        "result_summary": "Слънчево, 24°C",
+                        "payload": {
+                            "linked_results": [
+                                {
+                                    "result": {
+                                        "widget_type": "weather_snapshot",
+                                        "title": "Времето сега",
+                                        "summary": "Слънчево, 24°C",
+                                        "surface_preference": "popup_only",
+                                        "weather": {
+                                            "label": "Слънчево",
+                                            "summary": "Слънчево, 24°C",
+                                            "icon_key": "sun",
+                                            "advice": "Подходящо е за кратка разходка.",
+                                        },
+                                        "board_object": {
+                                            "extra_data": {
+                                                "kind": "weather_snapshot",
+                                            }
+                                        },
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                ]
+            )
+
+            payload = service.open_board_object(
+                object_payload={
+                    "name": "weather_now",
+                    "resultId": "result_weather",
+                    "memoryType": "memory",
+                    "deleteAfterClick": False,
+                    "extraData": {"kind": "weather_snapshot"},
+                }
+            )
+
+            self.assertTrue(payload["found"])
+            self.assertEqual(payload["viewer"]["widget_type"], "weather_snapshot")
+            self.assertNotIn("payload", payload["viewer"].get("weather", {}))
+
+
+class WeatherEndpointTests(SimpleTestCase):
+    def test_weather_endpoint_uses_explicit_location(self) -> None:
+        with patch("weather.views.get_current_weather_snapshot") as mock_weather:
+            mock_weather.return_value = {
+                "widget_type": "weather_snapshot",
+                "title": "Времето сега",
+                "summary": "Ясно, 22°C",
+                "weather": {"label": "Ясно"},
+            }
+
+            response = self.client.post(
+                "/api/weather/current/",
+                data=json.dumps(
+                    {
+                        "location": {"lat": 42.6977, "lng": 23.3219},
+                        "timezone": "Europe/Sofia",
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        _, kwargs = mock_weather.call_args
+        self.assertEqual(kwargs["lat"], 42.6977)
+        self.assertEqual(kwargs["lng"], 23.3219)
+        self.assertEqual(kwargs["timezone_name"], "Europe/Sofia")
+
+    def test_agent_run_start_forwards_location_payload(self) -> None:
+        with patch("controller.views.semi_agent_service.start_run") as mock_start_run:
+            mock_start_run.return_value = {"ok": True, "run_id": "run_weather"}
+
+            response = self.client.post(
+                "/api/agent/run/start/",
+                data=json.dumps(
+                    {
+                        "prompt": "Какво е времето?",
+                        "user_id": "guest_weather",
+                        "session_id": "session_weather",
+                        "location": {"lat": 42.7, "lng": 23.32},
+                        "board_state": {"board": {"width": 800, "height": 600}, "objects": []},
+                        "largest_empty_space": {
+                            "bbox": {"x": 0, "y": 0, "width": 800, "height": 600},
+                        },
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        _, kwargs = mock_start_run.call_args
+        self.assertEqual(kwargs["location"], {"lat": 42.7, "lng": 23.32})
