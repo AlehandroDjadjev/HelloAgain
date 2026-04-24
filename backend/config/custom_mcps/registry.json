@@ -41,6 +41,17 @@
       ]
     },
     {
+      "id": "weather",
+      "name": "weather",
+      "description": "Fetches a clean current weather snapshot for the user's current or saved location.",
+      "descriptor_file": "weather.json",
+      "descriptor_url": "/api/agent/mcps/weather/",
+      "notes": [
+        "Use this for direct weather questions.",
+        "Prefer a popup-friendly result instead of a generic board memory object."
+      ]
+    },
+    {
       "id": "meetup",
       "name": "meetup",
       "description": "Wraps the meetup planner so the agent can propose going out with exactly one accepted friend and return a whiteboard-openable invite.",
@@ -50,6 +61,18 @@
         "Use this when the user wants to go out with an existing accepted friend rather than find a new person.",
         "Prefer it over connections.find_connection when the friend is already known by name.",
         "Pass only one friend selector, usually friend_name extracted from the prompt."
+      ]
+    },
+    {
+      "id": "calendar",
+      "name": "calendar",
+      "description": "Creates a Google Calendar reminder for an already accepted meetup with full details.",
+      "descriptor_file": "calendar.json",
+      "descriptor_url": "/api/agent/mcps/calendar/",
+      "notes": [
+        "Use this only after a meetup is already accepted.",
+        "Only use it when the meetup has a time and place.",
+        "If Google Calendar is not connected, the tool should fail gracefully."
       ]
     }
   ]

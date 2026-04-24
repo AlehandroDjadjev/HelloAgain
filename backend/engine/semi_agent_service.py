@@ -9,18 +9,22 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from threading import Lock
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
 from .custom_mcp_registry import CustomMcpRegistry
+from .live_tool_services import LiveToolError, SearchService, TimeService, WeatherService
 from .llm_parser import QwenPromptParser
 from .qwen_worker_client import QwenWorkerClient
+from .routing_models import RouteDecision
 from .semi_agent_prompts import (
     build_step_one_mcp_prompt,
     build_step_two_board_prompt,
 )
 from .user_context import ActiveUserTracker, TemporaryChatHistoryStore
 from .whiteboard_memory import WhiteboardMemoryStore
+from services.google_calendar_service import GoogleCalendarService
+from weather.agent_service import WeatherAgentService
 from voice_gateway.services.providers import (
     OpenAILLMProvider,
     TextToSpeechProvider,
@@ -36,7 +40,9 @@ class SemiAgentService:
         "gnn_actions": {"add_action", "fetch_action", "conversation"},
         "connections": {"update_profile", "find_connection"},
         "phone_command": {"open_phone_command"},
-        "meetup": {"propose_friend_meetup"},
+        "weather": {"get_current_weather"},
+        "meetup": {"propose_friend_meetup", "suggest_outdoor_place"},
+        "calendar": {"create_meetup_reminder"},
     }
     SUPPORTED_TOOL_NAMES = {
         tool_name
@@ -60,9 +66,16 @@ class SemiAgentService:
         registry: CustomMcpRegistry | None = None,
         board_memory: WhiteboardMemoryStore | None = None,
         llm_provider: OpenAILLMProvider | None = None,
+        router_llm_provider: OpenAILLMProvider | None = None,
+        reasoning_llm_provider: OpenAILLMProvider | None = None,
         tts_provider: TextToSpeechProvider | None = None,
         connections_service: Any | None = None,
         meetup_service: Any | None = None,
+        calendar_service: GoogleCalendarService | None = None,
+        weather_service: WeatherService | None = None,
+        time_service: TimeService | None = None,
+        search_service: SearchService | None = None,
+        weather_agent_service: WeatherAgentService | None = None,
         user_tracker: ActiveUserTracker | None = None,
         speech_history_store: TemporaryChatHistoryStore | None = None,
     ) -> None:
@@ -71,6 +84,8 @@ class SemiAgentService:
         self.registry = registry or CustomMcpRegistry()
         self.board_memory = board_memory or WhiteboardMemoryStore()
         self.llm_provider = llm_provider or OpenAILLMProvider()
+        self.router_llm_provider = router_llm_provider or OpenAILLMProvider(model="gpt-5.4-mini")
+        self.reasoning_llm_provider = reasoning_llm_provider or OpenAILLMProvider(model="gpt-5.4")
         self.tts_provider = tts_provider or build_default_tts_provider()
         self.user_tracker = user_tracker or ActiveUserTracker()
         self.speech_history_store = speech_history_store or TemporaryChatHistoryStore()
@@ -87,6 +102,11 @@ class SemiAgentService:
 
             meetup_service = MeetupAgentService()
         self.meetup_service = meetup_service
+        self.calendar_service = calendar_service or GoogleCalendarService()
+        self.weather_service = weather_service or WeatherService()
+        self.time_service = time_service or TimeService()
+        self.search_service = search_service or SearchService()
+        self.weather_agent_service = weather_agent_service or WeatherAgentService()
         self._executor = ThreadPoolExecutor(max_workers=4)
         self._run_jobs: Dict[str, Dict[str, Any]] = {}
         self._run_jobs_lock = Lock()
@@ -166,6 +186,24 @@ class SemiAgentService:
         ]
         if len(matches) == 1:
             return matches[0]
+        return ""
+
+    def _infer_default_tool_for_mcp(
+        self,
+        *,
+        mcp_id: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+    ) -> str:
+        if mcp_id == "weather":
+            return "get_current_weather"
+        if mcp_id != "meetup":
+            return ""
+        friend_name = self._clean_text(arguments.get("friend_name"))
+        if friend_name or self._extract_bulgarian_meetup_friend_name(prompt):
+            return "propose_friend_meetup"
+        if self._looks_like_outdoor_place_request(prompt):
+            return "suggest_outdoor_place"
         return ""
 
     def _json_schema_for_body_type(self, raw_type: Any) -> Dict[str, Any]:
@@ -502,23 +540,580 @@ class SemiAgentService:
             "board_state": persisted,
         }
 
+    def _build_route_response_format(self) -> Dict[str, Any]:
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "semi_agent_route_decision",
+                "strict": True,
+                "schema": self._strict_openai_schema(RouteDecision.model_json_schema()),
+            },
+        }
+
+    def _route_request(self, prompt: str, board_state: Dict[str, Any] | None) -> RouteDecision:
+        clean_prompt = self._clean_text(prompt)
+        fallback = self._fallback_route_decision(clean_prompt, board_state)
+        try:
+            llm_result = self.router_llm_provider.generate_reply_with_messages(
+                system_prompt=self._build_route_system_prompt(),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_route_user_prompt(
+                            clean_prompt=clean_prompt,
+                            board_state=board_state,
+                        ),
+                    }
+                ],
+                session_id="router",
+                user_id="router",
+                include_history=False,
+                store_history=False,
+                response_format=self._build_route_response_format(),
+            )
+            raw_payload = json.loads(self._clean_text(llm_result.text) or "{}")
+            decision = RouteDecision.model_validate(raw_payload)
+            clean_tool_name = self._clean_text(decision.tool_name).lower() or None
+            if decision.route == "live_tool":
+                if clean_tool_name not in {"weather", "time", "search"}:
+                    clean_tool_name = "search"
+                decision = decision.model_copy(
+                    update={
+                        "tool_name": clean_tool_name,
+                        "location": self._clean_text(decision.location) or None,
+                    }
+                )
+            else:
+                decision = decision.model_copy(update={"tool_name": None, "location": None})
+            return decision
+        except Exception:
+            return fallback
+
+    def _build_route_system_prompt(self) -> str:
+        return (
+            "You are a strict router for HelloAgain. "
+            "Choose exactly one route for the incoming request. "
+            "Return only valid JSON matching the schema.\n\n"
+            "Route direct_reasoning for explanations, comparisons, math, logic, planning, summaries, and general knowledge.\n"
+            "Route live_tool for weather, current time in a place, prices, news, fresh web data, or anything requiring current external information.\n"
+            "Route semi_agent for whiteboard or board actions, persistent memory, meetups, friend finding, graph or GNN actions, phone-command launchers, and existing MCP workflows.\n"
+            "Only set tool_name for live_tool. Allowed live tools: weather, time, search.\n"
+            "Set location only when a concrete place is clearly present for weather or time."
+        )
+
+    def _build_route_user_prompt(
+        self,
+        *,
+        clean_prompt: str,
+        board_state: Dict[str, Any] | None,
+    ) -> str:
+        payload = {
+            "prompt": clean_prompt,
+            "board_context": self._summarize_board_for_router(board_state),
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _summarize_board_for_router(self, board_state: Dict[str, Any] | None) -> Dict[str, Any]:
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        objects = normalized_board_state.get("objects", [])
+        summarized_objects: List[Dict[str, Any]] = []
+        for raw_object in objects[:6]:
+            if not isinstance(raw_object, dict):
+                continue
+            extra_data = raw_object.get("extraData") if isinstance(raw_object.get("extraData"), dict) else {}
+            summarized_objects.append(
+                {
+                    "name": self._clean_text(raw_object.get("name")),
+                    "text": self._clean_text(raw_object.get("text")),
+                    "tags": raw_object.get("tags") if isinstance(raw_object.get("tags"), list) else [],
+                    "kind": self._clean_text(extra_data.get("kind")),
+                }
+            )
+        return {
+            "object_count": len(objects) if isinstance(objects, list) else 0,
+            "objects": summarized_objects,
+        }
+
+    def _fallback_route_decision(
+        self,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+    ) -> RouteDecision:
+        lowered = self._clean_text(prompt).lower()
+        location_hint = self._extract_location_hint(prompt)
+        live_markers = {
+            "weather": "weather",
+            "temperature": "weather",
+            "forecast": "weather",
+            "time in": "time",
+            "current time": "time",
+            "what time": "time",
+            "latest": "search",
+            "today": "search",
+            "news": "search",
+            "price": "search",
+            "stock": "search",
+            "search": "search",
+            "look up": "search",
+        }
+        for marker, tool_name in live_markers.items():
+            if marker in lowered:
+                return RouteDecision(
+                    route="live_tool",
+                    reason=f"Fallback routed to live_tool because the prompt mentions {marker}.",
+                    tool_name=tool_name,
+                    location=location_hint if tool_name in {"weather", "time"} else None,
+                )
+
+        board_summary = self._summarize_board_for_router(board_state)
+        semi_agent_markers = (
+            "board",
+            "whiteboard",
+            "remember",
+            "memory",
+            "friend",
+            "connection",
+            "meetup",
+            "go out with",
+            "phone command",
+            "open the phone",
+            "gnn",
+            "graph",
+            "show this on",
+            "move this",
+            "delete this",
+            "find me",
+            "connect me",
+        )
+        if any(marker in lowered for marker in semi_agent_markers):
+            return RouteDecision(
+                route="semi_agent",
+                reason="Fallback routed to semi_agent because the prompt matches an existing board or MCP workflow.",
+            )
+        if board_summary.get("object_count") and any(
+            marker in lowered for marker in {"this", "that", "move", "delete", "open it", "show it"}
+        ):
+            return RouteDecision(
+                route="semi_agent",
+                reason="Fallback routed to semi_agent because the prompt appears to refer to board state.",
+            )
+        return RouteDecision(
+            route="direct_reasoning",
+            reason="Fallback routed to direct_reasoning because the prompt looks like a self-contained knowledge request.",
+        )
+
+    def _extract_location_hint(self, prompt: str) -> Optional[str]:
+        clean_prompt = self._clean_text(prompt)
+        if not clean_prompt:
+            return None
+        patterns = (
+            r"\b(?:in|for|at)\s+([A-ZА-Я][^?.!,]+)$",
+            r"\b(?:weather|time)\s+(?:for|in)\s+([A-ZА-Я][^?.!,]+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, clean_prompt, flags=re.IGNORECASE)
+            if not match:
+                continue
+            location = self._clean_text(match.group(1)).strip(" .?!,;:")
+            if location:
+                return location
+        return None
+
+    def _build_completed_future(self, payload: Dict[str, Any]) -> Future:
+        future: Future = Future()
+        future.set_result(payload)
+        return future
+
+    def _build_routed_whitespace_payload(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        route_decision: RouteDecision,
+        reasoning_provider: str,
+    ) -> Dict[str, Any]:
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        return {
+            "ok": True,
+            "status": "completed",
+            "prompt": self._clean_text(prompt),
+            "route": route_decision.route,
+            "route_decision": route_decision.model_dump(),
+            "reasoning_provider": reasoning_provider,
+            "step_one": {
+                "stage": "router",
+                "needs_mcps": False,
+                "request_kind": "mechanical",
+                "memory_hint": "ram",
+                "reasoning_summary": route_decision.reason,
+                "why_this_is_part_of_the_chain": "A pre-router answered before the semi-agent pipeline.",
+                "board_intent": "No board changes are needed for this route.",
+                "speech_intent": "Answer directly to the user.",
+                "mcp_calls": [],
+            },
+            "mcp_results": [],
+            "step_two": {
+                "stage": "router_bypass",
+                "cycle_back_to_step_one": False,
+                "reasoning_summary": "Router bypassed whitespace generation.",
+                "board_explanation": "No whiteboard interaction was needed.",
+                "memory_plan": {
+                    "default_memory_type": "ram",
+                    "why": "The routed request is answer-only and should not mutate board state.",
+                },
+                "focus_object": {
+                    "name": "",
+                    "text": "",
+                    "width": 0,
+                    "height": 0,
+                    "memory_type": "ram",
+                    "delete_after_click": False,
+                    "linked_call_ids": [],
+                    "result_title": "",
+                    "result_summary": "",
+                },
+                "board_commands": [],
+                "result_bindings": [],
+            },
+            "board_commands": [],
+            "board_state": normalized_board_state,
+            "persisted_board_state": normalized_board_state,
+            "result_bindings": [],
+        }
+
+    def _build_speech_payload_from_text(
+        self,
+        *,
+        assistant_text: str,
+        llm_source: str,
+        warnings: List[str],
+    ) -> Dict[str, Any]:
+        normalized_text = self._clean_text(assistant_text)
+        assistant_audio_base64 = ""
+        assistant_audio_mime_type = ""
+        tts_source = self.tts_provider.status()
+        try:
+            synthesis = self.tts_provider.synthesize(normalized_text)
+        except Exception as exc:
+            warnings = [*warnings, f"tts_unavailable={exc}"]
+        else:
+            warnings = [*warnings, *synthesis.warnings]
+            assistant_audio_base64 = base64.b64encode(synthesis.audio_bytes).decode("ascii")
+            assistant_audio_mime_type = synthesis.mime_type
+            tts_source = synthesis.source
+        return {
+            "ok": True,
+            "status": "completed",
+            "speech_response": normalized_text,
+            "assistant_text": normalized_text,
+            "assistant_audio_base64": assistant_audio_base64,
+            "assistant_audio_mime_type": assistant_audio_mime_type,
+            "provider_status": {
+                "llm": llm_source,
+                "tts": tts_source,
+            },
+            "warnings": warnings,
+        }
+
+    def _build_recent_history_payload(
+        self,
+        *,
+        user_context: Dict[str, str],
+        session_id: str,
+    ) -> List[Dict[str, str]]:
+        history_key = self._clean_text(user_context.get("history_key")) or "anonymous"
+        clean_session_id = self._clean_text(session_id) or "default_session"
+        return self.speech_history_store.get_messages(
+            history_key=history_key,
+            session_id=clean_session_id,
+        )
+
+    def _store_speech_turn(
+        self,
+        *,
+        user_context: Dict[str, str],
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        history_key = self._clean_text(user_context.get("history_key")) or "anonymous"
+        clean_session_id = self._clean_text(session_id) or "default_session"
+        self.speech_history_store.append_turn(
+            history_key=history_key,
+            session_id=clean_session_id,
+            user_text=self._clean_text(user_text),
+            assistant_text=self._clean_text(assistant_text),
+        )
+
+    def _run_direct_reasoning(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        user_context: Dict[str, str],
+        session_id: str,
+        route_decision: RouteDecision,
+        reasoning_provider: str,
+    ) -> Dict[str, Any]:
+        speech_payload = self._run_direct_reasoning_speech_stage(
+            prompt=prompt,
+            user_context=user_context,
+            session_id=session_id,
+        )
+        whitespace_payload = self._build_routed_whitespace_payload(
+            prompt=prompt,
+            board_state=board_state,
+            route_decision=route_decision,
+            reasoning_provider=reasoning_provider,
+        )
+        return {
+            **whitespace_payload,
+            "speech_response": self._clean_text(speech_payload.get("assistant_text")),
+            "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
+            "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
+            "speech_provider_status": speech_payload.get("provider_status", {}),
+            "speech_warnings": speech_payload.get("warnings", []),
+        }
+
+    def _run_live_tool(
+        self,
+        *,
+        prompt: str,
+        board_state: Dict[str, Any] | None,
+        user_context: Dict[str, str],
+        session_id: str,
+        route_decision: RouteDecision,
+        reasoning_provider: str,
+    ) -> Dict[str, Any]:
+        speech_payload = self._run_live_tool_speech_stage(
+            prompt=prompt,
+            user_context=user_context,
+            session_id=session_id,
+            route_decision=route_decision,
+        )
+        whitespace_payload = self._build_routed_whitespace_payload(
+            prompt=prompt,
+            board_state=board_state,
+            route_decision=route_decision,
+            reasoning_provider=reasoning_provider,
+        )
+        return {
+            **whitespace_payload,
+            "speech_response": self._clean_text(speech_payload.get("assistant_text")),
+            "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
+            "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
+            "speech_provider_status": speech_payload.get("provider_status", {}),
+            "speech_warnings": speech_payload.get("warnings", []),
+        }
+
+    def _fetch_live_tool_payload(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        location: str,
+    ) -> Dict[str, Any]:
+        if tool_name == "weather":
+            return self.weather_service.get_current_weather(location)
+        if tool_name == "time":
+            return self.time_service.get_current_time(location)
+        return self.search_service.search(prompt)
+
+    def _summarize_live_tool_payload(
+        self,
+        *,
+        prompt: str,
+        tool_payload: Dict[str, Any],
+        route_decision: RouteDecision,
+        user_context: Dict[str, str],
+        session_id: str,
+    ) -> tuple[str, str, List[str]]:
+        warnings: List[str] = []
+        try:
+            llm_result = self.reasoning_llm_provider.generate_reply_with_messages(
+                system_prompt=self._build_live_tool_summary_system_prompt(),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_live_tool_summary_user_prompt(
+                            prompt=prompt,
+                            route_decision=route_decision,
+                            tool_payload=tool_payload,
+                            recent_history=self._build_recent_history_payload(
+                                user_context=user_context,
+                                session_id=session_id,
+                            ),
+                        ),
+                    }
+                ],
+                session_id=f"{self._clean_text(session_id) or 'default_session'}_live_tool",
+                user_id=self._clean_text(user_context.get("resolved_user_id")) or "anonymous",
+                include_history=False,
+                store_history=False,
+            )
+            warnings.extend(llm_result.warnings)
+            text = self._clean_text(llm_result.text)
+            if text:
+                return text, llm_result.source, warnings
+        except Exception as exc:
+            warnings.append(f"live_tool_summary_fallback={exc}")
+        return self._fallback_live_tool_response(tool_payload), "fallback", warnings
+
+    def _build_direct_reasoning_system_prompt(self) -> str:
+        return (
+            "You are HelloAgain's direct reasoning layer. "
+            "Answer clearly, accurately, and helpfully. "
+            "Use the same language as the user's latest message. "
+            "Do not mention whiteboards, MCPs, tools, or hidden routing. "
+            "If essential information is missing, ask exactly one short follow-up question."
+        )
+
+    def _build_direct_reasoning_user_prompt(
+        self,
+        *,
+        prompt: str,
+        recent_history: List[Dict[str, str]],
+    ) -> str:
+        return json.dumps(
+            {
+                "user_request": self._clean_text(prompt),
+                "recent_chat_history": recent_history,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def _build_live_tool_summary_system_prompt(self) -> str:
+        return (
+            "You are HelloAgain's live-data response layer. "
+            "Use only the provided live tool payload as factual grounding. "
+            "Never invent current data. "
+            "Answer naturally in the same language as the user's latest message. "
+            "If the tool payload contains an error or missing data, say so plainly and ask at most one short follow-up question."
+        )
+
+    def _build_live_tool_summary_user_prompt(
+        self,
+        *,
+        prompt: str,
+        route_decision: RouteDecision,
+        tool_payload: Dict[str, Any],
+        recent_history: List[Dict[str, str]],
+    ) -> str:
+        return json.dumps(
+            {
+                "user_request": self._clean_text(prompt),
+                "recent_chat_history": recent_history,
+                "route_decision": route_decision.model_dump(),
+                "tool_payload": tool_payload,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def _fallback_direct_reasoning_response(self, prompt: str) -> str:
+        return (
+            "I can help with that. "
+            "Please ask it one more time in a short sentence."
+        )
+
+    def _missing_location_follow_up(self, tool_name: str) -> str:
+        if tool_name == "weather":
+            return "Which location should I check the weather for?"
+        return "Which location should I check the time for?"
+
+    def _fallback_live_tool_response(self, tool_payload: Dict[str, Any]) -> str:
+        tool_name = self._clean_text(tool_payload.get("tool_name")).lower()
+        if self._clean_text(tool_payload.get("error")):
+            return (
+                "I couldn't fetch the live data right now. "
+                "Please try again in a moment."
+            )
+        if tool_name == "weather":
+            location = (
+                tool_payload.get("location")
+                if isinstance(tool_payload.get("location"), dict)
+                else {}
+            )
+            name = self._clean_text(location.get("name")) or "that place"
+            description = self._clean_text(tool_payload.get("weather_description")) or "unknown conditions"
+            temperature = tool_payload.get("temperature_c")
+            if temperature is not None:
+                return f"The weather in {name} is {description}, around {temperature} degrees Celsius."
+            return f"The weather in {name} is {description}."
+        if tool_name == "time":
+            location = (
+                tool_payload.get("location")
+                if isinstance(tool_payload.get("location"), dict)
+                else {}
+            )
+            name = self._clean_text(location.get("name")) or "that place"
+            clock = self._clean_text(tool_payload.get("local_clock"))
+            if clock:
+                return f"The current time in {name} is {clock}."
+        heading = self._clean_text(tool_payload.get("heading") or tool_payload.get("query"))
+        abstract = self._clean_text(tool_payload.get("abstract") or tool_payload.get("answer"))
+        if heading and abstract:
+            return f"{heading}: {abstract}"
+        return "I fetched live data, but I need one more try to phrase it clearly."
+
     def run(
         self,
         *,
         prompt: str,
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
+        location: Dict[str, Any] | None = None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
         reasoning_provider: str = "openai",
     ) -> Dict[str, Any]:
+        clean_prompt = self._clean_text(prompt)
+        if not clean_prompt:
+            raise ValueError("prompt required")
+        normalized_reasoning_provider = self._normalize_reasoning_provider(reasoning_provider)
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        route_decision = self._route_request(clean_prompt, normalized_board_state)
+
+        if route_decision.route == "direct_reasoning":
+            return {
+                **self._run_direct_reasoning(
+                    prompt=clean_prompt,
+                    board_state=normalized_board_state,
+                    user_context=user_context,
+                    session_id=session_id,
+                    route_decision=route_decision,
+                    reasoning_provider=normalized_reasoning_provider,
+                ),
+                "user_context": user_context,
+                "route": route_decision.route,
+                "route_decision": route_decision.model_dump(),
+            }
+
+        if route_decision.route == "live_tool":
+            return {
+                **self._run_live_tool(
+                    prompt=clean_prompt,
+                    board_state=normalized_board_state,
+                    user_context=user_context,
+                    session_id=session_id,
+                    route_decision=route_decision,
+                    reasoning_provider=normalized_reasoning_provider,
+                ),
+                "user_context": user_context,
+                "route": route_decision.route,
+                "route_decision": route_decision.model_dump(),
+            }
+
         context = self._prepare_run_context(
-            prompt=prompt,
-            board_state=board_state,
+            prompt=clean_prompt,
+            board_state=normalized_board_state,
             largest_empty_space=largest_empty_space,
+            location=location,
             user_id=user_id,
             session_id=session_id,
-            reasoning_provider=reasoning_provider,
+            reasoning_provider=normalized_reasoning_provider,
         )
         speech_future = self._executor.submit(
             self._run_speech_stage,
@@ -541,12 +1136,15 @@ class SemiAgentService:
             user_id=context["effective_user_id"],
             session_id=session_id,
             reasoning_provider=context["reasoning_provider"],
+            location=context["location"],
         )
         speech_payload = speech_future.result()
         return {
             **board_payload,
             "user_context": context["user_context"],
             "reasoning_provider": context["reasoning_provider"],
+            "route": "semi_agent",
+            "route_decision": route_decision.model_dump(),
             "speech_response": self._clean_text(speech_payload.get("assistant_text")),
             "speech_audio_base64": speech_payload.get("assistant_audio_base64"),
             "speech_audio_mime_type": speech_payload.get("assistant_audio_mime_type"),
@@ -560,18 +1158,80 @@ class SemiAgentService:
         prompt: str,
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
+        location: Dict[str, Any] | None = None,
         user_id: str = "anonymous",
         session_id: str = "default_session",
         reasoning_provider: str = "openai",
     ) -> Dict[str, Any]:
         self._prune_run_jobs()
+        clean_prompt = self._clean_text(prompt)
+        if not clean_prompt:
+            raise ValueError("prompt required")
+        normalized_reasoning_provider = self._normalize_reasoning_provider(reasoning_provider)
+        normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        user_context = self.user_tracker.resolve(user_id=user_id)
+        route_decision = self._route_request(clean_prompt, normalized_board_state)
+
+        if route_decision.route in {"direct_reasoning", "live_tool"}:
+            run_id = f"run_{uuid.uuid4().hex}"
+            if route_decision.route == "direct_reasoning":
+                speech_future = self._executor.submit(
+                    self._run_direct_reasoning_speech_stage,
+                    prompt=clean_prompt,
+                    user_context=user_context,
+                    session_id=session_id,
+                )
+            else:
+                speech_future = self._executor.submit(
+                    self._run_live_tool_speech_stage,
+                    prompt=clean_prompt,
+                    user_context=user_context,
+                    session_id=session_id,
+                    route_decision=route_decision,
+                )
+            whitespace_future = self._build_completed_future(
+                self._build_routed_whitespace_payload(
+                    prompt=clean_prompt,
+                    board_state=normalized_board_state,
+                    route_decision=route_decision,
+                    reasoning_provider=normalized_reasoning_provider,
+                )
+            )
+            with self._run_jobs_lock:
+                self._run_jobs[run_id] = {
+                    "created_at": time.time(),
+                    "prompt": clean_prompt,
+                    "reasoning_provider": normalized_reasoning_provider,
+                    "user_context": user_context,
+                    "speech_future": speech_future,
+                    "whitespace_future": whitespace_future,
+                }
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "prompt": clean_prompt,
+                "user_context": user_context,
+                "reasoning_provider": normalized_reasoning_provider,
+                "route": route_decision.route,
+                "route_decision": route_decision.model_dump(),
+                "step_one": {
+                    "stage": "router",
+                    "needs_mcps": False,
+                    "mcp_calls": [],
+                },
+                "mcp_results": [],
+                "speech_status": "running",
+                "whitespace_status": "completed",
+            }
+
         context = self._prepare_run_context(
-            prompt=prompt,
-            board_state=board_state,
+            prompt=clean_prompt,
+            board_state=normalized_board_state,
             largest_empty_space=largest_empty_space,
+            location=location,
             user_id=user_id,
             session_id=session_id,
-            reasoning_provider=reasoning_provider,
+            reasoning_provider=normalized_reasoning_provider,
         )
         run_id = f"run_{uuid.uuid4().hex}"
         speech_future = self._executor.submit(
@@ -596,6 +1256,7 @@ class SemiAgentService:
             user_id=context["effective_user_id"],
             session_id=session_id,
             reasoning_provider=context["reasoning_provider"],
+            location=context["location"],
         )
         with self._run_jobs_lock:
             self._run_jobs[run_id] = {
@@ -612,6 +1273,8 @@ class SemiAgentService:
             "prompt": context["prompt"],
             "user_context": context["user_context"],
             "reasoning_provider": context["reasoning_provider"],
+            "route": "semi_agent",
+            "route_decision": route_decision.model_dump(),
             "step_one": context["step_one"],
             "mcp_results": context["mcp_results"],
             "speech_status": "running",
@@ -638,6 +1301,7 @@ class SemiAgentService:
         prompt: str,
         board_state: Dict[str, Any] | None,
         largest_empty_space: Dict[str, Any] | None,
+        location: Dict[str, Any] | None,
         user_id: str,
         session_id: str,
         reasoning_provider: str,
@@ -661,6 +1325,7 @@ class SemiAgentService:
         chain_history: List[Dict[str, Any]] = []
         registry_payload = self.get_registry_payload()
         tool_catalog = self._build_mcp_tool_catalog()
+        normalized_location = self._normalize_location_payload(location)
 
         step_one_raw = self._generate_json(
             system_prompt=build_step_one_mcp_prompt(
@@ -685,6 +1350,7 @@ class SemiAgentService:
             clean_prompt,
             user_id=effective_user_id,
             board_state=normalized_board_state,
+            location=normalized_location,
         )
         if mcp_results:
             chain_history.append({"stage": "mcp_results", "payload": mcp_results})
@@ -698,10 +1364,112 @@ class SemiAgentService:
             "mcp_tool_catalog": tool_catalog,
             "user_context": user_context,
             "effective_user_id": effective_user_id,
+            "location": normalized_location,
             "reasoning_provider": normalized_reasoning_provider,
             "step_one": step_one,
             "mcp_results": mcp_results,
         }
+
+    def _run_direct_reasoning_speech_stage(
+        self,
+        *,
+        prompt: str,
+        user_context: Dict[str, str],
+        session_id: str,
+    ) -> Dict[str, Any]:
+        recent_history = self._build_recent_history_payload(
+            user_context=user_context,
+            session_id=session_id,
+        )
+        warnings: List[str] = []
+        try:
+            llm_result = self.reasoning_llm_provider.generate_reply_with_messages(
+                system_prompt=self._build_direct_reasoning_system_prompt(),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": self._build_direct_reasoning_user_prompt(
+                            prompt=prompt,
+                            recent_history=recent_history,
+                        ),
+                    }
+                ],
+                session_id=f"{self._clean_text(session_id) or 'default_session'}_direct",
+                user_id=self._clean_text(user_context.get("resolved_user_id")) or "anonymous",
+                include_history=False,
+                store_history=False,
+            )
+            assistant_text = self._clean_text(llm_result.text)
+            warnings.extend(llm_result.warnings)
+            llm_source = llm_result.source
+        except Exception as exc:
+            assistant_text = self._fallback_direct_reasoning_response(prompt)
+            warnings.append(f"direct_reasoning_fallback={exc}")
+            llm_source = "fallback"
+
+        if not assistant_text:
+            assistant_text = self._fallback_direct_reasoning_response(prompt)
+            warnings.append("direct_reasoning_empty_response")
+
+        self._store_speech_turn(
+            user_context=user_context,
+            session_id=session_id,
+            user_text=prompt,
+            assistant_text=assistant_text,
+        )
+        return self._build_speech_payload_from_text(
+            assistant_text=assistant_text,
+            llm_source=llm_source,
+            warnings=warnings,
+        )
+
+    def _run_live_tool_speech_stage(
+        self,
+        *,
+        prompt: str,
+        user_context: Dict[str, str],
+        session_id: str,
+        route_decision: RouteDecision,
+    ) -> Dict[str, Any]:
+        warnings: List[str] = []
+        tool_name = self._clean_text(route_decision.tool_name).lower() or "search"
+        if tool_name in {"weather", "time"} and not self._clean_text(route_decision.location):
+            assistant_text = self._missing_location_follow_up(tool_name)
+            warnings.append(f"{tool_name}_missing_location")
+            llm_source = "rule_based"
+        else:
+            try:
+                tool_payload = self._fetch_live_tool_payload(
+                    tool_name=tool_name,
+                    prompt=prompt,
+                    location=self._clean_text(route_decision.location),
+                )
+            except Exception as exc:
+                tool_payload = {
+                    "tool_name": tool_name,
+                    "error": str(exc),
+                }
+                warnings.append(f"live_tool_error={exc}")
+            assistant_text, llm_source, summary_warnings = self._summarize_live_tool_payload(
+                prompt=prompt,
+                tool_payload=tool_payload,
+                route_decision=route_decision,
+                user_context=user_context,
+                session_id=session_id,
+            )
+            warnings.extend(summary_warnings)
+
+        self._store_speech_turn(
+            user_context=user_context,
+            session_id=session_id,
+            user_text=prompt,
+            assistant_text=assistant_text,
+        )
+        return self._build_speech_payload_from_text(
+            assistant_text=assistant_text,
+            llm_source=llm_source,
+            warnings=warnings,
+        )
 
     def _run_board_stage(
         self,
@@ -717,6 +1485,7 @@ class SemiAgentService:
         user_id: str,
         session_id: str,
         reasoning_provider: str,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         step_two, final_mcp_results = self._run_step_two_loop(
             prompt=clean_prompt,
@@ -729,20 +1498,39 @@ class SemiAgentService:
             user_id=user_id,
             session_id=session_id,
             reasoning_provider=reasoning_provider,
+            location=location,
         )
 
-        final_board_commands = step_two.get("board_commands", [])
-        final_board_state = self.board_memory.apply_commands(
-            normalized_board_state,
-            final_board_commands,
+        auto_open_viewer = self._extract_auto_open_viewer(
+            final_mcp_results,
+            user_id=user_id,
         )
-        registered_bindings = self._prepare_result_bindings(
-            step_two=step_two,
-            executed_results=final_mcp_results,
-            final_board_state=final_board_state,
-        )
-        self._attach_bindings_to_commands(final_board_commands, registered_bindings)
-        self.board_memory.register_result_bindings(registered_bindings)
+        if not final_mcp_results:
+            final_board_commands: List[Dict[str, Any]] = []
+            final_board_state = normalized_board_state
+            registered_bindings: List[Dict[str, Any]] = []
+        else:
+            final_board_commands = step_two.get("board_commands", [])
+            if self._viewer_prefers_popup_only(auto_open_viewer):
+                final_board_commands = [
+                    command
+                    for command in final_board_commands
+                    if self._clean_text(command.get("action")) not in {"create", "click"}
+                ]
+            final_board_state = self.board_memory.apply_commands(
+                normalized_board_state,
+                final_board_commands,
+            )
+            registered_bindings = self._prepare_result_bindings(
+                step_two=step_two,
+                executed_results=final_mcp_results,
+                final_board_state=final_board_state,
+            )
+            self._attach_bindings_to_commands(final_board_commands, registered_bindings)
+            if self._viewer_prefers_popup_only(auto_open_viewer):
+                registered_bindings = []
+            self.board_memory.register_result_bindings(registered_bindings)
+
         persisted_board_state = self.connections_service.save_board_state_for_user(
             user_id,
             final_board_state,
@@ -762,6 +1550,7 @@ class SemiAgentService:
             "board_commands": final_board_commands,
             "board_state": final_board_state,
             "persisted_board_state": persisted_board_state,
+            "auto_open_viewer": auto_open_viewer,
             "result_bindings": [
                 {
                     "object_name": binding.get("object_name"),
@@ -1051,23 +1840,29 @@ class SemiAgentService:
         fallback_prompt: str = "",
         user_id: str = "anonymous",
         board_state: Dict[str, Any] | None = None,
+        location: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         user_context = self.user_tracker.resolve(user_id=user_id)
         effective_user_id = user_context["resolved_user_id"]
         clean_mcp_id = self._clean_text(mcp_id)
         clean_tool_name = self._normalize_tool_name(tool_name)
+        arguments = self._clean_jsonish(arguments) if isinstance(arguments, dict) else {}
+        tool_prompt = self._clean_text(arguments.get("prompt") or fallback_prompt)
         if not clean_mcp_id:
             clean_mcp_id = self._infer_mcp_id_from_tool_name(clean_tool_name)
         supported_tools = self._supported_mcp_tools().get(clean_mcp_id)
         if supported_tools is None:
             raise ValueError(f"Unsupported MCP '{clean_mcp_id}'.")
+        if not clean_tool_name:
+            clean_tool_name = self._infer_default_tool_for_mcp(
+                mcp_id=clean_mcp_id,
+                prompt=tool_prompt,
+                arguments=arguments,
+            )
         if not clean_tool_name and len(supported_tools) == 1:
             clean_tool_name = sorted(supported_tools)[0]
         if clean_tool_name not in supported_tools:
             raise ValueError(f"Unsupported tool '{clean_tool_name}'.")
-
-        arguments = self._clean_jsonish(arguments) if isinstance(arguments, dict) else {}
-        tool_prompt = self._clean_text(arguments.get("prompt") or fallback_prompt)
         if not tool_prompt:
             raise ValueError("prompt required for MCP invocation")
 
@@ -1078,6 +1873,7 @@ class SemiAgentService:
             arguments=arguments,
             user_id=effective_user_id,
             board_state=board_state,
+            location=location,
         )
         summary = self._summarize_mcp_result(clean_mcp_id, clean_tool_name, result)
         return {
@@ -1237,6 +2033,7 @@ class SemiAgentService:
         user_id: str,
         session_id: str,
         reasoning_provider: str,
+        location: Dict[str, Any] | None = None,
     ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         current_results = list(mcp_results)
         current_history = list(chain_history)
@@ -1278,6 +2075,7 @@ class SemiAgentService:
                 prompt,
                 user_id=user_id,
                 board_state=board_state,
+                location=location,
             )
             if not extra_results:
                 break
@@ -1295,6 +2093,7 @@ class SemiAgentService:
         *,
         user_id: str,
         board_state: Dict[str, Any] | None,
+        location: Dict[str, Any] | None = None,
     ) -> List[Dict[str, Any]]:
         executed: List[Dict[str, Any]] = []
         seen_call_ids: set[str] = set()
@@ -1319,6 +2118,7 @@ class SemiAgentService:
                     fallback_prompt=fallback_prompt,
                     user_id=user_id,
                     board_state=board_state,
+                    location=location,
                 )
             except Exception as exc:
                 payload = {
@@ -1344,6 +2144,7 @@ class SemiAgentService:
         arguments: Dict[str, Any],
         user_id: str,
         board_state: Dict[str, Any] | None,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         if mcp_id == "gnn_actions":
             return self._dispatch_gnn_tool(tool_name, prompt, user_id=user_id)
@@ -1354,14 +2155,31 @@ class SemiAgentService:
                 arguments=arguments,
                 user_id=user_id,
                 board_state=board_state,
+                location=location,
             )
         if mcp_id == "phone_command":
             return self._dispatch_phone_command_tool(
                 tool_name=tool_name,
                 prompt=prompt,
             )
+        if mcp_id == "weather":
+            return self._dispatch_weather_tool(
+                tool_name=tool_name,
+                prompt=prompt,
+                arguments=arguments,
+                user_id=user_id,
+                location=location,
+            )
         if mcp_id == "meetup":
             return self._dispatch_meetup_tool(
+                tool_name=tool_name,
+                prompt=prompt,
+                arguments=arguments,
+                user_id=user_id,
+                location=location,
+            )
+        if mcp_id == "calendar":
+            return self._dispatch_calendar_tool(
                 tool_name=tool_name,
                 prompt=prompt,
                 arguments=arguments,
@@ -1393,6 +2211,7 @@ class SemiAgentService:
         arguments: Dict[str, Any],
         user_id: str,
         board_state: Dict[str, Any] | None,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         if tool_name == "update_profile":
             return self.connections_service.update_profile_from_prompt(
@@ -1403,13 +2222,52 @@ class SemiAgentService:
                 board_state=board_state,
             )
         if tool_name == "find_connection":
-            return self.connections_service.find_connection_for_prompt(
+            result = self.connections_service.find_connection_for_prompt(
                 agent_user_id=user_id,
                 prompt=prompt,
                 limit=int(arguments.get("limit") or 1),
                 board_state=board_state,
             )
+            if (
+                isinstance(result, dict)
+                and isinstance(result.get("user"), dict)
+                and self._looks_like_outdoor_social_request(prompt)
+            ):
+                try:
+                    outing = self.meetup_service.suggest_outing_for_match(
+                        agent_user_id=user_id,
+                        prompt=prompt,
+                        match_user_id=result["user"]["user_id"],
+                        viewer_location=location,
+                    )
+                except Exception:
+                    outing = None
+                if isinstance(outing, dict):
+                    result.update(outing)
+            return result
         raise ValueError(f"Unsupported tool '{tool_name}'.")
+
+    def _dispatch_weather_tool(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+        user_id: str,
+        location: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if tool_name != "get_current_weather":
+            raise ValueError(f"Unsupported tool '{tool_name}'.")
+        argument_location = (
+            arguments.get("location") if isinstance(arguments.get("location"), dict) else None
+        )
+        timezone_name = self._clean_text(arguments.get("timezone"))
+        return self.weather_agent_service.get_current_weather_for_prompt(
+            agent_user_id=user_id,
+            prompt=prompt,
+            location=argument_location or location,
+            timezone_name=timezone_name or None,
+        )
 
     def _dispatch_phone_command_tool(
         self,
@@ -1442,21 +2300,88 @@ class SemiAgentService:
         prompt: str,
         arguments: Dict[str, Any],
         user_id: str,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
-        if tool_name != "propose_friend_meetup":
+        if tool_name == "propose_friend_meetup":
+            friend_name = self._clean_text(arguments.get("friend_name"))
+            return self.meetup_service.propose_friend_meetup_for_prompt(
+                agent_user_id=user_id,
+                prompt=prompt,
+                friend_name=friend_name,
+            )
+        if tool_name == "suggest_outdoor_place":
+            argument_location = (
+                arguments.get("location") if isinstance(arguments.get("location"), dict) else None
+            )
+            return self.meetup_service.suggest_outdoor_place_for_prompt(
+                agent_user_id=user_id,
+                prompt=prompt,
+                viewer_location=argument_location or location,
+            )
+        raise ValueError(f"Unsupported tool '{tool_name}'.")
+
+    def _dispatch_calendar_tool(
+        self,
+        *,
+        tool_name: str,
+        prompt: str,
+        arguments: Dict[str, Any],
+        user_id: str,
+    ) -> Dict[str, Any]:
+        if tool_name != "create_meetup_reminder":
             raise ValueError(f"Unsupported tool '{tool_name}'.")
-        friend_name = self._clean_text(arguments.get("friend_name"))
-        return self.meetup_service.propose_friend_meetup_for_prompt(
-            agent_user_id=user_id,
-            prompt=prompt,
-            friend_name=friend_name,
+
+        target_user_id = self._clean_text(arguments.get("user_id") or user_id)
+        title = self._clean_text(arguments.get("title"))
+        start_time = self._clean_text(arguments.get("start_time"))
+        end_time = self._clean_text(arguments.get("end_time"))
+        location = self._clean_text(arguments.get("location"))
+        description = self._clean_text(arguments.get("description")) or "Meetup planned through HelloAgain"
+        reminder_minutes = int(arguments.get("reminder_minutes") or 30)
+
+        if not title or not start_time or not end_time or not location:
+            raise ValueError("Accepted meetup reminder requires title, start_time, end_time, and location.")
+
+        result = self.calendar_service.create_meetup_reminder(
+            user_id=target_user_id,
+            title=title,
+            start_time=start_time,
+            end_time=end_time,
+            location=location,
+            description=description,
+            reminder_minutes=reminder_minutes,
         )
+        speech_text = (
+            "Добавих срещата в календарът ти."
+            if result.get("success")
+            else "Срещата бе приета,но календарът не работи в момента."
+        )
+        return {
+            **result,
+            "message": result.get("message") or speech_text,
+            "speech_text": speech_text,
+            "title": title,
+            "location": location,
+            "start_time": start_time,
+            "end_time": end_time,
+            "prompt": prompt,
+        }
 
     def _summarize_mcp_result(self, mcp_id: str, tool_name: str, result: Dict[str, Any]) -> str:
         if mcp_id == "connections":
             if tool_name == "find_connection":
                 user = result.get("user") if isinstance(result.get("user"), dict) else {}
+                outing = (
+                    result.get("outing")
+                    if isinstance(result.get("outing"), dict)
+                    else result.get("suggestion")
+                    if isinstance(result.get("suggestion"), dict)
+                    else {}
+                )
                 display_name = self._clean_text(user.get("display_name") or user.get("name"))
+                place_name = self._clean_text(outing.get("place_name"))
+                if display_name and place_name:
+                    return f"Found {display_name} and a place to go: {place_name}."
                 if display_name:
                     return f"Found a close connection match: {display_name}."
                 return self._clean_text(result.get("message")) or "Connection search finished."
@@ -1471,8 +2396,16 @@ class SemiAgentService:
             if launch_prompt:
                 return f"Prepared the phone command handoff for {launch_prompt}."
             return self._clean_text(result.get("message")) or "Phone command handoff is ready."
+        if mcp_id == "weather":
+            weather = result.get("weather") if isinstance(result.get("weather"), dict) else {}
+            summary = self._clean_text(weather.get("summary"))
+            if summary:
+                return f"Weather ready: {summary}"
+            return self._clean_text(result.get("message")) or "Weather is ready."
         if mcp_id == "meetup":
             invite = result.get("invite") if isinstance(result.get("invite"), dict) else {}
+            outing = result.get("outing") if isinstance(result.get("outing"), dict) else {}
+            search_location = result.get("search_location") if isinstance(result.get("search_location"), dict) else {}
             friend_name = self._clean_text(
                 result.get("friend_name")
                 or invite.get("invited_display_name")
@@ -1481,9 +2414,25 @@ class SemiAgentService:
             place_name = self._clean_text(invite.get("place_name"))
             if friend_name and place_name:
                 return f"Planned a meetup with {friend_name} at {place_name}."
+            if tool_name == "suggest_outdoor_place":
+                place_name = self._clean_text(outing.get("place_name"))
+                location_label = self._clean_text(
+                    search_location.get("label") or outing.get("location_label")
+                )
+                if place_name and location_label:
+                    return f"Found an outdoor place in {location_label}: {place_name}."
+                if place_name:
+                    return f"Found an outdoor place: {place_name}."
             if friend_name:
                 return f"Prepared a meetup proposal with {friend_name}."
             return self._clean_text(result.get("message")) or "Meetup planning finished."
+        if mcp_id == "calendar":
+            if result.get("success"):
+                return "Added the accepted meetup to Google Calendar."
+            error_code = self._clean_text(result.get("error"))
+            if error_code == "google_calendar_not_connected":
+                return "Accepted meetup could not be added because Google Calendar is not connected."
+            return self._clean_text(result.get("message")) or "Calendar reminder failed."
         if tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             chosen_name = self._clean_text(chosen.get("name"))
@@ -1678,7 +2627,36 @@ class SemiAgentService:
                 **meetup_viewer,
             }
 
+        outing_viewer = self._extract_outing_suggestion_viewer(
+            object_payload=object_payload,
+            binding=binding,
+        )
+        if outing_viewer is not None:
+            return {
+                "title": self._clean_text(outing_viewer.get("title")) or default_title,
+                "summary": self._clean_text(outing_viewer.get("summary")) or default_summary,
+                "memory_type": binding.get("memory_type"),
+                "linked_call_ids": binding.get("linked_call_ids", []),
+                "payload": default_payload,
+                **outing_viewer,
+            }
+
+        weather_viewer = self._extract_weather_viewer(
+            object_payload=object_payload,
+            binding=binding,
+        )
+        if weather_viewer is not None:
+            return {
+                "title": self._clean_text(weather_viewer.get("title")) or default_title,
+                "summary": self._clean_text(weather_viewer.get("summary")) or default_summary,
+                "memory_type": binding.get("memory_type"),
+                "linked_call_ids": binding.get("linked_call_ids", []),
+                "payload": default_payload,
+                **weather_viewer,
+            }
+
         return {
+            "widget_type": "summary_only",
             "title": default_title,
             "summary": default_summary,
             "memory_type": binding.get("memory_type"),
@@ -1845,6 +2823,124 @@ class SemiAgentService:
             "notification": notification,
             "friend_name": friend_name,
         }
+
+    def _extract_outing_suggestion_viewer(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        selected_result = self._select_linked_widget_result(
+            object_payload=object_payload,
+            binding=binding,
+            widget_type="outing_suggestion",
+            kind="outing_suggestion",
+        )
+        if not isinstance(selected_result, dict):
+            return None
+        outing = (
+            selected_result.get("outing")
+            if isinstance(selected_result.get("outing"), dict)
+            else {}
+        )
+        user = (
+            selected_result.get("user")
+            if isinstance(selected_result.get("user"), dict)
+            else {}
+        )
+        if not outing:
+            return None
+        friend_name = self._clean_text(user.get("display_name") or user.get("name"))
+        place_name = self._clean_text(outing.get("place_name"))
+        location_label = self._clean_text(
+            (selected_result.get("search_location") or {}).get("label")
+            if isinstance(selected_result.get("search_location"), dict)
+            else outing.get("location_label")
+        ) or self._clean_text(outing.get("location_label"))
+        when = self._clean_text(
+            outing.get("recommended_when_bg")
+            or outing.get("meeting_when_bg")
+            or outing.get("recommended_time")
+        )
+        summary_bits = [bit for bit in (friend_name, place_name, when, location_label) if bit]
+        return {
+            "widget_type": "outing_suggestion",
+            "title": self._clean_text(f"Навън с {friend_name}") if friend_name else "Предложение за излизане",
+            "summary": " | ".join(summary_bits),
+            "user": user,
+            "outing": outing,
+        }
+
+    def _extract_weather_viewer(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        selected_result = self._select_linked_widget_result(
+            object_payload=object_payload,
+            binding=binding,
+            widget_type="weather_snapshot",
+            kind="weather_snapshot",
+        )
+        if not isinstance(selected_result, dict):
+            return None
+        weather = (
+            selected_result.get("weather")
+            if isinstance(selected_result.get("weather"), dict)
+            else {}
+        )
+        if not weather:
+            return None
+        return {
+            "widget_type": "weather_snapshot",
+            "title": self._clean_text(selected_result.get("title")) or "Времето сега",
+            "summary": self._clean_text(selected_result.get("summary") or weather.get("summary")),
+            "surface_preference": self._clean_text(
+                selected_result.get("surface_preference")
+            ) or "popup_only",
+            "weather": weather,
+        }
+
+    def _select_linked_widget_result(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+        widget_type: str,
+        kind: str,
+    ) -> Dict[str, Any] | None:
+        candidates = [
+            object_payload.get("extraData"),
+            object_payload.get("extra_data"),
+        ]
+        payload = binding.get("payload") if isinstance(binding.get("payload"), dict) else {}
+        candidates.append(payload.get("object") if isinstance(payload.get("object"), dict) else {})
+        for linked in payload.get("linked_results", []):
+            if not isinstance(linked, dict):
+                continue
+            result = linked.get("result") if isinstance(linked.get("result"), dict) else {}
+            candidates.append(result)
+            candidates.append(result.get("board_object"))
+
+        selected_result: Dict[str, Any] | None = None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            extra_data = (
+                candidate.get("extra_data")
+                if isinstance(candidate.get("extra_data"), dict)
+                else candidate.get("extraData")
+                if isinstance(candidate.get("extraData"), dict)
+                else candidate
+            )
+            candidate_kind = self._clean_text(extra_data.get("kind")).lower()
+            candidate_widget_type = self._clean_text(candidate.get("widget_type")).lower()
+            if candidate_kind != kind and candidate_widget_type != widget_type:
+                continue
+            if selected_result is None or candidate_widget_type == widget_type:
+                selected_result = candidate
+        return selected_result
 
     def _build_phone_command_launch_metadata(self, prompt: str) -> Dict[str, Any]:
         clean_prompt = self._clean_text(prompt)
@@ -2520,6 +3616,153 @@ class SemiAgentService:
         except Exception:
             return fallback
 
+    def _normalize_location_payload(
+        self,
+        payload: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        try:
+            lat = float(payload.get("lat"))
+            lng = float(payload.get("lng"))
+        except (TypeError, ValueError):
+            return {}
+        result = {"lat": lat, "lng": lng}
+        timezone_name = self._clean_text(payload.get("timezone"))
+        if timezone_name:
+            result["timezone"] = timezone_name
+        return result
+
+    def _viewer_prefers_popup_only(self, viewer: Dict[str, Any] | None) -> bool:
+        if not isinstance(viewer, dict):
+            return False
+        return self._clean_text(viewer.get("surface_preference")).lower() == "popup_only"
+
+    def _extract_auto_open_viewer(
+        self,
+        results: List[Dict[str, Any]],
+        *,
+        user_id: str,
+    ) -> Dict[str, Any] | None:
+        for item in results:
+            viewer = self._direct_viewer_from_result(item, user_id=user_id)
+            if isinstance(viewer, dict):
+                return viewer
+        return None
+
+    def _direct_viewer_from_result(
+        self,
+        item: Dict[str, Any],
+        *,
+        user_id: str,
+    ) -> Dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        widget_type = self._clean_text(result.get("widget_type"))
+        if widget_type in {
+            "phone_command_launcher",
+            "meetup_invite",
+            "weather_snapshot",
+            "outing_suggestion",
+        }:
+            return deepcopy(result)
+        target_user_id = None
+        user_payload = result.get("user") if isinstance(result.get("user"), dict) else {}
+        if user_payload.get("user_id") is not None:
+            try:
+                target_user_id = int(user_payload.get("user_id"))
+            except (TypeError, ValueError):
+                target_user_id = None
+        if target_user_id is None:
+            return None
+        try:
+            return self.connections_service.build_user_widget_payload(
+                agent_user_id=user_id,
+                target_user_id=target_user_id,
+            )
+        except Exception:
+            return None
+
+    def _looks_like_direct_weather_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        weather_markers = (
+            "weather",
+            "forecast",
+            "temperature",
+            "rain",
+            "sunny",
+            "cloudy",
+            "времето",
+            "температура",
+            "вали",
+            "дъжд",
+            "слънчево",
+            "облачно",
+        )
+        return any(marker in lowered for marker in weather_markers)
+
+    def _looks_like_outdoor_social_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        outdoor_markers = (
+            "outside",
+            "outdoors",
+            "go outside",
+            "place to go",
+            "hang out",
+            "park",
+            "навън",
+            "на открито",
+            "да изляза",
+            "да излезем",
+            "разходка",
+            "парк",
+        )
+        social_markers = (
+            "person",
+            "someone",
+            "with who",
+            "with whom",
+            "friend",
+            "човек",
+            "някого",
+            "с кого",
+            "приятел",
+        )
+        return any(marker in lowered for marker in outdoor_markers) and any(
+            marker in lowered for marker in social_markers
+        )
+
+    def _looks_like_outdoor_place_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        outdoor_markers = (
+            "outside",
+            "outdoors",
+            "go outside",
+            "park",
+            "навън",
+            "на открито",
+            "разходка",
+            "парк",
+        )
+        place_markers = (
+            "place to go",
+            "where can i go",
+            "where should i go",
+            "recommend a place",
+            "find me a place",
+            "spot",
+            "place",
+            "where",
+            "къде",
+            "място",
+            "препоръчай",
+            "предложи",
+        )
+        return any(marker in lowered for marker in outdoor_markers) and any(
+            marker in lowered for marker in place_markers
+        )
+
     def _default_step_one_plan(self, prompt: str) -> Dict[str, Any]:
         request_kind = self._default_request_kind(prompt)
         return {
@@ -2568,6 +3811,18 @@ class SemiAgentService:
         }
 
     def _default_mcp_calls(self, prompt: str, request_kind: str) -> List[Dict[str, Any]]:
+        if self._looks_like_direct_weather_request(prompt):
+            return [
+                {
+                    "call_id": "weather.get_current_weather.1",
+                    "mcp_id": "weather",
+                    "tool_name": "get_current_weather",
+                    "arguments": {
+                        "prompt": prompt,
+                    },
+                    "why": "The user is asking directly about the weather.",
+                }
+            ]
         friend_name = self._extract_bulgarian_meetup_friend_name(prompt)
         if friend_name:
             return [
@@ -2580,6 +3835,18 @@ class SemiAgentService:
                         "friend_name": friend_name,
                     },
                     "why": "The user wants to go out with one existing friend by name.",
+                }
+            ]
+        if self._looks_like_outdoor_place_request(prompt) and not self._looks_like_outdoor_social_request(prompt):
+            return [
+                {
+                    "call_id": "meetup.suggest_outdoor_place.1",
+                    "mcp_id": "meetup",
+                    "tool_name": "suggest_outdoor_place",
+                    "arguments": {
+                        "prompt": prompt,
+                    },
+                    "why": "The user wants an outdoor place recommendation based on explicit city or available location.",
                 }
             ]
         return []
@@ -2741,14 +4008,19 @@ class SemiAgentService:
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
 
         if mcp_id == "connections" and tool_name == "find_connection":
+            outing = result.get("outing") if isinstance(result.get("outing"), dict) else {}
             user = result.get("user") if isinstance(result.get("user"), dict) else {}
-            candidate = self._clean_text(user.get("display_name") or user.get("name"))
-            if candidate:
-                return self._clip_focus_title(candidate)
+            friend_name = self._clean_text(user.get("display_name") or user.get("name"))
+            if outing and friend_name:
+                return self._clip_focus_title(f"Навън с {friend_name}")
+            if friend_name:
+                return self._clip_focus_title(friend_name)
         elif mcp_id == "connections" and tool_name == "update_profile":
             return "Profile Update"
         elif mcp_id == "phone_command" and tool_name == "open_phone_command":
             return "Phone Command"
+        elif mcp_id == "weather" and tool_name == "get_current_weather":
+            return "Времето сега"
         elif mcp_id == "meetup" and tool_name == "propose_friend_meetup":
             friend_name = self._clean_text(result.get("friend_name"))
             if friend_name:
@@ -2757,6 +4029,23 @@ class SemiAgentService:
             candidate = self._clean_text(invite.get("place_name"))
             if candidate:
                 return self._clip_focus_title(candidate)
+        elif mcp_id == "calendar" and tool_name == "create_meetup_reminder":
+            title = self._clean_text(result.get("title"))
+            if title:
+                return self._clip_focus_title(title)
+            return "Calendar Reminder"
+        elif mcp_id == "meetup" and tool_name == "suggest_outdoor_place":
+            outing = result.get("outing") if isinstance(result.get("outing"), dict) else {}
+            location_label = self._clean_text(
+                (result.get("search_location") or {}).get("label")
+                if isinstance(result.get("search_location"), dict)
+                else outing.get("location_label")
+            )
+            candidate = self._clean_text(outing.get("place_name"))
+            if candidate:
+                return self._clip_focus_title(candidate)
+            if location_label:
+                return self._clip_focus_title(f"Навън в {location_label}")
         elif tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
             candidate = self._clean_text(chosen.get("name"))

@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.accounts.services import profile_for_token
+from services.google_calendar_service import GoogleCalendarService
 
 from .agent_service import (
     MeetupRequestError,
@@ -22,6 +23,9 @@ from .agent_service import (
 )
 from .models import MeetupInvite, MeetupNotification
 from .services import get_best_meetup_spot, get_central_point, get_ranked_meetup_spots
+
+
+calendar_service = GoogleCalendarService()
 
 
 def _json_ok(data: dict, status_code: int = 200) -> JsonResponse:
@@ -327,6 +331,7 @@ def respond_meetup_invite(request, invite_id: int):
     close_invite_request_notifications(invite)
 
     generated_notifications = []
+    calendar_results = []
     if action == "accept":
         accepted_note = create_meetup_notification(
             recipient=invite.requester_profile,
@@ -358,6 +363,34 @@ def respond_meetup_invite(request, invite_id: int):
                 },
             )
             generated_notifications.append(notification_payload(reminder_note))
+
+        for participant, friend in (
+            (invite.requester_profile, invite.invited_profile),
+            (invite.invited_profile, invite.requester_profile),
+        ):
+            reminder_payload = calendar_service.build_meetup_reminder_payload(
+                user_id=str(participant.user_id),
+                friend_name=friend.display_name,
+                start_dt=invite.proposed_time,
+                location=invite.place_name,
+                description="Meetup planned through HelloAgain",
+                reminder_minutes=30,
+            )
+            result = calendar_service.create_meetup_reminder(**reminder_payload)
+            calendar_results.append(
+                {
+                    "user_id": str(participant.user_id),
+                    "success": bool(result.get("success")),
+                    "error": result.get("error"),
+                    "event_id": result.get("event_id"),
+                    "html_link": result.get("html_link"),
+                    "speech_text": (
+                        "Добавих срещата в календарът ти."
+                        if result.get("success")
+                        else "Срещата бе приета,но календарът не работи в момента."
+                    ),
+                }
+            )
 
     elif action == "decline":
         declined_note = create_meetup_notification(
@@ -391,5 +424,6 @@ def respond_meetup_invite(request, invite_id: int):
             "message": f"Meetup invite {action}ed.",
             "invite": invite_payload(invite, viewer.id),
             "notifications": generated_notifications,
+            "calendar_results": calendar_results,
         }
     )

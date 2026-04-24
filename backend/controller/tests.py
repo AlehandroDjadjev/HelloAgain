@@ -48,7 +48,9 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertTrue(payload["mcps"][0]["descriptor_url"].endswith("/api/agent/mcps/gnn_actions/"))
         self.assertTrue(any(item["id"] == "connections" for item in payload["mcps"]))
         self.assertTrue(any(item["id"] == "phone_command" for item in payload["mcps"]))
+        self.assertTrue(any(item["id"] == "weather" for item in payload["mcps"]))
         self.assertTrue(any(item["id"] == "meetup" for item in payload["mcps"]))
+        self.assertTrue(any(item["id"] == "calendar" for item in payload["mcps"]))
 
         descriptor = registry.load_descriptor("gnn_actions", base_url="http://localhost:8000")
         self.assertEqual(descriptor["id"], "gnn_actions")
@@ -66,11 +68,24 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertTrue(phone_command_descriptor["invoke_url"].endswith("/api/agent/mcps/phone_command/invoke/"))
         self.assertEqual(phone_command_descriptor["tools"][0]["path"], "/api/agent/mcps/phone_command/invoke/")
 
+        weather_descriptor = registry.load_descriptor("weather", base_url="http://localhost:8000")
+        self.assertEqual(weather_descriptor["id"], "weather")
+        self.assertEqual(len(weather_descriptor["tools"]), 1)
+        self.assertTrue(weather_descriptor["invoke_url"].endswith("/api/agent/mcps/weather/invoke/"))
+        self.assertEqual(weather_descriptor["tools"][0]["path"], "/api/weather/current/")
+
         meetup_descriptor = registry.load_descriptor("meetup", base_url="http://localhost:8000")
         self.assertEqual(meetup_descriptor["id"], "meetup")
-        self.assertEqual(len(meetup_descriptor["tools"]), 1)
+        self.assertEqual(len(meetup_descriptor["tools"]), 2)
         self.assertTrue(meetup_descriptor["invoke_url"].endswith("/api/agent/mcps/meetup/invoke/"))
         self.assertEqual(meetup_descriptor["tools"][0]["path"], "/api/meetup/friends/propose/")
+        self.assertEqual(meetup_descriptor["tools"][1]["name"], "suggest_outdoor_place")
+
+        calendar_descriptor = registry.load_descriptor("calendar", base_url="http://localhost:8000")
+        self.assertEqual(calendar_descriptor["id"], "calendar")
+        self.assertEqual(len(calendar_descriptor["tools"]), 1)
+        self.assertTrue(calendar_descriptor["invoke_url"].endswith("/api/agent/mcps/calendar/invoke/"))
+        self.assertEqual(calendar_descriptor["tools"][0]["path"], "/api/agent/mcps/calendar/invoke/")
 
     def test_step_one_prompt_explicitly_teaches_phone_command_tool_usage(self) -> None:
         registry = CustomMcpRegistry()
@@ -95,6 +110,8 @@ class CustomMcpRegistryTests(SimpleTestCase):
         self.assertIn("MEETUP TOOL CHOICE RULES", prompt)
         self.assertIn("meetup.propose_friend_meetup", prompt)
         self.assertIn("искам да излеза с", prompt)
+        self.assertIn("CALENDAR TOOL CHOICE RULES", prompt)
+        self.assertIn("calendar.create_meetup_reminder", prompt)
 
     def test_service_builds_tool_catalog_from_registry_descriptors(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -323,6 +340,14 @@ class NavigationPageTests(SimpleTestCase):
 
 
 class SemiAgentServiceTests(SimpleTestCase):
+    @staticmethod
+    def _stub_connections_service():
+        return SimpleNamespace(
+            save_board_state_for_user=lambda *args, **kwargs: None,
+            apply_board_commands_for_user=lambda *args, **kwargs: None,
+            build_user_widget_payload=lambda **kwargs: {},
+        )
+
     def test_opening_instant_object_returns_delete_command(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
@@ -430,6 +455,179 @@ class SemiAgentServiceTests(SimpleTestCase):
             self.assertTrue(payload["ok"])
             self.assertEqual(payload["board_state"]["objects"], [])
             self.assertIsNone(store.resolve_result_binding("result_saved"))
+
+    def test_route_request_can_choose_live_tool_with_location(self) -> None:
+        class RecordingRouterProvider:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def generate_reply_with_messages(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "live_tool",
+                            "reason": "Needs current time data.",
+                            "tool_name": "time",
+                            "location": "Tokyo",
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        router_provider = RecordingRouterProvider()
+        service = SemiAgentService(
+            router_llm_provider=router_provider,
+            connections_service=self._stub_connections_service(),
+        )
+
+        decision = service._route_request(
+            "What time is it in Tokyo?",
+            {"board": {"width": 1000, "height": 700}, "objects": []},
+        )
+
+        self.assertEqual(decision.route, "live_tool")
+        self.assertEqual(decision.tool_name, "time")
+        self.assertEqual(decision.location, "Tokyo")
+        self.assertEqual(
+            router_provider.calls[0]["response_format"]["type"],
+            "json_schema",
+        )
+
+    def test_run_direct_reasoning_bypasses_board_pipeline(self) -> None:
+        class RecordingRouterProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "direct_reasoning",
+                            "reason": "Pure explanation request.",
+                            "tool_name": None,
+                            "location": None,
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        class RecordingReasoningProvider:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def generate_reply_with_messages(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    text="Recursion is when a function solves a problem by calling itself on a smaller version.",
+                    source="reasoner",
+                    warnings=[],
+                )
+
+        class MissingTtsProvider:
+            def synthesize(self, text: str):
+                raise RuntimeError("tts unavailable")
+
+            def status(self) -> str:
+                return "unavailable: test"
+
+        class GuardQwenClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate(self, **kwargs):
+                self.calls += 1
+                raise AssertionError("Qwen should not be called for direct reasoning.")
+
+        reasoning_provider = RecordingReasoningProvider()
+        qwen_client = GuardQwenClient()
+        service = SemiAgentService(
+            qwen_client=qwen_client,
+            router_llm_provider=RecordingRouterProvider(),
+            reasoning_llm_provider=reasoning_provider,
+            tts_provider=MissingTtsProvider(),
+            connections_service=self._stub_connections_service(),
+        )
+
+        payload = service.run(
+            prompt="Explain recursion",
+            board_state={"board": {"width": 1000, "height": 700}, "objects": []},
+            largest_empty_space={"bbox": {"x": 0, "y": 0, "width": 1000, "height": 700}},
+        )
+
+        self.assertEqual(payload["route"], "direct_reasoning")
+        self.assertEqual(payload["board_commands"], [])
+        self.assertIn("Recursion is when a function", payload["speech_response"])
+        self.assertEqual(qwen_client.calls, 0)
+        self.assertEqual(len(reasoning_provider.calls), 1)
+
+    def test_start_run_live_tool_keeps_polling_contract(self) -> None:
+        class RouterProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "live_tool",
+                            "reason": "Needs current weather.",
+                            "tool_name": "weather",
+                            "location": "Sofia",
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        class SummaryProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text="It is sunny in Sofia and about 22 degrees Celsius.",
+                    source="summary",
+                    warnings=[],
+                )
+
+        class FakeWeatherService:
+            def get_current_weather(self, location: str) -> dict:
+                return {
+                    "tool_name": "weather",
+                    "location": {"name": location, "timezone": "Europe/Sofia"},
+                    "temperature_c": 22,
+                    "weather_description": "sunny",
+                    "source": "test_weather",
+                }
+
+        class MissingTtsProvider:
+            def synthesize(self, text: str):
+                raise RuntimeError("tts unavailable")
+
+            def status(self) -> str:
+                return "unavailable: test"
+
+        service = SemiAgentService(
+            router_llm_provider=RouterProvider(),
+            reasoning_llm_provider=SummaryProvider(),
+            weather_service=FakeWeatherService(),
+            tts_provider=MissingTtsProvider(),
+            connections_service=self._stub_connections_service(),
+        )
+
+        start_payload = service.start_run(
+            prompt="What's the weather in Sofia?",
+            board_state={"board": {"width": 1000, "height": 700}, "objects": []},
+            largest_empty_space={"bbox": {"x": 0, "y": 0, "width": 1000, "height": 700}},
+        )
+
+        self.assertEqual(start_payload["route"], "live_tool")
+        self.assertEqual(start_payload["whitespace_status"], "completed")
+
+        whitespace_payload = service.get_run_whitespace(start_payload["run_id"])
+        self.assertEqual(whitespace_payload["status"], "completed")
+        self.assertEqual(whitespace_payload["board_commands"], [])
+
+        speech_future = service._run_jobs[start_payload["run_id"]]["speech_future"]
+        speech_future.result(timeout=1)
+        speech_payload = service.get_run_speech(start_payload["run_id"])
+
+        self.assertEqual(speech_payload["status"], "completed")
+        self.assertIn("sunny in Sofia", speech_payload["assistant_text"])
 
     def test_default_focus_text_uses_compact_summary_title(self) -> None:
         service = SemiAgentService()
@@ -1039,6 +1237,94 @@ class SemiAgentServiceTests(SimpleTestCase):
         self.assertEqual(payload["result"]["friend_name"], "Bob")
         self.assertEqual(payload["result"]["board_object"]["extra_data"]["kind"], "meetup_invite")
 
+    def test_calendar_mcp_creates_meetup_reminder(self) -> None:
+        fake_calendar_service = SimpleNamespace(
+            create_meetup_reminder=lambda **kwargs: {
+                "success": True,
+                "event_id": "evt_123",
+                "html_link": "https://calendar.google.com/event?eid=evt_123",
+                "message": "Meetup reminder added to Google Calendar",
+            }
+        )
+        service = SemiAgentService(
+            calendar_service=fake_calendar_service,
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+        )
+
+        payload = service.invoke_mcp(
+            mcp_id="calendar",
+            tool_name="create_meetup_reminder",
+            arguments={
+                "prompt": "Add this accepted meetup to my calendar.",
+                "user_id": "12",
+                "title": "Meetup with Ivan",
+                "start_time": "2026-04-26T17:00:00+03:00",
+                "end_time": "2026-04-26T18:00:00+03:00",
+                "location": "Costa Coffee, Sofia",
+            },
+            user_id="12",
+        )
+
+        self.assertEqual(payload["tool_name"], "create_meetup_reminder")
+        self.assertTrue(payload["result"]["success"])
+        self.assertEqual(payload["summary"], "Added the accepted meetup to Google Calendar.")
+
+    def test_meetup_mcp_infers_outdoor_place_tool_and_passes_location(self) -> None:
+        calls: list[dict] = []
+
+        def _suggest_outdoor_place_for_prompt(**kwargs):
+            calls.append(kwargs)
+            return {
+                "ok": True,
+                "widget_type": "outing_suggestion",
+                "title": "Навън в Sofia",
+                "message": "Suggested an outdoor place in Sofia.",
+                "user": {},
+                "search_location": {"label": "Sofia", "source": "explicit_city"},
+                "outing": {
+                    "place_name": "South Park",
+                    "recommended_when_bg": "today at 18:00",
+                    "location_label": "Sofia",
+                },
+                "board_object": {
+                    "extra_data": {
+                        "kind": "outing_suggestion",
+                        "place_name": "South Park",
+                    }
+                },
+            }
+
+        fake_meetup_service = SimpleNamespace(
+            propose_friend_meetup_for_prompt=lambda **kwargs: {},
+            suggest_outdoor_place_for_prompt=_suggest_outdoor_place_for_prompt,
+        )
+        service = SemiAgentService(
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+            meetup_service=fake_meetup_service,
+        )
+
+        payload = service.invoke_mcp(
+            mcp_id="meetup",
+            tool_name="",
+            arguments={
+                "prompt": "find me a place to go outside in Sofia",
+            },
+            location={"lat": 42.7, "lng": 23.32},
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["tool_name"], "suggest_outdoor_place")
+        self.assertEqual(payload["result"]["widget_type"], "outing_suggestion")
+        self.assertEqual(calls[0]["viewer_location"], {"lat": 42.7, "lng": 23.32})
+
     def test_opening_meetup_object_returns_meetup_viewer(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
@@ -1388,6 +1674,18 @@ class SemiAgentServiceTests(SimpleTestCase):
 
         self.assertEqual(calls, [])
 
+    def test_default_mcp_calls_returns_outdoor_place_tool_for_location_request(self) -> None:
+        service = SemiAgentService()
+
+        calls = service._default_mcp_calls(
+            "find me a place to go outside in Sofia",
+            "mechanical",
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["mcp_id"], "meetup")
+        self.assertEqual(calls[0]["tool_name"], "suggest_outdoor_place")
+
 
 class GnnParserFallbackTests(SimpleTestCase):
     def test_parser_uses_openai_before_qwen_for_json_steps(self) -> None:
@@ -1664,18 +1962,148 @@ class AuthenticatedIdentityFlowTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["user_id"], str(viewer_profile.user_id))
 
-    def test_agent_run_start_surfaces_reasoning_dependency_failure(self) -> None:
-        with patch("controller.views.semi_agent_service.start_run") as mock_start_run:
-            mock_start_run.side_effect = RuntimeError(
-                "OpenAI request failed: 429 You exceeded your current quota."
+
+class SemiAgentWeatherFlowTests(SimpleTestCase):
+    def test_weather_mcp_infers_single_tool_and_returns_snapshot(self) -> None:
+        fake_weather_service = SimpleNamespace(
+            get_current_weather_for_prompt=lambda **kwargs: {
+                "ok": True,
+                "widget_type": "weather_snapshot",
+                "title": "Времето сега",
+                "summary": "Слънчево, 24°C",
+                "surface_preference": "popup_only",
+                "weather": {
+                    "label": "Слънчево",
+                    "summary": "Слънчево, 24°C",
+                    "icon_key": "sun",
+                    "advice": "Подходящо е за кратка разходка.",
+                },
+            }
+        )
+        service = SemiAgentService(
+            weather_service=fake_weather_service,
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+        )
+
+        payload = service.invoke_mcp(
+            mcp_id="weather",
+            tool_name="",
+            arguments={
+                "prompt": "Какво е времето навън?",
+                "location": {"lat": 42.6977, "lng": 23.3219},
+            },
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["tool_name"], "get_current_weather")
+        self.assertEqual(payload["result"]["widget_type"], "weather_snapshot")
+        self.assertEqual(payload["result"]["surface_preference"], "popup_only")
+
+    def test_opening_weather_object_returns_weather_viewer_without_raw_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            service = SemiAgentService(
+                board_memory=store,
+                connections_service=SimpleNamespace(
+                    save_board_state_for_user=lambda *args, **kwargs: None,
+                    apply_board_commands_for_user=lambda *args, **kwargs: None,
+                    build_user_widget_payload=lambda **kwargs: {},
+                ),
             )
+            store.register_result_bindings(
+                [
+                    {
+                        "result_id": "result_weather",
+                        "object_name": "weather_now",
+                        "memory_type": "memory",
+                        "delete_after_click": False,
+                        "result_title": "Времето сега",
+                        "result_summary": "Слънчево, 24°C",
+                        "payload": {
+                            "linked_results": [
+                                {
+                                    "result": {
+                                        "widget_type": "weather_snapshot",
+                                        "title": "Времето сега",
+                                        "summary": "Слънчево, 24°C",
+                                        "surface_preference": "popup_only",
+                                        "weather": {
+                                            "label": "Слънчево",
+                                            "summary": "Слънчево, 24°C",
+                                            "icon_key": "sun",
+                                            "advice": "Подходящо е за кратка разходка.",
+                                        },
+                                        "board_object": {
+                                            "extra_data": {
+                                                "kind": "weather_snapshot",
+                                            }
+                                        },
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                ]
+            )
+
+            payload = service.open_board_object(
+                object_payload={
+                    "name": "weather_now",
+                    "resultId": "result_weather",
+                    "memoryType": "memory",
+                    "deleteAfterClick": False,
+                    "extraData": {"kind": "weather_snapshot"},
+                }
+            )
+
+            self.assertTrue(payload["found"])
+            self.assertEqual(payload["viewer"]["widget_type"], "weather_snapshot")
+            self.assertNotIn("payload", payload["viewer"].get("weather", {}))
+
+
+class WeatherEndpointTests(SimpleTestCase):
+    def test_weather_endpoint_uses_explicit_location(self) -> None:
+        with patch("weather.views.get_current_weather_snapshot") as mock_weather:
+            mock_weather.return_value = {
+                "widget_type": "weather_snapshot",
+                "title": "Времето сега",
+                "summary": "Ясно, 22°C",
+                "weather": {"label": "Ясно"},
+            }
+
+            response = self.client.post(
+                "/api/weather/current/",
+                data=json.dumps(
+                    {
+                        "location": {"lat": 42.6977, "lng": 23.3219},
+                        "timezone": "Europe/Sofia",
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        _, kwargs = mock_weather.call_args
+        self.assertEqual(kwargs["lat"], 42.6977)
+        self.assertEqual(kwargs["lng"], 23.3219)
+        self.assertEqual(kwargs["timezone_name"], "Europe/Sofia")
+
+    def test_agent_run_start_forwards_location_payload(self) -> None:
+        with patch("controller.views.semi_agent_service.start_run") as mock_start_run:
+            mock_start_run.return_value = {"ok": True, "run_id": "run_weather"}
 
             response = self.client.post(
                 "/api/agent/run/start/",
                 data=json.dumps(
                     {
-                        "prompt": "Find someone to talk to.",
-                        "session_id": "session_1",
+                        "prompt": "Какво е времето?",
+                        "user_id": "guest_weather",
+                        "session_id": "session_weather",
+                        "location": {"lat": 42.7, "lng": 23.32},
                         "board_state": {"board": {"width": 800, "height": 600}, "objects": []},
                         "largest_empty_space": {
                             "bbox": {"x": 0, "y": 0, "width": 800, "height": 600},
@@ -1690,3 +2118,6 @@ class AuthenticatedIdentityFlowTests(TestCase):
         self.assertIn("OpenAI request failed: 429", payload["detail"])
         self.assertIn("action_required", payload)
         self.assertIn("OPENAI_LLM_API_KEY", payload["action_required"])
+        self.assertEqual(response.status_code, 200)
+        _, kwargs = mock_start_run.call_args
+        self.assertEqual(kwargs["location"], {"lat": 42.7, "lng": 23.32})

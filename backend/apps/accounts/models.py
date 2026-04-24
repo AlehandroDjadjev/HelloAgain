@@ -365,3 +365,29 @@ class RecommendationActivity(models.Model):
 
     def __str__(self):
         return f"{self.actor_profile} {self.event_type} {self.target_profile or ''}".strip()
+
+
+class GoogleCalendarConnection(models.Model):
+    profile = models.OneToOneField(
+        AccountProfile,
+        on_delete=models.CASCADE,
+        related_name="google_calendar_connection",
+    )
+    google_email = models.EmailField(blank=True)
+    access_token = models.TextField(blank=True)
+    refresh_token = models.TextField(blank=True)
+    token_uri = models.URLField(default="https://oauth2.googleapis.com/token")
+    scopes = models.JSONField(default=list, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at", "-id"]
+
+    def __str__(self):
+        return self.google_email or f"Google Calendar connection for {self.profile}"
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self.refresh_token or self.access_token)

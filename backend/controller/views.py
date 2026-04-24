@@ -269,6 +269,7 @@ def agent_mcp_invoke_view(request: HttpRequest, mcp_id: str):
             fallback_prompt=fallback_prompt,
             user_id=_effective_user_id(request, payload),
             board_state=payload.get("board_state") if isinstance(payload.get("board_state"), dict) else {},
+            location=payload.get("location") if isinstance(payload.get("location"), dict) else {},
         )
     except ValueError as exc:
         return JsonResponse({"detail": str(exc)}, status=400)
@@ -356,6 +357,7 @@ def agent_run_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
+            location=payload.get("location") if isinstance(payload.get("location"), dict) else {},
             user_id=_effective_user_id(request, payload),
             session_id=str(payload.get("session_id") or "default_session"),
             reasoning_provider=str(payload.get("reasoning_provider") or "openai"),
@@ -392,6 +394,7 @@ def agent_run_start_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
+            location=payload.get("location") if isinstance(payload.get("location"), dict) else {},
             user_id=_effective_user_id(request, payload),
             session_id=str(payload.get("session_id") or "default_session"),
             reasoning_provider=str(payload.get("reasoning_provider") or "openai"),

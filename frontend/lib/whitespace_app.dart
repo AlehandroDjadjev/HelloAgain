@@ -6,6 +6,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -1196,6 +1197,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   final TextEditingController _promptController = TextEditingController();
   late final String _sessionId;
   _ActiveUserPopup? _activeUserPopup;
+  Map<String, dynamic>? _cachedLocationPayload;
   String _lastSpeech =
       'The board is ready for the whitespace conversation pipeline.';
   String _statusText = 'Loading saved board memory...';
@@ -1288,43 +1290,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       final viewer = Map<String, dynamic>.from(
         payload['viewer'] as Map? ?? const {},
       );
-      if (mounted && viewer.isNotEmpty) {
-        final widgetType = (viewer['widget_type'] ?? '').toString();
-        if (widgetType == 'user_connection') {
-          setState(() {
-            _activeUserPopup = _ActiveUserPopup(
-              objectName: object.name,
-              viewer: viewer,
-            );
-          });
-        } else if (widgetType == 'phone_command_launcher') {
-          final prompt = (viewer['prompt'] ?? '').toString().trim();
-          final rawAutoRun = viewer['auto_run_on_open'];
-          final autoRunOnOpen = rawAutoRun is bool
-              ? rawAutoRun
-              : rawAutoRun?.toString().trim().toLowerCase() != 'false';
-          if (prompt.isNotEmpty) {
-            await Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => NavigationLauncherScreen(
-                  initialPrompt: prompt,
-                  autoRunOnOpen: autoRunOnOpen,
-                ),
-              ),
-            );
-          } else {
-            await showDialog<void>(
-              context: context,
-              builder: (context) => AgentResultDialog(viewer: viewer),
-            );
-          }
-        } else {
-          await showDialog<void>(
-            context: context,
-            builder: (context) => AgentResultDialog(viewer: viewer),
-          );
-        }
-      }
+      await _presentViewer(viewer, objectName: object.name);
       if (!mounted) return;
       setState(() {
         _lastSpeech = (payload['speech_response'] ?? _lastSpeech).toString();
@@ -1565,6 +1531,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     });
 
     try {
+      final location = await _maybeResolveCurrentLocationPayload(cleanMessage);
       final startPayload = await _backendClient.startAgentRun(
         prompt: cleanMessage,
         boardState: _sceneController.exportStateSnapshot(),
@@ -1572,6 +1539,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         userId: widget.userId,
         sessionId: _sessionId,
         token: widget.accountToken,
+        location: location,
       );
 
       final runId = (startPayload['run_id'] ?? '').toString();
@@ -1693,6 +1661,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       }
 
       await _applyCommands(payload['board_commands']);
+      final autoOpenViewer = Map<String, dynamic>.from(
+        payload['auto_open_viewer'] as Map? ?? const {},
+      );
       if (!mounted) return;
       setState(() {
         _whitespaceReady = true;
@@ -1700,8 +1671,121 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
             ? _readStatusText(payload)
             : 'Whitespace actions are ready. Waiting for the speech response...';
       });
+      if (autoOpenViewer.isNotEmpty) {
+        await _presentViewer(autoOpenViewer, automated: true);
+      }
       return;
     }
+  }
+
+  Future<Map<String, dynamic>?> _maybeResolveCurrentLocationPayload(
+    String prompt,
+  ) async {
+    if (!_promptNeedsPreciseLocation(prompt)) {
+      return null;
+    }
+    if (_cachedLocationPayload != null) {
+      return _cachedLocationPayload;
+    }
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        return null;
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return null;
+      }
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.medium,
+        ),
+      );
+      _cachedLocationPayload = <String, dynamic>{
+        'lat': position.latitude,
+        'lng': position.longitude,
+        'timezone': DateTime.now().timeZoneName,
+      };
+      return _cachedLocationPayload;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _promptNeedsPreciseLocation(String prompt) {
+    final lowered = prompt.toLowerCase();
+    const markers = <String>[
+      'weather',
+      'forecast',
+      'temperature',
+      'rain',
+      'sunny',
+      'cloudy',
+      'outside',
+      'outdoors',
+      'place to go',
+      'go outside',
+      'park',
+      'времето',
+      'температура',
+      'дъжд',
+      'слънчево',
+      'облачно',
+      'навън',
+      'разходка',
+      'на открито',
+    ];
+    return markers.any(lowered.contains);
+  }
+
+  Future<void> _presentViewer(
+    Map<String, dynamic> viewer, {
+    String? objectName,
+    bool automated = false,
+  }) async {
+    if (!mounted || viewer.isEmpty) {
+      return;
+    }
+    final widgetType = (viewer['widget_type'] ?? '').toString();
+    if (widgetType == 'user_connection' && objectName != null) {
+      setState(() {
+        _activeUserPopup = _ActiveUserPopup(
+          objectName: objectName,
+          viewer: viewer,
+        );
+      });
+      return;
+    }
+    if (widgetType == 'phone_command_launcher') {
+      final prompt = (viewer['prompt'] ?? '').toString().trim();
+      final rawAutoRun = viewer['auto_run_on_open'];
+      final autoRunOnOpen = rawAutoRun is bool
+          ? rawAutoRun
+          : rawAutoRun?.toString().trim().toLowerCase() != 'false';
+      if (prompt.isNotEmpty) {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => NavigationLauncherScreen(
+              initialPrompt: prompt,
+              autoRunOnOpen: autoRunOnOpen,
+            ),
+          ),
+        );
+        return;
+      }
+    }
+    if (!mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: !automated,
+      builder: (context) => AgentResultDialog(viewer: viewer),
+    );
   }
 
   Future<void> _applyCommands(dynamic rawCommands) async {
@@ -2032,7 +2116,24 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                     y,
                                   );
                                 },
-                                onDragEnded: _persistBoardStateSilently,
+                                onDragEnded: () async {
+                                  _sceneController.snapObjectToNearestValidPosition(
+                                    object.name,
+                                  );
+                                  await _persistBoardStateSilently();
+                                },
+                                onScaleChanged: (scale) {
+                                  _sceneController.setObjectScaleFromGesture(
+                                    object.name,
+                                    scale,
+                                  );
+                                },
+                                onScaleEnded: () async {
+                                  _sceneController.snapObjectToNearestValidPosition(
+                                    object.name,
+                                  );
+                                  await _persistBoardStateSilently();
+                                },
                               ),
                             ),
                           ],
@@ -2932,73 +3033,142 @@ class AgentResultDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final title = (viewer['title'] ?? 'Board result').toString();
+    final title = (viewer['title'] ?? 'Резултат').toString();
     final summary = (viewer['summary'] ?? '').toString();
-    final payload = viewer['payload'];
     final widgetType = (viewer['widget_type'] ?? '').toString();
-    final jsonText = JsonEncoder.withIndent('  ').convert(payload);
+    final badge = switch (widgetType) {
+      'weather_snapshot' => 'Време',
+      'outing_suggestion' => 'Навън',
+      'meetup_invite' => 'Среща',
+      'phone_command_launcher' => 'Телефон',
+      _ => 'Резултат',
+    };
+    final body = switch (widgetType) {
+      'user_profile' when viewer['user'] is Map => AgentUserProfileView(
+        user: Map<String, dynamic>.from(viewer['user'] as Map),
+      ),
+      'meetup_invite' when viewer['invite'] is Map => AgentMeetupInviteView(
+        invite: Map<String, dynamic>.from(viewer['invite'] as Map),
+        notification: viewer['notification'] is Map
+            ? Map<String, dynamic>.from(viewer['notification'] as Map)
+            : const <String, dynamic>{},
+        friendName: (viewer['friend_name'] ?? '').toString(),
+      ),
+      'weather_snapshot' when viewer['weather'] is Map => AgentWeatherSnapshotView(
+        weather: Map<String, dynamic>.from(viewer['weather'] as Map),
+      ),
+      'outing_suggestion' => AgentOutingSuggestionView(
+        user: viewer['user'] is Map
+            ? Map<String, dynamic>.from(viewer['user'] as Map)
+            : const <String, dynamic>{},
+        outing: viewer['outing'] is Map
+            ? Map<String, dynamic>.from(viewer['outing'] as Map)
+            : const <String, dynamic>{},
+      ),
+      'phone_command_launcher' => AgentPhoneLauncherSummaryView(
+        prompt: (viewer['prompt'] ?? '').toString(),
+      ),
+      _ => AgentSummaryOnlyView(title: title, summary: summary),
+    };
 
-    return AlertDialog(
-      title: Text(title),
-      content: SizedBox(
-        width: 520,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (summary.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(
-                  summary,
-                  style: TextStyle(
-                    color: Colors.black.withValues(alpha: 0.72),
-                    height: 1.24,
-                  ),
-                ),
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 22, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: _whiteSmoke,
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(28),
+              topRight: Radius.circular(36),
+              bottomLeft: Radius.circular(34),
+              bottomRight: Radius.circular(24),
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF5E3023).withValues(alpha: 0.18),
+                blurRadius: 32,
+                offset: const Offset(0, 16),
               ),
-            if (widgetType == 'user_profile' && viewer['user'] is Map)
-              SizedBox(
-                width: 520,
-                height: 340,
-                child: SingleChildScrollView(
-                  child: AgentUserProfileView(
-                    user: Map<String, dynamic>.from(viewer['user'] as Map),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 7,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _almondCream,
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: Text(
+                        badge,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w800,
+                          color: _bloodRed,
+                        ),
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      style: IconButton.styleFrom(
+                        backgroundColor: _dustGrey,
+                        foregroundColor: _bloodRed,
+                      ),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  title,
+                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: const Color(0xFF36211E),
                   ),
                 ),
-              )
-            else if (widgetType == 'meetup_invite' && viewer['invite'] is Map)
-              SizedBox(
-                width: 520,
-                child: SingleChildScrollView(
-                  child: AgentMeetupInviteView(
-                    invite: Map<String, dynamic>.from(viewer['invite'] as Map),
-                    notification: viewer['notification'] is Map
-                        ? Map<String, dynamic>.from(viewer['notification'] as Map)
-                        : const <String, dynamic>{},
-                    friendName: (viewer['friend_name'] ?? '').toString(),
+                if (summary.isNotEmpty &&
+                    widgetType != 'weather_snapshot' &&
+                    widgetType != 'outing_suggestion') ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    summary,
+                    style: TextStyle(
+                      color: Colors.black.withValues(alpha: 0.72),
+                      height: 1.28,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 18),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 420),
+                  child: SingleChildScrollView(child: body),
+                ),
+                const SizedBox(height: 18),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Затвори'),
                   ),
                 ),
-              )
-            else
-              SizedBox(
-                height: 320,
-                child: SingleChildScrollView(
-                  child: SelectableText(
-                    jsonText,
-                    style: const TextStyle(fontSize: 12, height: 1.25),
-                  ),
-                ),
-              ),
-          ],
+              ],
+            ),
+          ),
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Close'),
-        ),
-      ],
     );
   }
 }
@@ -3095,25 +3265,289 @@ class AgentMeetupInviteView extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         if (visibleFriend.isNotEmpty)
-          _UserSectionLabel(text: 'Friend', value: visibleFriend),
-        if (status.isNotEmpty) _UserSectionLabel(text: 'Status', value: status),
-        if (when.isNotEmpty) _UserSectionLabel(text: 'When', value: when),
+          _UserSectionLabel(text: 'Човек', value: visibleFriend),
+        if (status.isNotEmpty) _UserSectionLabel(text: 'Статус', value: status),
+        if (when.isNotEmpty) _UserSectionLabel(text: 'Кога', value: when),
         if (placeName.isNotEmpty)
-          _UserSectionLabel(text: 'Place', value: placeName),
+          _UserSectionLabel(text: 'Място', value: placeName),
         if (weather.isNotEmpty || temperature.isNotEmpty)
           _UserSectionLabel(
-            text: 'Weather',
+            text: 'Време',
             value: [
               if (weather.isNotEmpty) weather,
               if (temperature.isNotEmpty) '$temperature°C',
             ].join(' • '),
           ),
         if (score.isNotEmpty)
-          _UserSectionLabel(text: 'Match score', value: score),
+          _UserSectionLabel(text: 'Оценка', value: score),
         if (notificationBody.isNotEmpty)
-          _UserSectionLabel(text: 'Invite message', value: notificationBody),
+          _UserSectionLabel(text: 'Съобщение', value: notificationBody),
       ],
     );
+  }
+}
+
+class AgentWeatherSnapshotView extends StatelessWidget {
+  const AgentWeatherSnapshotView({super.key, required this.weather});
+
+  final Map<String, dynamic> weather;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = (weather['label'] ?? '').toString();
+    final summary = (weather['summary'] ?? '').toString();
+    final advice = (weather['advice'] ?? '').toString();
+    final temperature = weather['temperature_c']?.toString() ?? '';
+    final apparentTemperature =
+        weather['apparent_temperature_c']?.toString() ?? '';
+    final wind = weather['wind_speed']?.toString() ?? '';
+    final windUnit = (weather['wind_unit'] ?? 'km/h').toString();
+    final iconKey = (weather['icon_key'] ?? 'cloud').toString();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Container(
+              width: 68,
+              height: 68,
+              decoration: BoxDecoration(
+                color: _almondCream,
+                borderRadius: BorderRadius.circular(22),
+              ),
+              child: Icon(
+                _weatherIcon(iconKey),
+                color: _bloodRed,
+                size: 34,
+              ),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      fontSize: 22,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  if (summary.isNotEmpty)
+                    Text(
+                      summary,
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.black.withValues(alpha: 0.66),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        if (advice.isNotEmpty) ...[
+          const SizedBox(height: 16),
+          _SoftInfoPanel(text: advice),
+        ],
+        const SizedBox(height: 14),
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            if (temperature.isNotEmpty)
+              _MiniFactCard(label: 'Температура', value: '$temperature°C'),
+            if (apparentTemperature.isNotEmpty)
+              _MiniFactCard(
+                label: 'Усеща се',
+                value: '$apparentTemperature°C',
+              ),
+            if (wind.isNotEmpty)
+              _MiniFactCard(label: 'Вятър', value: '$wind $windUnit'),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class AgentOutingSuggestionView extends StatelessWidget {
+  const AgentOutingSuggestionView({
+    super.key,
+    required this.user,
+    required this.outing,
+  });
+
+  final Map<String, dynamic> user;
+  final Map<String, dynamic> outing;
+
+  @override
+  Widget build(BuildContext context) {
+    final person = (user['display_name'] ?? user['name'] ?? '').toString();
+    final description = (user['description'] ?? '').toString();
+    final place = (outing['place_name'] ?? '').toString();
+    final when = (outing['recommended_when_bg'] ??
+            outing['meeting_when_bg'] ??
+            outing['recommended_time'] ??
+            '')
+        .toString();
+    final weather = (outing['weather'] ?? '').toString();
+    final score = outing['score']?.toString() ?? '';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (person.isNotEmpty)
+          _SoftInfoPanel(text: 'Подходящ човек: $person'),
+        if (description.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text(
+            description,
+            style: TextStyle(
+              fontSize: 14.5,
+              height: 1.35,
+              color: Colors.black.withValues(alpha: 0.72),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+        const SizedBox(height: 16),
+        if (place.isNotEmpty) _UserSectionLabel(text: 'Място', value: place),
+        if (when.isNotEmpty) _UserSectionLabel(text: 'Час', value: when),
+        if (weather.isNotEmpty) _UserSectionLabel(text: 'Време', value: weather),
+        if (score.isNotEmpty) _UserSectionLabel(text: 'Оценка', value: score),
+      ],
+    );
+  }
+}
+
+class AgentPhoneLauncherSummaryView extends StatelessWidget {
+  const AgentPhoneLauncherSummaryView({
+    super.key,
+    required this.prompt,
+  });
+
+  final String prompt;
+
+  @override
+  Widget build(BuildContext context) {
+    return _SoftInfoPanel(
+      text: prompt.isNotEmpty
+          ? 'Подготвена е телефонна команда: $prompt'
+          : 'Подготвена е телефонна команда.',
+    );
+  }
+}
+
+class AgentSummaryOnlyView extends StatelessWidget {
+  const AgentSummaryOnlyView({
+    super.key,
+    required this.title,
+    required this.summary,
+  });
+
+  final String title;
+  final String summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = summary.trim().isNotEmpty
+        ? summary.trim()
+        : 'Няма нужда от допълнителна карта за този резултат.';
+    return _SoftInfoPanel(text: text);
+  }
+}
+
+class _MiniFactCard extends StatelessWidget {
+  const _MiniFactCard({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 110,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: _dustGrey),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w700,
+              color: Colors.black.withValues(alpha: 0.55),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SoftInfoPanel extends StatelessWidget {
+  const _SoftInfoPanel({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+      decoration: BoxDecoration(
+        color: _almondCream.withValues(alpha: 0.7),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 14.5,
+          height: 1.35,
+          fontWeight: FontWeight.w700,
+          color: Color(0xFF4A2A22),
+        ),
+      ),
+    );
+  }
+}
+
+IconData _weatherIcon(String iconKey) {
+  switch (iconKey) {
+    case 'sun':
+      return Icons.wb_sunny_rounded;
+    case 'moon':
+      return Icons.nightlight_round;
+    case 'cloud_sun':
+      return Icons.wb_cloudy_rounded;
+    case 'cloud_moon':
+      return Icons.cloud_outlined;
+    case 'fog':
+      return Icons.blur_on_rounded;
+    case 'rain':
+      return Icons.umbrella_rounded;
+    case 'snow':
+      return Icons.ac_unit_rounded;
+    case 'storm':
+      return Icons.thunderstorm_rounded;
+    default:
+      return Icons.cloud_rounded;
   }
 }
 
@@ -3317,6 +3751,7 @@ class AgentBackendClient {
     required String userId,
     required String sessionId,
     String? token,
+    Map<String, dynamic>? location,
   }) {
     return _postJson('/api/agent/run/start/', {
       'prompt': prompt,
@@ -3324,6 +3759,7 @@ class AgentBackendClient {
       'largest_empty_space': largestEmptySpace,
       'user_id': userId,
       'session_id': sessionId,
+      if (location != null) 'location': location,
     }, token: token);
   }
 
@@ -3541,13 +3977,29 @@ class SceneController extends ChangeNotifier {
     if (current == null) return;
 
     final clampedX = x
-        .clamp(0.0, math.max(0.0, _boardSize.width - current.width))
+        .clamp(0.0, math.max(0.0, _boardSize.width - current.scaledWidth))
         .toDouble();
     final clampedY = y
-        .clamp(0.0, math.max(0.0, _boardSize.height - current.height))
+        .clamp(0.0, math.max(0.0, _boardSize.height - current.scaledHeight))
         .toDouble();
 
     _objects[name] = current.copyWith(x: clampedX, y: clampedY);
+    notifyListeners();
+  }
+
+  void setObjectScaleFromGesture(String name, double baseScale) {
+    final current = _objects[name];
+    if (current == null) return;
+    final targetScale = baseScale.clamp(0.75, 1.8).toDouble();
+    final updated = current.copyWith(baseScale: targetScale);
+    _objects[name] = _clampObjectToBoard(updated);
+    notifyListeners();
+  }
+
+  void snapObjectToNearestValidPosition(String name) {
+    final current = _objects[name];
+    if (current == null) return;
+    _objects[name] = _resolveNonOverlappingPlacement(current);
     notifyListeners();
   }
 
@@ -3695,9 +4147,6 @@ class SceneController extends ChangeNotifier {
       }
     }
 
-    x = x.clamp(0.0, math.max(0.0, _boardSize.width - width)).toDouble();
-    y = y.clamp(0.0, math.max(0.0, _boardSize.height - height)).toDouble();
-
     final object = SceneObjectData(
       name: name,
       text: json['text']?.toString() ?? name,
@@ -3722,10 +4171,10 @@ class SceneController extends ChangeNotifier {
       extraData: _readExtraData(json['extraData'] ?? json['extra_data']),
     );
 
-    _objects[name] = object;
+    _objects[name] = _resolveNonOverlappingPlacement(object);
     notifyListeners();
 
-    return {'ok': true, 'action': 'create', 'object': object.toJson()};
+    return {'ok': true, 'action': 'create', 'object': _objects[name]!.toJson()};
   }
 
   Map<String, dynamic> _moveFromJson(Map<String, dynamic> json) {
@@ -3735,16 +4184,11 @@ class SceneController extends ChangeNotifier {
       throw StateError('Object "$name" not found.');
     }
 
-    final x = _readDouble(
-      json['x'],
-      fallback: current.x,
-    ).clamp(0.0, math.max(0.0, _boardSize.width - current.width)).toDouble();
-    final y = _readDouble(
-      json['y'],
-      fallback: current.y,
-    ).clamp(0.0, math.max(0.0, _boardSize.height - current.height)).toDouble();
-
-    _objects[name] = current.copyWith(x: x, y: y);
+    final moved = current.copyWith(
+      x: _readDouble(json['x'], fallback: current.x),
+      y: _readDouble(json['y'], fallback: current.y),
+    );
+    _objects[name] = _resolveNonOverlappingPlacement(moved);
     notifyListeners();
 
     return {'ok': true, 'action': 'move', 'object': _objects[name]!.toJson()};
@@ -3766,7 +4210,9 @@ class SceneController extends ChangeNotifier {
         .clamp(0.15, 8.0)
         .toDouble();
 
-    _objects[name] = current.copyWith(baseScale: targetScale);
+    _objects[name] = _resolveNonOverlappingPlacement(
+      current.copyWith(baseScale: targetScale),
+    );
     notifyListeners();
 
     return {
@@ -3844,9 +4290,9 @@ class SceneController extends ChangeNotifier {
 
     for (final object in _objects.values.where((o) => !o.isDeleting)) {
       xs.add(object.x.clamp(0.0, width).toDouble());
-      xs.add((object.x + object.width).clamp(0.0, width).toDouble());
+      xs.add((object.x + object.scaledWidth).clamp(0.0, width).toDouble());
       ys.add(object.y.clamp(0.0, height).toDouble());
-      ys.add((object.y + object.height).clamp(0.0, height).toDouble());
+      ys.add((object.y + object.scaledHeight).clamp(0.0, height).toDouble());
     }
 
     final sortedX = xs.toList()..sort();
@@ -3883,14 +4329,82 @@ class SceneController extends ChangeNotifier {
     return bestRect;
   }
 
-  bool _overlapsAny(Rect candidate) {
-    for (final object in _objects.values.where((o) => !o.isDeleting)) {
-      final rect = Rect.fromLTWH(
-        object.x,
-        object.y,
-        object.width,
-        object.height,
+  SceneObjectData _clampObjectToBoard(SceneObjectData object) {
+    final x = object.x
+        .clamp(0.0, math.max(0.0, _boardSize.width - object.scaledWidth))
+        .toDouble();
+    final y = object.y
+        .clamp(0.0, math.max(0.0, _boardSize.height - object.scaledHeight))
+        .toDouble();
+    return object.copyWith(x: x, y: y);
+  }
+
+  SceneObjectData _resolveNonOverlappingPlacement(SceneObjectData object) {
+    final clamped = _clampObjectToBoard(object);
+    final preferredRect = _objectRect(clamped);
+    if (!_overlapsAny(preferredRect, excludingName: clamped.name)) {
+      return clamped;
+    }
+
+    final maxX = math.max(0.0, _boardSize.width - clamped.scaledWidth);
+    final maxY = math.max(0.0, _boardSize.height - clamped.scaledHeight);
+    const step = 24.0;
+
+    SceneObjectData? bestCandidate;
+    var bestDistance = double.infinity;
+
+    void consider(double x, double y) {
+      final candidate = clamped.copyWith(
+        x: x.clamp(0.0, maxX).toDouble(),
+        y: y.clamp(0.0, maxY).toDouble(),
       );
+      final rect = _objectRect(candidate);
+      if (_overlapsAny(rect, excludingName: clamped.name)) {
+        return;
+      }
+      final distance = math.pow(candidate.x - clamped.x, 2) +
+          math.pow(candidate.y - clamped.y, 2);
+      if (distance < bestDistance) {
+        bestDistance = distance.toDouble();
+        bestCandidate = candidate;
+      }
+    }
+
+    consider(clamped.x, clamped.y);
+    for (double y = 0; y <= maxY; y += step) {
+      for (double x = 0; x <= maxX; x += step) {
+        consider(x, y);
+      }
+    }
+
+    if (bestCandidate != null) {
+      return bestCandidate!;
+    }
+
+    final emptyRect = findLargestEmptyRect();
+    if (emptyRect != null &&
+        emptyRect.width >= clamped.scaledWidth &&
+        emptyRect.height >= clamped.scaledHeight) {
+      return clamped.copyWith(x: emptyRect.left, y: emptyRect.top);
+    }
+    return clamped;
+  }
+
+  Rect _objectRect(SceneObjectData object) {
+    return Rect.fromLTWH(
+      object.x,
+      object.y,
+      object.scaledWidth,
+      object.scaledHeight,
+    );
+  }
+
+  bool _overlapsAny(Rect candidate, {String? excludingName}) {
+    for (final object in _objects.values.where((o) => !o.isDeleting)) {
+      if (excludingName != null && object.name == excludingName) {
+        continue;
+      }
+      final rect = _objectRect(object);
       if (_rectanglesOverlap(candidate, rect)) {
         return true;
       }
@@ -4037,6 +4551,10 @@ class SceneObjectData {
   final List<String> tags;
   final Map<String, dynamic> extraData;
 
+  double get scaledWidth => width * baseScale;
+
+  double get scaledHeight => height * baseScale;
+
   bool get isUserObject {
     final kind = (extraData['kind'] ?? '').toString().trim().toLowerCase();
     if (kind == 'user' || kind == 'user_chat') {
@@ -4102,7 +4620,7 @@ class SceneObjectData {
       'deleteAfterClick': deleteAfterClick,
       'tags': tags,
       'extraData': extraData,
-      'bbox': {'x': x, 'y': y, 'width': width, 'height': height},
+      'bbox': {'x': x, 'y': y, 'width': scaledWidth, 'height': scaledHeight},
     };
   }
 }
@@ -4116,6 +4634,8 @@ class BoardObjectWidget extends StatefulWidget {
     required this.onDeleteComplete,
     required this.onDragPositionChanged,
     required this.onDragEnded,
+    required this.onScaleChanged,
+    required this.onScaleEnded,
   });
 
   final SceneObjectData data;
@@ -4124,6 +4644,8 @@ class BoardObjectWidget extends StatefulWidget {
   final VoidCallback onDeleteComplete;
   final void Function(double x, double y) onDragPositionChanged;
   final Future<void> Function() onDragEnded;
+  final ValueChanged<double> onScaleChanged;
+  final Future<void> Function() onScaleEnded;
 
   @override
   State<BoardObjectWidget> createState() => _BoardObjectWidgetState();
@@ -4144,6 +4666,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
   bool _deletionDone = false;
   bool _isDragging = false;
   Offset? _dragPointerOffset;
+  double _gestureStartScale = 1;
 
   @override
   void initState() {
@@ -4286,7 +4809,56 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
           .clamp(18.0, 26.0)
           .toDouble(),
     );
-    final canRemove = !widget.data.isUserObject;
+    final canRemove = true;
+    final kind = (widget.data.extraData['kind'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final badgeLabel = switch (kind) {
+      'weather_snapshot' => 'Време',
+      'outing_suggestion' => 'Навън',
+      'meetup_invite' => 'Среща',
+      'phone_command' => 'Телефон',
+      'user' || 'user_chat' => 'Човек',
+      _ => 'Резултат',
+    };
+    final subtitle = () {
+      if (kind == 'weather_snapshot') {
+        return (widget.data.extraData['summary'] ?? '').toString();
+      }
+      if (kind == 'outing_suggestion') {
+        return (widget.data.extraData['place_name'] ??
+                widget.data.extraData['recommended_when_bg'] ??
+                '')
+            .toString();
+      }
+      if (kind == 'meetup_invite') {
+        return (widget.data.extraData['meeting_when_bg'] ??
+                widget.data.extraData['friend_name'] ??
+                '')
+            .toString();
+      }
+      if (kind == 'phone_command') {
+        return 'Натиснете, за да продължите';
+      }
+      if (widget.data.isUserObject) {
+        return 'Натиснете, за да отворите';
+      }
+      return '';
+    }().trim();
+    final accentColor = switch (kind) {
+      'weather_snapshot' => const Color(0xFFE9C46A),
+      'outing_suggestion' => const Color(0xFFA8C7B5),
+      'meetup_invite' => const Color(0xFFE7C4B4),
+      'phone_command' => const Color(0xFFD88B73),
+      _ => Colors.white.withValues(alpha: 0.76),
+    };
+    final panelRadius = BorderRadius.only(
+      topLeft: Radius.circular(borderRadius.topLeft.x + 6),
+      topRight: Radius.circular(borderRadius.topRight.x + 12),
+      bottomLeft: Radius.circular(borderRadius.bottomLeft.x + 12),
+      bottomRight: Radius.circular(borderRadius.bottomRight.x + 4),
+    );
 
     return Positioned(
       left: livePosition.dx,
@@ -4299,37 +4871,36 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTap: widget.onTap,
-            onPanStart: (details) {
+            onScaleStart: (details) {
               final box = context.findRenderObject() as RenderBox?;
               if (box == null) return;
-              _dragPointerOffset = box.globalToLocal(details.globalPosition);
+              _dragPointerOffset = box.globalToLocal(details.focalPoint);
+              _gestureStartScale = widget.data.baseScale;
               setState(() {
                 _isDragging = true;
               });
             },
-            onPanUpdate: (details) {
+            onScaleUpdate: (details) {
               final board = context.findAncestorRenderObjectOfType<RenderBox>();
               final dragOffset = _dragPointerOffset;
               if (board == null || dragOffset == null) return;
-              final localOnBoard = board.globalToLocal(details.globalPosition);
+              final localOnBoard = board.globalToLocal(details.focalPoint);
               widget.onDragPositionChanged(
                 localOnBoard.dx - dragOffset.dx,
                 localOnBoard.dy - dragOffset.dy,
               );
+              if (details.pointerCount > 1 ||
+                  (details.scale - 1.0).abs() > 0.015) {
+                widget.onScaleChanged(_gestureStartScale * details.scale);
+              }
             },
-            onPanEnd: (_) {
+            onScaleEnd: (_) {
               setState(() {
                 _isDragging = false;
                 _dragPointerOffset = null;
               });
               unawaited(widget.onDragEnded());
-            },
-            onPanCancel: () {
-              setState(() {
-                _isDragging = false;
-                _dragPointerOffset = null;
-              });
-              unawaited(widget.onDragEnded());
+              unawaited(widget.onScaleEnded());
             },
             child: SizedBox(
               width: widget.data.width,
@@ -4341,32 +4912,86 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                     height: widget.data.height,
                     decoration: BoxDecoration(
                       color: widget.data.color,
-                      borderRadius: borderRadius,
+                      borderRadius: panelRadius,
                       border: Border.all(
                         color: Colors.black.withValues(alpha: 0.08),
                         width: 1,
                       ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF5E3023).withValues(alpha: 0.13),
+                          blurRadius: 20,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
                     ),
-                    alignment: Alignment.center,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 14,
-                    ),
-                    child: Text(
-                      widget.data.text,
-                      textAlign: TextAlign.center,
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: _bestTextColor(widget.data.color),
-                        fontWeight: FontWeight.w700,
-                        fontSize:
-                            (math.min(widget.data.width, widget.data.height) *
-                                    0.18)
-                                .clamp(14.0, 22.0)
-                                .toDouble(),
-                        height: 1.1,
-                      ),
+                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: accentColor,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Text(
+                                badgeLabel,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                            const Spacer(),
+                            Container(
+                              width: 18,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.3),
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const Spacer(),
+                        Text(
+                          widget.data.text,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: _bestTextColor(widget.data.color),
+                            fontWeight: FontWeight.w800,
+                            fontSize:
+                                (math.min(widget.data.width, widget.data.height) *
+                                        0.16)
+                                    .clamp(16.0, 24.0)
+                                    .toDouble(),
+                            height: 1.08,
+                          ),
+                        ),
+                        if (subtitle.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            subtitle,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: _bestTextColor(
+                                widget.data.color,
+                              ).withValues(alpha: 0.82),
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              height: 1.2,
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
                   if (canRemove)
@@ -4377,18 +5002,18 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                         behavior: HitTestBehavior.opaque,
                         onTap: widget.onRemovePressed,
                         child: Container(
-                          width: 24,
-                          height: 24,
+                          width: 28,
+                          height: 28,
                           alignment: Alignment.center,
                           decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.12),
+                            color: Colors.black.withValues(alpha: 0.10),
                             shape: BoxShape.circle,
                           ),
                           child: Text(
-                            'x',
+                            '×',
                             style: TextStyle(
                               color: _bestTextColor(widget.data.color),
-                              fontSize: 12,
+                              fontSize: 15,
                               fontWeight: FontWeight.w700,
                               height: 1,
                             ),
