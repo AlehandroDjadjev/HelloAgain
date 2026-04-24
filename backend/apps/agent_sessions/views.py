@@ -127,6 +127,7 @@ def _user_id_from_request(request: Request) -> str:
 def _prepare_session_for_transcript(
     session: AgentSession,
     transcript: str,
+    context: dict | None = None,
 ) -> dict:
     clean_transcript = transcript.strip()
     if session.transcript != clean_transcript:
@@ -139,6 +140,7 @@ def _prepare_session_for_transcript(
     intent_result = svc.parse_intent(
         transcript=clean_transcript,
         supported_packages=list(session.supported_packages) or None,
+        context=context or {},
     )
 
     PlanService.store_intent(
@@ -151,42 +153,63 @@ def _prepare_session_for_transcript(
         ambiguity_flags=intent_result.ambiguity_flags,
     )
 
-    session.store_intent_data(
-        goal=intent_result.goal,
-        target_app=intent_result.app_package,
-        entities=intent_result.entities or {},
-        risk_level=intent_result.risk_level or "low",
-    )
-
-    if session.status not in SessionService.TERMINAL:
-        if session.status not in (
-            SessionStatus.EXECUTING,
-            SessionStatus.AWAITING_CONFIRMATION,
-        ):
-            if session.status == SessionStatus.CREATED:
-                SessionService.transition(session, SessionStatus.PLANNING)
-                session.refresh_from_db()
-            if session.status not in (
-                SessionStatus.EXECUTING,
-                SessionStatus.AWAITING_CONFIRMATION,
-            ):
-                SessionService.transition(session, SessionStatus.EXECUTING)
-                session.refresh_from_db()
-
-        if not session.started_at:
-            session.started_at = datetime.now(timezone.utc)
-            session.save(update_fields=["started_at", "updated_at"])
+    execution_ready = _apply_intent_to_session(session, intent_result)
 
     session.refresh_from_db()
     return {
         "intent": intent_result.to_dict(),
-        "execution_ready": session.status == SessionStatus.EXECUTING,
+        "execution_ready": execution_ready,
         "can_auto_compile": PlanCompiler.has_template(
             intent_result.goal_type,
             intent_result.app_package,
         ),
         "session_status": session.status,
     }
+
+
+def _apply_intent_to_session(session: AgentSession, intent_result) -> bool:
+    if intent_result.needs_clarification:
+        session.store_intent_data(
+            goal="",
+            target_app="",
+            entities=intent_result.entities or {},
+            risk_level=intent_result.risk_level or "low",
+        )
+    else:
+        session.store_intent_data(
+            goal=intent_result.goal,
+            target_app=intent_result.app_package,
+            entities=intent_result.entities or {},
+            risk_level=intent_result.risk_level or "low",
+        )
+
+    if session.status in SessionService.TERMINAL:
+        return False
+
+    if intent_result.needs_clarification:
+        if session.status != SessionStatus.PLANNING:
+            SessionService.transition(session, SessionStatus.PLANNING)
+        return False
+
+    if session.status not in (
+        SessionStatus.EXECUTING,
+        SessionStatus.AWAITING_CONFIRMATION,
+    ):
+        if session.status == SessionStatus.CREATED:
+            SessionService.transition(session, SessionStatus.PLANNING)
+            session.refresh_from_db()
+        if session.status not in (
+            SessionStatus.EXECUTING,
+            SessionStatus.AWAITING_CONFIRMATION,
+        ):
+            SessionService.transition(session, SessionStatus.EXECUTING)
+            session.refresh_from_db()
+
+    if not session.started_at:
+        session.started_at = datetime.now(timezone.utc)
+        session.save(update_fields=["started_at", "updated_at"])
+
+    return session.status == SessionStatus.EXECUTING
 
 
 def _create_prepared_command_session(
@@ -204,6 +227,7 @@ def _create_prepared_command_session(
     response_payload = _prepare_session_for_transcript(
         session,
         validated_data["prompt"],
+        validated_data.get("context") or {},
     )
     return session, response_payload
 
@@ -336,7 +360,9 @@ class SessionIntentView(APIView):
         )
 
         # ── Auto-transition to EXECUTING (skip /plan/ and /approve/) ──────────
-        if session.status not in SessionService.TERMINAL:
+        execution_ready = _apply_intent_to_session(session, intent_result)
+
+        if False:
             if session.status not in (SessionStatus.EXECUTING,
                                       SessionStatus.AWAITING_CONFIRMATION):
                 # CREATED → PLANNING → EXECUTING

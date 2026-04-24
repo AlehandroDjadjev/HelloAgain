@@ -116,6 +116,52 @@ class AgentCommandViewTests(TestCase):
         self.assertEqual(session.reasoning_provider, "openai")
         self.assertEqual(session.status, SessionStatus.EXECUTING)
 
+    @patch("apps.agent_sessions.views.IntentService.parse_intent")
+    def test_phone_command_endpoint_keeps_vague_prompt_in_clarification_state(
+        self,
+        mock_parse_intent,
+    ):
+        mock_parse_intent.return_value = IntentResult(
+            goal="Send a message",
+            goal_type="send_message",
+            app_package="com.whatsapp",
+            target_app="WhatsApp",
+            entities={},
+            risk_level="high",
+            confidence=0.72,
+            ambiguity_flags=[],
+            needs_clarification=True,
+            missing_fields=["recipient", "message"],
+            clarification_question="Who should I message, and what should I say?",
+        )
+
+        response = self.client.post(
+            "/api/agent/phone-command/",
+            data={
+                "prompt": "Send a WhatsApp message",
+                "device_id": "pixel-1",
+                "input_mode": "text",
+                "reasoning_provider": "openai",
+                "supported_packages": ["com.whatsapp"],
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.json()
+        self.assertEqual(payload["session_status"], SessionStatus.PLANNING)
+        self.assertFalse(payload["execution_ready"])
+        self.assertTrue(payload["intent"]["needs_clarification"])
+        self.assertEqual(
+            payload["intent"]["clarification_question"],
+            "Who should I message, and what should I say?",
+        )
+
+        session = SessionService.get(payload["session_id"])
+        self.assertEqual(session.status, SessionStatus.PLANNING)
+        self.assertEqual(session.goal, "")
+        self.assertEqual(session.target_app, "")
+
     def test_navigation_prepare_endpoint_uses_deterministic_maps_flow(self):
         response = self.client.post(
             "/api/agent/navigation/prepare/",

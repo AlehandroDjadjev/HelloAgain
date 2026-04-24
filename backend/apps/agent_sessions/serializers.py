@@ -80,6 +80,7 @@ class AgentCommandSubmitSerializer(serializers.Serializer):
         required=False,
         default=list,
     )
+    context = serializers.JSONField(required=False, default=dict)
 
 
 class NavigationPrepareSerializer(serializers.Serializer):

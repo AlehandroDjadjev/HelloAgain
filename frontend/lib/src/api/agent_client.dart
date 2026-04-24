@@ -49,12 +49,14 @@ class AgentClient {
     String inputMode = 'text',
     String reasoningProvider = 'openai',
     List<String> supportedPackages = const [],
+    Map<String, dynamic> context = const {},
   }) => _post('/api/agent/phone-command/', {
     'prompt': prompt,
     'device_id': deviceId,
     'input_mode': inputMode,
     'reasoning_provider': reasoningProvider,
     'supported_packages': supportedPackages,
+    'context': context,
   });
 
   Future<Map<String, dynamic>> prepareNavigation({

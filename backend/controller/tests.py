@@ -626,6 +626,38 @@ class SemiAgentServiceTests(SimpleTestCase):
         self.assertEqual(payload["mcp_calls"], [])
         self.assertEqual(len(service.llm_provider.calls), 1)
 
+    def test_generate_json_returns_default_when_openai_is_unreachable(self) -> None:
+        class RecordingQwenClient:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def generate(self, **kwargs) -> str:
+                self.calls.append(kwargs)
+                return '{"stage":"step_1_mcp","needs_mcps":false,"mcp_calls":[]}'
+
+        class FailingLlmProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                raise RuntimeError("planner unavailable")
+
+        qwen_client = RecordingQwenClient()
+        service = SemiAgentService(
+            qwen_client=qwen_client,
+            llm_provider=FailingLlmProvider(),
+        )
+
+        payload = service._generate_json(
+            system_prompt="system",
+            user_prompt="user",
+            default_payload={"stage": "fallback"},
+            response_format={"type": "json_object"},
+            reasoning_provider="openai",
+            user_id="guest_123",
+            session_id="session_1",
+        )
+
+        self.assertEqual(payload["stage"], "fallback")
+        self.assertEqual(len(qwen_client.calls), 0)
+
     def test_generate_json_can_fail_loudly_when_default_fallback_is_disabled(self) -> None:
         class FailingQwenClient:
             def generate(self, **kwargs) -> str:
@@ -1631,3 +1663,30 @@ class AuthenticatedIdentityFlowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["user_id"], str(viewer_profile.user_id))
+
+    def test_agent_run_start_surfaces_reasoning_dependency_failure(self) -> None:
+        with patch("controller.views.semi_agent_service.start_run") as mock_start_run:
+            mock_start_run.side_effect = RuntimeError(
+                "OpenAI request failed: 429 You exceeded your current quota."
+            )
+
+            response = self.client.post(
+                "/api/agent/run/start/",
+                data=json.dumps(
+                    {
+                        "prompt": "Find someone to talk to.",
+                        "session_id": "session_1",
+                        "board_state": {"board": {"width": 800, "height": 600}, "objects": []},
+                        "largest_empty_space": {
+                            "bbox": {"x": 0, "y": 0, "width": 800, "height": 600},
+                        },
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        self.assertEqual(response.status_code, 503)
+        payload = response.json()
+        self.assertIn("OpenAI request failed: 429", payload["detail"])
+        self.assertIn("action_required", payload)
+        self.assertIn("OPENAI_LLM_API_KEY", payload["action_required"])

@@ -2417,28 +2417,21 @@ class SemiAgentService:
     ) -> Dict[str, Any]:
         normalized_provider = self._normalize_reasoning_provider(reasoning_provider)
         try:
-            if normalized_provider == "qwen":
-                raw = self.qwen_client.generate(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    generation_overrides={
-                        "max_new_tokens": self.BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS,
-                        "json_continuation_budget": self.BOARD_PIPELINE_JSON_CONTINUATION_BUDGET,
-                    },
-                )
-            else:
-                raw = self._generate_openai_reasoning_text(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    response_format=response_format,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
+            raw = self._generate_reasoning_text(
+                provider=normalized_provider,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_format=response_format,
+                user_id=user_id,
+                session_id=session_id,
+            )
             return QwenPromptParser._extract_json(raw)
         except Exception:
-            if normalized_provider == "qwen":
+            alternate_provider = self._alternate_reasoning_provider(normalized_provider)
+            if alternate_provider:
                 try:
-                    raw = self._generate_openai_reasoning_text(
+                    raw = self._generate_reasoning_text(
+                        provider=alternate_provider,
                         system_prompt=system_prompt,
                         user_prompt=user_prompt,
                         response_format=response_format,
@@ -2460,6 +2453,38 @@ class SemiAgentService:
                 f"Supported: {', '.join(sorted(self.SUPPORTED_REASONING_PROVIDERS))}."
             )
         return normalized
+
+    def _alternate_reasoning_provider(self, provider: str) -> str:
+        if provider == "qwen":
+            return "openai"
+        return ""
+
+    def _generate_reasoning_text(
+        self,
+        *,
+        provider: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_format: Dict[str, Any] | None,
+        user_id: str,
+        session_id: str,
+    ) -> str:
+        if provider == "qwen":
+            return self.qwen_client.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                generation_overrides={
+                    "max_new_tokens": self.BOARD_PIPELINE_STAGE_MAX_NEW_TOKENS,
+                    "json_continuation_budget": self.BOARD_PIPELINE_JSON_CONTINUATION_BUDGET,
+                },
+            )
+        return self._generate_openai_reasoning_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_format=response_format,
+            user_id=user_id,
+            session_id=session_id,
+        )
 
     def _generate_openai_reasoning_text(
         self,

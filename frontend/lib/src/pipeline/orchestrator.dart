@@ -114,6 +114,7 @@ class PipelineOrchestrator extends ChangeNotifier {
   Future<void> preparePhoneCommand(
     String command, {
     String reasoningProvider = 'openai',
+    Map<String, dynamic> context = const {},
   }) async {
     if (phase.isRunning) return;
 
@@ -133,6 +134,7 @@ class PipelineOrchestrator extends ChangeNotifier {
         inputMode: 'text',
         reasoningProvider: reasoningProvider,
         supportedPackages: _supportedPackages,
+        context: context,
       );
       sessionId = resp['session_id'] as String?;
       parsedIntent = (resp['intent'] as Map?)?.cast<String, dynamic>() ?? {};

@@ -1472,7 +1472,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       CapturedAudioTurn capturedTurn;
       try {
         capturedTurn = await _voiceBridge
-            .captureAudioTurn(language: 'bg-BG')
+            .captureAudioTurn(
+              language: 'bg-BG',
+            )
             .timeout(
               const Duration(seconds: 22),
               onTimeout: () => throw TimeoutException(
@@ -1957,6 +1959,13 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   }
 
   String _formatError(Object error) {
+    if (error is BackendClientException) {
+      final actionRequired = error.actionRequired.trim();
+      if (actionRequired.isNotEmpty) {
+        return '${error.detail} $actionRequired';
+      }
+      return error.detail;
+    }
     final text = error.toString().trim();
     if (text.isEmpty) {
       return 'Unknown error.';
@@ -3377,8 +3386,10 @@ class AgentBackendClient {
       path,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-        'GET $path failed with ${response.statusCode}: ${utf8.decode(response.bodyBytes)}',
+      throw _backendError(
+        method: 'GET',
+        path: path,
+        response: response,
       );
     }
     return _decodeJson(utf8.decode(response.bodyBytes));
@@ -3399,8 +3410,10 @@ class AgentBackendClient {
       path,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-        'POST $path failed with ${response.statusCode}: ${utf8.decode(response.bodyBytes)}',
+      throw _backendError(
+        method: 'POST',
+        path: path,
+        response: response,
       );
     }
     return _decodeJson(utf8.decode(response.bodyBytes));
@@ -3411,13 +3424,44 @@ class AgentBackendClient {
     String method,
     String path,
   ) async {
+    debugPrint('AgentBackendClient $method ${_baseUri.resolve(path)}');
     try {
-      return await request().timeout(_requestTimeout);
+      final response = await request().timeout(_requestTimeout);
+      debugPrint(
+        'AgentBackendClient $method $path -> ${response.statusCode}',
+      );
+      return response;
     } on TimeoutException {
       throw Exception(
         '$method $path timed out after ${_requestTimeout.inSeconds}s while contacting ${_baseUri.origin}.',
       );
     }
+  }
+
+  BackendClientException _backendError({
+    required String method,
+    required String path,
+    required http.Response response,
+  }) {
+    final body = utf8.decode(response.bodyBytes);
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map) {
+        return BackendClientException(
+          statusCode: response.statusCode,
+          detail:
+              (decoded['detail'] ?? '$method $path failed').toString().trim(),
+          actionRequired:
+              (decoded['action_required'] ?? '').toString().trim(),
+          path: path,
+        );
+      }
+    } catch (_) {}
+    return BackendClientException(
+      statusCode: response.statusCode,
+      detail: '$method $path failed with ${response.statusCode}: $body',
+      path: path,
+    );
   }
 
   Map<String, String> _headers({String? token}) {
@@ -3437,6 +3481,29 @@ class AgentBackendClient {
       throw FormatException('Backend did not return a JSON object.');
     }
     return Map<String, dynamic>.from(decoded);
+  }
+}
+
+class BackendClientException implements Exception {
+  const BackendClientException({
+    required this.statusCode,
+    required this.detail,
+    this.actionRequired = '',
+    this.path = '',
+  });
+
+  final int statusCode;
+  final String detail;
+  final String actionRequired;
+  final String path;
+
+  @override
+  String toString() {
+    final action = actionRequired.trim();
+    if (action.isEmpty) {
+      return 'BackendClientException($statusCode): $detail';
+    }
+    return 'BackendClientException($statusCode): $detail $action';
   }
 }
 

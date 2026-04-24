@@ -75,6 +75,35 @@ def _effective_user_id(request: HttpRequest, payload: dict | None = None) -> str
     return str(resolved.get("user_id") or resolved.get("phone_number") or "anonymous")
 
 
+def _reasoning_failure_response(exc: Exception) -> JsonResponse | None:
+    detail = str(exc).strip()
+    lowered = detail.lower()
+    if "openai request failed: 429" in lowered:
+        return JsonResponse(
+            {
+                "detail": detail,
+                "action_required": (
+                    "OpenAI quota is unavailable. Update billing/quota for the "
+                    "configured OpenAI account or replace OPENAI_LLM_API_KEY in "
+                    "backend/.env with a working key, then restart Django."
+                ),
+            },
+            status=503,
+        )
+    if "could not reach the qwen server" in lowered:
+        return JsonResponse(
+            {
+                "detail": detail,
+                "action_required": (
+                    "Start the local Qwen worker with `python main.py` or set "
+                    "`QWEN_SERVER_URL` to a running worker."
+                ),
+            },
+            status=503,
+        )
+    return None
+
+
 def home_view(request: HttpRequest):
     return render(
         request,
@@ -335,6 +364,9 @@ def agent_run_view(request: HttpRequest):
         return JsonResponse({"detail": str(exc)}, status=400)
     except Exception as exc:
         print(f"[controller] semi-agent failed: {exc}", file=sys.stderr, flush=True)
+        service_failure = _reasoning_failure_response(exc)
+        if service_failure is not None:
+            return service_failure
         return JsonResponse({"detail": str(exc)}, status=500)
     return JsonResponse(result)
 
@@ -369,6 +401,9 @@ def agent_run_start_view(request: HttpRequest):
         return JsonResponse({"detail": str(exc)}, status=400)
     except Exception as exc:
         print(f"[controller] semi-agent start failed: {exc}", file=sys.stderr, flush=True)
+        service_failure = _reasoning_failure_response(exc)
+        if service_failure is not None:
+            return service_failure
         return JsonResponse({"detail": str(exc)}, status=500)
     print("[controller] semi-agent start request completed", file=sys.stderr, flush=True)
     return JsonResponse(result)

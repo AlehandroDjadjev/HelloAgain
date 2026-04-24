@@ -420,6 +420,12 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
         .trim();
     final isLoginConfirmationMode = mode == 'login_confirmation';
     final needsPhoneNumber = missingFields.contains('phone_number');
+    final hasCompletedIntroduction =
+        _hasCompletedIntroduction ||
+        draftSummary.isNotEmpty ||
+        isLoginConfirmationMode ||
+        mode == 'ready_to_register' ||
+        mode == 'completed';
     final hasCollectedInput =
         countAsProgress ||
         _hasCollectedOnboardingInput ||
@@ -438,13 +444,12 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       _conversationMode = mode.isEmpty ? 'collecting' : mode;
       _recognizedPhone = recognizedPhone;
       _hasCollectedOnboardingInput = hasCollectedInput;
-      _hasCompletedIntroduction = _hasCompletedIntroduction || countAsProgress;
-      if (_hasCompletedIntroduction) {
-        _visualStep = 2;
-      }
+      _hasCompletedIntroduction = hasCompletedIntroduction;
+      _visualStep = hasCompletedIntroduction ? 2 : 1;
       _pendingVoicePrompt = _resolvedOnboardingPrompt(
         assistantReply: assistantReply,
         isLoginConfirmationMode: isLoginConfirmationMode,
+        hasCompletedIntroduction: hasCompletedIntroduction,
         needsPhoneNumber: needsPhoneNumber,
       );
       _isListening = false;
@@ -453,6 +458,7 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
       _statusText = _resolvedOnboardingStatusText(
         assistantReply: assistantReply,
         isLoginConfirmationMode: isLoginConfirmationMode,
+        hasCompletedIntroduction: hasCompletedIntroduction,
         needsPhoneNumber: needsPhoneNumber,
       );
     });
@@ -521,15 +527,16 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   String _resolvedOnboardingPrompt({
     required String assistantReply,
     required bool isLoginConfirmationMode,
+    required bool hasCompletedIntroduction,
     required bool needsPhoneNumber,
   }) {
     if (isLoginConfirmationMode) {
       return '';
     }
-    if (needsPhoneNumber) {
+    if (needsPhoneNumber && hasCompletedIntroduction) {
       return 'Споделете телефонния си номер, за да продължите. Това е задължителна стъпка за вход.';
     }
-    if (!_hasCompletedIntroduction) {
+    if (!hasCompletedIntroduction) {
       return 'Кажете името си и малко за себе си.';
     }
     return assistantReply;
@@ -538,15 +545,16 @@ class _HelloAgainShellState extends State<HelloAgainShell> {
   String _resolvedOnboardingStatusText({
     required String assistantReply,
     required bool isLoginConfirmationMode,
+    required bool hasCompletedIntroduction,
     required bool needsPhoneNumber,
   }) {
     if (isLoginConfirmationMode) {
       return 'Потвърдете дали това е вашият профил.';
     }
-    if (needsPhoneNumber) {
+    if (needsPhoneNumber && hasCompletedIntroduction) {
       return 'Очаквам телефонния ви номер. Това е задължителна стъпка за вход.';
     }
-    if (!_hasCompletedIntroduction) {
+    if (!hasCompletedIntroduction) {
       return 'Очаквам да кажете името си и малко за себе си.';
     }
     return assistantReply.isEmpty

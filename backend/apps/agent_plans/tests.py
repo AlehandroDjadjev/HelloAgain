@@ -81,6 +81,9 @@ class BrawlStarsSupportTests(SimpleTestCase):
             "risk_level": "low",
             "confidence": 0.15,
             "ambiguity_flags": ["not_actionable_request"],
+            "needs_clarification": True,
+            "missing_fields": ["target_app", "goal"],
+            "clarification_question": "В кое приложение и какво действие искате да направя?",
         }
 
         result = IntentService(client=client).parse_intent("How are you today?")
@@ -89,6 +92,11 @@ class BrawlStarsSupportTests(SimpleTestCase):
         self.assertEqual(result.app_package, "")
         self.assertIn("not_actionable_request", result.ambiguity_flags)
         self.assertLess(result.confidence, 0.5)
+        self.assertTrue(result.needs_clarification)
+        self.assertEqual(
+            result.clarification_question,
+            "В кое приложение и какво действие искате да направя?",
+        )
 
     def test_keyword_fallback_marks_unknown_request_as_invalid(self):
         result = IntentService()._fallback_service.parse("Tell me a joke")
@@ -104,6 +112,82 @@ class BrawlStarsSupportTests(SimpleTestCase):
         self.assertEqual(result.goal_type, "navigate_to")
         self.assertEqual(result.app_package, "com.google.android.apps.maps")
         self.assertEqual(result.entities.get("destination"), "central park")
+
+    def test_parse_intent_marks_send_message_missing_details_for_clarification(self):
+        client = Mock()
+        client.generate.return_value = {
+            "goal": "Send a message",
+            "goal_type": "send_message",
+            "target_app": "com.whatsapp",
+            "entities": {},
+            "risk_level": "high",
+            "confidence": 0.72,
+            "ambiguity_flags": [],
+            "needs_clarification": True,
+            "missing_fields": ["recipient", "message"],
+            "clarification_question": "На кого да пиша и какво да кажа?",
+        }
+
+        result = IntentService(client=client).parse_intent("Send a WhatsApp message")
+
+        self.assertTrue(result.needs_clarification)
+        self.assertEqual(result.missing_fields, ["recipient", "message"])
+        self.assertEqual(
+            result.clarification_question,
+            "На кого да пиша и какво да кажа?",
+        )
+
+    def test_parse_intent_marks_navigation_missing_destination_for_clarification(self):
+        client = Mock()
+        client.generate.return_value = {
+            "goal": "Navigate somewhere",
+            "goal_type": "navigate_to",
+            "target_app": "com.google.android.apps.maps",
+            "entities": {},
+            "risk_level": "medium",
+            "confidence": 0.81,
+            "ambiguity_flags": [],
+            "needs_clarification": True,
+            "missing_fields": ["destination"],
+            "clarification_question": "Накъде да навигирам?",
+        }
+
+        result = IntentService(client=client).parse_intent("Open Maps and navigate")
+
+        self.assertTrue(result.needs_clarification)
+        self.assertEqual(result.missing_fields, ["destination"])
+        self.assertEqual(result.clarification_question, "Накъде да навигирам?")
+
+    def test_parse_intent_uses_follow_up_context_for_relative_command(self):
+        client = Mock()
+        client.generate.return_value = {
+            "goal": "Превърти надолу в текущия изглед",
+            "goal_type": "scroll_view",
+            "target_app": "",
+            "entities": {"direction": "down"},
+            "risk_level": "low",
+            "confidence": 0.84,
+            "ambiguity_flags": [],
+            "needs_clarification": False,
+            "missing_fields": [],
+            "clarification_question": "",
+        }
+
+        result = IntentService(client=client).parse_intent(
+            "Scroll and look at the websites there",
+            supported_packages=["com.android.chrome", "com.whatsapp"],
+            context={
+                "follow_up_mode": True,
+                "current_app_package": "com.android.chrome",
+                "current_app_name": "Chrome",
+                "previous_goal": "Search for weather in Chrome",
+            },
+        )
+
+        self.assertEqual(result.app_package, "com.android.chrome")
+        self.assertEqual(result.target_app, "Chrome")
+        self.assertEqual(result.goal_type, "scroll_view")
+        self.assertFalse(result.needs_clarification)
 
 
 class PlanServiceStoreIntentTests(TestCase):
