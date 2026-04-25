@@ -9,8 +9,10 @@ import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'browser_voice_bridge.dart';
+import 'google_calendar_connect.dart';
 import 'src/config/backend_base_url.dart';
 import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
@@ -138,7 +140,7 @@ class WhitespaceLaunchConfig {
       resolvedDisplayName != null;
 }
 
-enum HelloAgainStage { booting, intro, onboarding, board }
+enum HelloAgainStage { booting, intro, onboarding, googleCalendar, board }
 
 class StandaloneWhitespaceShell extends StatefulWidget {
   const StandaloneWhitespaceShell({
@@ -153,7 +155,8 @@ class StandaloneWhitespaceShell extends StatefulWidget {
       _StandaloneWhitespaceShellState();
 }
 
-class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
+class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell>
+    with WidgetsBindingObserver {
   static const _tokenKey = 'hello_again.account_token';
 
   late final AgentBackendClient _backendClient;
@@ -167,11 +170,18 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
   bool _isListening = false;
   bool _isWorking = false;
   bool _isConfirming = false;
+  bool _isGoogleCalendarWorking = false;
+  bool _googleCalendarConnected = false;
   int _currentStepIndex = 0;
   String _statusText = 'Preparing Hello Again...';
   String _promptText = '';
   String _transcriptPreview = '';
+  String _googleCalendarEmail = '';
+  String _googleCalendarStatusText =
+      'You can connect Google Calendar now or skip it.';
   final Map<String, String> _answers = <String, String>{};
+  Map<String, dynamic>? _registrationLocationPayload;
+  AppAccountSession? _pendingGoogleCalendarSession;
 
   static const List<_RegistrationStep> _steps = [
     _RegistrationStep(
@@ -213,6 +223,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _backendClient = AgentBackendClient();
     _voiceBridge = createBrowserVoiceBridge();
     unawaited(_bootstrap());
@@ -220,9 +231,19 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _voiceBridge.stopRecognition();
     _voiceBridge.stopAudio();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        _stage == HelloAgainStage.googleCalendar &&
+        _pendingGoogleCalendarSession != null) {
+      unawaited(_refreshGoogleCalendarStatus());
+    }
   }
 
   Future<void> _bootstrap() async {
@@ -242,6 +263,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
         _statusText = 'A calm start is ready.';
       }
     });
+    unawaited(_ensureRegistrationLocation());
   }
 
   Future<_ResolvedWhitespaceLaunch?> _resolveLaunch(
@@ -325,14 +347,36 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
       });
       return;
     }
+    unawaited(_prepareOnboardingLocationPermission());
+  }
+
+  Future<void> _prepareOnboardingLocationPermission() async {
+    final location = await _ensureRegistrationLocation();
+    if (!mounted) return;
     setState(() {
       _showContinue = true;
-      _statusText = 'Tap Continue and I will guide you through registration.';
+      if (location == null) {
+        _statusText =
+            'Before onboarding, please allow location so meetup planning can work well.';
+      } else {
+        _statusText = 'Tap Continue and I will guide you through registration.';
+      }
     });
   }
 
   Future<void> _startRegistration() async {
     if (_isWorking) return;
+    final location = await _ensureRegistrationLocation();
+    if (location == null) {
+      if (!mounted) return;
+      setState(() {
+        _showContinue = true;
+        _stage = HelloAgainStage.intro;
+        _statusText =
+            'Location access is needed before registration so meetup suggestions can work.';
+      });
+      return;
+    }
     setState(() {
       _showContinue = false;
       _stage = HelloAgainStage.onboarding;
@@ -340,8 +384,50 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
       _answers.clear();
       _transcriptPreview = '';
       _isConfirming = false;
+      _registrationLocationPayload = location;
     });
     await _runCurrentStep();
+  }
+
+  Future<Map<String, dynamic>?> _ensureRegistrationLocation() async {
+    if (_registrationLocationPayload != null) {
+      return _registrationLocationPayload;
+    }
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        return null;
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return null;
+      }
+      Position? position;
+      try {
+        position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.medium,
+          ),
+        );
+      } catch (_) {
+        position = await Geolocator.getLastKnownPosition();
+      }
+      if (position == null) {
+        return null;
+      }
+      _registrationLocationPayload = <String, dynamic>{
+        'lat': position.latitude,
+        'lng': position.longitude,
+        'timezone': DateTime.now().timeZoneName,
+      };
+      return _registrationLocationPayload;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> _runCurrentStep() async {
@@ -613,20 +699,22 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
     };
 
     try {
+      final location = await _ensureRegistrationLocation();
+      if (location == null) {
+        throw StateError(
+          'Location access is required before registration can finish.',
+        );
+      }
       final session = await _backendClient.registerVoiceProfile(
         name: _answers['name'] ?? '',
         phoneNumber: _answers['phone_number'] ?? '',
         description: _answers['description'] ?? '',
         onboardingAnswers: onboardingAnswers,
+        homeLat: (location['lat'] as num).toDouble(),
+        homeLng: (location['lng'] as num).toDouble(),
       );
       await _prefs?.setString(_tokenKey, session.token);
-      if (!mounted) return;
-      setState(() {
-        _session = session;
-        _launch = _ResolvedWhitespaceLaunch.fromSession(session);
-        _stage = HelloAgainStage.board;
-        _isWorking = false;
-      });
+      await _enterGoogleCalendarStep(session);
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -635,6 +723,104 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
             'Registration could not finish. Tap once and I will repeat the current step. ${error.toString()}';
       });
     }
+  }
+
+  Future<void> _enterGoogleCalendarStep(AppAccountSession session) async {
+    if (!mounted) return;
+    setState(() {
+      _session = session;
+      _pendingGoogleCalendarSession = session;
+      _isWorking = false;
+      _stage = HelloAgainStage.googleCalendar;
+      _googleCalendarConnected = false;
+      _googleCalendarEmail = '';
+      _googleCalendarStatusText =
+          'Optional. Connect Google Calendar now, or skip for now.';
+    });
+    await _refreshGoogleCalendarStatus();
+  }
+
+  Future<void> _refreshGoogleCalendarStatus() async {
+    final session = _pendingGoogleCalendarSession;
+    if (session == null) return;
+    if (!mounted) return;
+    setState(() {
+      _isGoogleCalendarWorking = true;
+    });
+    try {
+      final payload = await _backendClient.fetchGoogleCalendarStatus(
+        token: session.token,
+      );
+      if (!mounted) return;
+      setState(() {
+        _googleCalendarConnected = (payload['connected'] ?? false) == true;
+        _googleCalendarEmail = (payload['google_email'] ?? '').toString().trim();
+        _googleCalendarStatusText = _googleCalendarConnected
+            ? 'Google Calendar is connected. You can continue into the app.'
+            : 'Optional. Add meetups and reminders to your phone calendar automatically.';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _googleCalendarStatusText =
+            'Google Calendar is optional. You can try connecting now or skip for now.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isGoogleCalendarWorking = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _startGoogleCalendarConnect() async {
+    final session = _pendingGoogleCalendarSession;
+    if (session == null || _isGoogleCalendarWorking) return;
+    setState(() {
+      _isGoogleCalendarWorking = true;
+      _googleCalendarStatusText =
+          'Opening Google sign-in. Return to HelloAgain after you finish.';
+    });
+    try {
+      final payload = await _backendClient.startGoogleCalendarConnect(
+        token: session.token,
+      );
+      final authUrl = (payload['auth_url'] ?? '').toString().trim();
+      if (authUrl.isEmpty) {
+        throw StateError('Google Calendar auth URL is missing.');
+      }
+      await launchUrl(
+        Uri.parse(authUrl),
+        mode: LaunchMode.externalApplication,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _googleCalendarStatusText =
+            'Google Calendar could not start right now. ${error.toString()}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isGoogleCalendarWorking = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _skipGoogleCalendarForNow() async {
+    await _continueIntoBoard();
+  }
+
+  Future<void> _continueIntoBoard() async {
+    final session = _pendingGoogleCalendarSession ?? _session;
+    if (session == null || !mounted) return;
+    setState(() {
+      _session = session;
+      _launch = _ResolvedWhitespaceLaunch.fromSession(session);
+      _stage = HelloAgainStage.board;
+    });
   }
 
   @override
@@ -662,6 +848,16 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
           stepNumber: _currentStepIndex + 1,
           stepCount: _steps.length,
           onRetry: _runCurrentStep,
+        );
+      case HelloAgainStage.googleCalendar:
+        return GoogleCalendarConnectView(
+          connected: _googleCalendarConnected,
+          connectedEmail: _googleCalendarEmail,
+          isWorking: _isGoogleCalendarWorking,
+          statusText: _googleCalendarStatusText,
+          onConnect: _startGoogleCalendarConnect,
+          onSkip: _skipGoogleCalendarForNow,
+          onContinue: _continueIntoBoard,
         );
       case HelloAgainStage.board:
         final session = _session;
@@ -1208,6 +1404,92 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   int _voiceLoopToken = 0;
   Future<void>? _activeSpeechPlayback;
 
+  Future<void> _openAccountSheet() async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _statusText = 'A logged-in account is required for Google Calendar.';
+      });
+      return;
+    }
+
+    Map<String, dynamic> statusPayload = const {
+      'connected': false,
+      'google_email': '',
+    };
+    try {
+      statusPayload = await _backendClient.fetchGoogleCalendarStatus(token: token);
+    } catch (_) {}
+    if (!mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (context) {
+        final connected = (statusPayload['connected'] ?? false) == true;
+        final email = (statusPayload['google_email'] ?? '').toString().trim();
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'Google Calendar',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  connected
+                      ? 'Connected as ${email.isEmpty ? 'your Google account' : email}.'
+                      : 'Optional. Connect Google Calendar to add meetup reminders later.',
+                ),
+                const SizedBox(height: 16),
+                if (!connected)
+                  ElevatedButton(
+                    onPressed: () async {
+                      Navigator.of(context).pop();
+                      final payload = await _backendClient.startGoogleCalendarConnect(
+                        token: token,
+                      );
+                      final authUrl = (payload['auth_url'] ?? '').toString().trim();
+                      if (authUrl.isNotEmpty) {
+                        await launchUrl(
+                          Uri.parse(authUrl),
+                          mode: LaunchMode.externalApplication,
+                        );
+                        if (mounted) {
+                          setState(() {
+                            _statusText =
+                                'Google sign-in opened. Return to HelloAgain when you finish.';
+                          });
+                        }
+                      }
+                    },
+                    child: const Text('Connect Google'),
+                  ),
+                if (connected)
+                  OutlinedButton(
+                    onPressed: () async {
+                      Navigator.of(context).pop();
+                      await _backendClient.disconnectGoogleCalendar(token: token);
+                      if (mounted) {
+                        setState(() {
+                          _statusText = 'Google Calendar has been disconnected.';
+                        });
+                      }
+                    },
+                    child: const Text('Disconnect'),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -1696,11 +1978,19 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
           permission == LocationPermission.deniedForever) {
         return null;
       }
-      final position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.medium,
-        ),
-      );
+      Position? position;
+      try {
+        position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.medium,
+          ),
+        );
+      } catch (_) {
+        position = await Geolocator.getLastKnownPosition();
+      }
+      if (position == null) {
+        return null;
+      }
       _cachedLocationPayload = <String, dynamic>{
         'lat': position.latitude,
         'lng': position.longitude,
@@ -1715,6 +2005,11 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   bool _promptNeedsPreciseLocation(String prompt) {
     final lowered = prompt.toLowerCase();
     const markers = <String>[
+      'meetup',
+      'meet up',
+      'hang out',
+      'go out with',
+      'meet with',
       'weather',
       'forecast',
       'temperature',
@@ -1734,6 +2029,12 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       'навън',
       'разходка',
       'на открито',
+      'среща',
+      'срещнем',
+      'излеза с',
+      'изляза с',
+      'искам да излеза с',
+      'искам да изляза с',
     ];
     return markers.any(lowered.contains);
   }
@@ -2142,6 +2443,17 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                         viewer: activePopup.viewer,
                       ),
                     ],
+                    Positioned(
+                      top: isCompact ? 14 : 20,
+                      right: horizontalPadding,
+                      child: SafeArea(
+                        child: IconButton(
+                          tooltip: 'Account',
+                          onPressed: _openAccountSheet,
+                          icon: const Icon(Icons.manage_accounts_outlined),
+                        ),
+                      ),
+                    ),
                     Positioned(
                       top: isCompact ? 68 : 78,
                       left: 0,
@@ -3728,6 +4040,8 @@ class AgentBackendClient {
     required String phoneNumber,
     required String description,
     required Map<String, String> onboardingAnswers,
+    required double homeLat,
+    required double homeLng,
   }) async {
     final payload = await _postJson('/api/accounts/register/', {
       'name': name,
@@ -3738,6 +4052,8 @@ class AgentBackendClient {
       'microphone_permission_granted': true,
       'voice_navigation_enabled': true,
       'onboarding_completed': true,
+      'home_lat': homeLat,
+      'home_lng': homeLng,
     });
     final profile = Map<String, dynamic>.from(
       payload['profile'] as Map? ?? const {},
@@ -3778,12 +4094,47 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> completeOnboarding({required String sessionId}) {
+  Future<Map<String, dynamic>> completeOnboarding({
+    required String sessionId,
+    required double homeLat,
+    required double homeLng,
+  }) {
     return _postJson('/api/accounts/onboarding/complete/', {
       'session_id': sessionId,
       'microphone_permission_granted': true,
       'phone_permission_granted': true,
+      'home_lat': homeLat,
+      'home_lng': homeLng,
     });
+  }
+
+  Future<Map<String, dynamic>> fetchGoogleCalendarStatus({
+    required String token,
+  }) {
+    return _getJson(
+      '/api/accounts/integrations/google/calendar/status/',
+      token: token,
+    );
+  }
+
+  Future<Map<String, dynamic>> startGoogleCalendarConnect({
+    required String token,
+  }) {
+    return _postJson(
+      '/api/accounts/integrations/google/calendar/connect/',
+      const {},
+      token: token,
+    );
+  }
+
+  Future<Map<String, dynamic>> disconnectGoogleCalendar({
+    required String token,
+  }) {
+    return _postJson(
+      '/api/accounts/integrations/google/calendar/disconnect/',
+      const {},
+      token: token,
+    );
   }
 
   Future<Map<String, dynamic>> fetchBoardMemory({

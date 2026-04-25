@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 import requests
@@ -72,6 +73,131 @@ def _advice(weather_code: int, temperature_c: float, is_day: bool) -> str:
 
 def _weather_label(weather_code: int) -> str:
     return _WEATHER_CODE_LABELS.get(weather_code, "Спокойно време")
+
+
+def extract_weather_day_offset(prompt: str | None) -> int:
+    lowered = " ".join(str(prompt or "").split()).strip().lower()
+    if not lowered:
+        return 0
+    if any(marker in lowered for marker in ("tomorrow", "утре")):
+        return 1
+    match = re.search(r"\b(?:in|след)\s+(\d+)\s+(?:days|day|дни|ден)\b", lowered)
+    if match:
+        try:
+            return max(0, int(match.group(1)))
+        except ValueError:
+            return 0
+    return 0
+
+
+def get_weather_snapshot(
+    *,
+    lat: float,
+    lng: float,
+    day_offset: int = 0,
+    timezone_name: str | None = None,
+) -> dict[str, Any]:
+    if day_offset <= 0:
+        return get_current_weather_snapshot(
+            lat=lat,
+            lng=lng,
+            timezone_name=timezone_name,
+        )
+
+    params = {
+        "latitude": lat,
+        "longitude": lng,
+        "daily": ",".join(
+            [
+                "weather_code",
+                "temperature_2m_max",
+                "temperature_2m_min",
+                "apparent_temperature_max",
+                "apparent_temperature_min",
+                "precipitation_probability_max",
+                "wind_speed_10m_max",
+            ]
+        ),
+        "timezone": timezone_name or "auto",
+        "forecast_days": max(day_offset + 1, 2),
+    }
+    response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params=params,
+        timeout=12,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    daily = payload.get("daily") if isinstance(payload.get("daily"), dict) else {}
+    daily_units = (
+        payload.get("daily_units")
+        if isinstance(payload.get("daily_units"), dict)
+        else {}
+    )
+
+    try:
+        forecast_date = str((daily.get("time") or [])[day_offset])
+        weather_code = int((daily.get("weather_code") or [])[day_offset] or 0)
+        temperature_max_c = float((daily.get("temperature_2m_max") or [])[day_offset] or 0.0)
+        temperature_min_c = float((daily.get("temperature_2m_min") or [])[day_offset] or 0.0)
+        apparent_temperature_max_c = float(
+            (daily.get("apparent_temperature_max") or [])[day_offset] or temperature_max_c
+        )
+        apparent_temperature_min_c = float(
+            (daily.get("apparent_temperature_min") or [])[day_offset] or temperature_min_c
+        )
+        precipitation_probability_max = float(
+            (daily.get("precipitation_probability_max") or [])[day_offset] or 0.0
+        )
+        wind_speed = float((daily.get("wind_speed_10m_max") or [])[day_offset] or 0.0)
+    except (IndexError, TypeError, ValueError) as exc:
+        raise ValueError("Forecast data is unavailable for that day.") from exc
+
+    label = _weather_label(weather_code)
+    summary = (
+        f"Утре {label.lower()}, "
+        f"между {round(temperature_min_c)}°C и {round(temperature_max_c)}°C"
+    )
+    return {
+        "widget_type": "weather_snapshot",
+        "title": "Времето утре",
+        "summary": summary,
+        "message": "Прогнозата за утре е готова.",
+        "surface_preference": "popup_only",
+        "board_object": {
+            "tags": [
+                "kind:weather_snapshot",
+                "source:weather",
+                "entity:weather_snapshot",
+            ],
+            "extra_data": {
+                "kind": "weather_snapshot",
+                "summary": summary,
+                "icon_key": _icon_key(weather_code, True),
+            },
+        },
+        "weather": {
+            "label": label,
+            "summary": summary,
+            "weather_code": weather_code,
+            "temperature_max_c": round(temperature_max_c, 1),
+            "temperature_min_c": round(temperature_min_c, 1),
+            "apparent_temperature_max_c": round(apparent_temperature_max_c, 1),
+            "apparent_temperature_min_c": round(apparent_temperature_min_c, 1),
+            "precipitation_probability_max": round(precipitation_probability_max, 1),
+            "wind_speed": round(wind_speed, 1),
+            "wind_unit": str(daily_units.get("wind_speed_10m_max") or "km/h"),
+            "temperature_unit": str(daily_units.get("temperature_2m_max") or "°C"),
+            "icon_key": _icon_key(weather_code, True),
+            "is_day": True,
+            "advice": _advice(weather_code, temperature_max_c, True),
+            "forecast_date": forecast_date,
+            "forecast_day_offset": day_offset,
+            "timezone": str(payload.get("timezone") or timezone_name or ""),
+            "latitude": round(float(lat), 6),
+            "longitude": round(float(lng), 6),
+        },
+    }
 
 
 def get_current_weather_snapshot(

@@ -9,7 +9,7 @@ from apps.agent_core.services.vision_reasoning import VisionReasoningService
 
 class VisionReasoningServiceConfigTests(SimpleTestCase):
     @override_settings(
-        OPENAI_LLM_MODEL="gpt-5-mini",
+        OPENAI_LLM_MODEL="gpt-4o-mini",
         OPENAI_LLM_API_KEY="sk-test",
         OPENAI_LLM_BASE_URL="https://api.openai.com/v1",
         OPENAI_LLM_TIMEOUT=27,

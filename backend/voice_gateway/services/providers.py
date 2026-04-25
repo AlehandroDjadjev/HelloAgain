@@ -29,7 +29,7 @@ DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 DEFAULT_ELEVENLABS_STT_MODEL = "scribe_v2"
 DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
 DEFAULT_ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "You are HelloAgain, a warm Bulgarian real-time voice assistant. "
@@ -772,6 +772,7 @@ class OpenAILLMProvider(LLMProvider):
         self.api_key = (
             api_key
             or _read_env_value("OPENAI_LLM_API_KEY")
+            or _read_env_value("OPENAI_API_KEY")
             or _read_env_value("LLM_API_KEY")
             or _read_env_value("OPEN_AI_KEY")
             or ""
@@ -1183,9 +1184,25 @@ class PiperTTSProvider(TextToSpeechProvider):
         self._voice = None
         self._load_error: Optional[str] = None
 
+    @staticmethod
+    def _piper_available() -> bool:
+        try:
+            return importlib.util.find_spec("piper") is not None
+        except ModuleNotFoundError:
+            return False
+
     def _ensure_voice(self):
-        if self._voice is not None or self._load_error is not None:
+        if self._voice is not None:
             return
+
+        if self._load_error is not None:
+            # If Piper was installed after an earlier failed request, allow a retry
+            # instead of pinning the provider in a broken state until full restart.
+            if "No module named 'piper'" in self._load_error and self._piper_available():
+                logger.info("Piper package is now available; retrying voice load.")
+                self._load_error = None
+            else:
+                return
 
         try:
             self.model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1274,14 +1291,11 @@ class PiperTTSProvider(TextToSpeechProvider):
         # Check the status of the voice model
         if self._voice is not None:
             return "ready"
+        if self._load_error is not None and "No module named 'piper'" in self._load_error and self._piper_available():
+            self._load_error = None
         if self._load_error is not None:
             return f"unavailable: {self._load_error}"
-        try:
-            piper_available = importlib.util.find_spec("piper") is not None
-        except ModuleNotFoundError:
-            piper_available = False
-
-        if not piper_available:
+        if not self._piper_available():
             return "unavailable: package_missing"
         if self.model_path.exists() and self.config_path.exists():
             return "configured"

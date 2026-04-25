@@ -62,6 +62,18 @@
         "Prefer it over connections.find_connection when the friend is already known by name.",
         "Pass only one friend selector, usually friend_name extracted from the prompt."
       ]
+    },
+    {
+      "id": "calendar",
+      "name": "calendar",
+      "description": "Creates a Google Calendar reminder for accepted meetups or explicit reminder requests.",
+      "descriptor_file": "calendar.json",
+      "descriptor_url": "/api/agent/mcps/calendar/",
+      "notes": [
+        "Use this after an accepted meetup or when the user explicitly asks to set a reminder or add something to the calendar.",
+        "For plain reminder requests, Google Calendar is the default target.",
+        "If Google Calendar is not connected, the tool should fail gracefully."
+      ]
     }
   ]
 }
