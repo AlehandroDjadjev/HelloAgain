@@ -5,7 +5,7 @@ import json
 from django.contrib.auth.models import User
 from django.db import transaction
 from django.db.models import Q
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -36,6 +36,7 @@ from .serializers import (
     RegisterSerializer,
 )
 from .agent_service import ConnectionsAgentService
+from .google_calendar_oauth_service import GoogleCalendarOAuthService
 from .onboarding_service import OnboardingService
 from .services import (
     build_match_summary,
@@ -66,6 +67,7 @@ from .whiteboard_service import AccountWhiteboardService
 connections_agent_service = ConnectionsAgentService()
 onboarding_service = OnboardingService()
 whiteboard_service = AccountWhiteboardService()
+google_calendar_oauth_service = GoogleCalendarOAuthService()
 
 
 def _json_ok(data: dict, status: int = 200) -> JsonResponse:
@@ -370,10 +372,89 @@ def onboarding_complete_view(request):
             serializer.validated_data["session_id"],
             microphone_permission_granted=serializer.validated_data["microphone_permission_granted"],
             phone_permission_granted=serializer.validated_data["phone_permission_granted"],
+            home_lat=serializer.validated_data["home_lat"],
+            home_lng=serializer.validated_data["home_lng"],
         )
     except ValueError as exc:
         return _json_error(str(exc), status=400)
     return _json_ok(payload, status=201)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def google_calendar_connect_view(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    payload = google_calendar_oauth_service.build_connect_url(viewer)
+    if not payload.get("success"):
+        return _json_error(
+            "Google Calendar connection is not configured right now.",
+            status=503,
+            code=str(payload.get("error") or "GOOGLE_OAUTH_NOT_CONFIGURED").upper(),
+        )
+    return _json_ok(
+        {
+            "status": "success",
+            "auth_url": payload["auth_url"],
+        }
+    )
+
+
+@require_http_methods(["GET"])
+def google_calendar_callback_view(request):
+    state = str(request.GET.get("state") or "").strip()
+    code = str(request.GET.get("code") or "").strip()
+    result = google_calendar_oauth_service.handle_callback(state=state, code=code)
+    if result.get("success"):
+        return HttpResponse(
+            """
+            <html>
+              <head><title>HelloAgain Google Calendar</title></head>
+              <body style="font-family: Arial, sans-serif; padding: 24px; background: #f7f4f3; color: #2f2725;">
+                <h2>Google Calendar connected</h2>
+                <p>You can return to HelloAgain now.</p>
+              </body>
+            </html>
+            """,
+            content_type="text/html; charset=utf-8",
+        )
+    return HttpResponse(
+        f"""
+        <html>
+          <head><title>HelloAgain Google Calendar</title></head>
+          <body style="font-family: Arial, sans-serif; padding: 24px; background: #f7f4f3; color: #2f2725;">
+            <h2>Google Calendar connection failed</h2>
+            <p>{str(result.get("error") or "Unknown error")}</p>
+            <p>Please return to HelloAgain and try again.</p>
+          </body>
+        </html>
+        """,
+        content_type="text/html; charset=utf-8",
+        status=400,
+    )
+
+
+@require_http_methods(["GET"])
+def google_calendar_status_view(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    status_payload = google_calendar_oauth_service.get_connection_status(viewer)
+    return _json_ok({"status": "success", **status_payload})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def google_calendar_disconnect_view(request):
+    viewer = _require_profile(request)
+    if isinstance(viewer, JsonResponse):
+        return viewer
+
+    payload = google_calendar_oauth_service.disconnect(viewer)
+    return _json_ok({"status": "success", **payload})
 
 
 @csrf_exempt
@@ -417,6 +498,8 @@ def register_view(request):
             contacts_permission_granted=data.get("contacts_permission_granted", False),
             share_phone_with_friends=data.get("share_phone_with_friends", False),
             share_email_with_friends=data.get("share_email_with_friends", False),
+            home_lat=data["home_lat"],
+            home_lng=data["home_lng"],
         )
         sync_profile_to_recommendations(profile, preserve_adaptation=False)
         seed_social_graph_for_profile(profile)

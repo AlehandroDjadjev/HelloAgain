@@ -36,7 +36,7 @@ class LLMClientConfigTests(SimpleTestCase):
         self.assertEqual(client.timeout, 61)
 
     @override_settings(
-        OPENAI_LLM_MODEL="gpt-5-mini",
+        OPENAI_LLM_MODEL="gpt-4o-mini",
         OPENAI_LLM_API_KEY="sk-test",
         OPENAI_LLM_BASE_URL="https://api.openai.com/v1",
         OPENAI_LLM_TIMEOUT=27,
@@ -45,7 +45,7 @@ class LLMClientConfigTests(SimpleTestCase):
         client = LLMClient.from_reasoning_provider("openai")
 
         self.assertEqual(client.provider, "openai")
-        self.assertEqual(client.model, "gpt-5-mini")
+        self.assertEqual(client.model, "gpt-4o-mini")
         self.assertEqual(client.api_key, "sk-test")
         self.assertEqual(client.base_url, "https://api.openai.com/v1")
         self.assertEqual(client.timeout, 27)

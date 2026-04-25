@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -42,13 +43,13 @@ class LocationResolver:
             raise LiveToolError("A location is required.")
 
         payload = self._fetch_json(
-            f"{self.base_url}?name={urllib.parse.quote(clean_location)}&count=1&language=en&format=json"
+            f"{self.base_url}?name={urllib.parse.quote(clean_location)}&count=5&language=bg&format=json"
         )
         results = payload.get("results") if isinstance(payload, dict) else None
         if not isinstance(results, list) or not results:
             raise LiveToolError(f"Could not resolve location '{clean_location}'.")
 
-        first = results[0] if isinstance(results[0], dict) else {}
+        first = self._pick_best_result(clean_location, results)
         name = ", ".join(
             part
             for part in [
@@ -76,6 +77,26 @@ class LocationResolver:
             country=str(first.get("country") or "").strip(),
             timezone=timezone_name,
         )
+
+    def _pick_best_result(self, query: str, results: list[Any]) -> dict[str, Any]:
+        clean_query = " ".join(str(query or "").split()).strip().casefold()
+
+        def score(item: Any) -> tuple[int, int, int]:
+            if not isinstance(item, dict):
+                return (-1, -1, -1)
+            name = str(item.get("name") or "").strip().casefold()
+            feature_code = str(item.get("feature_code") or "").strip().upper()
+            try:
+                population = int(item.get("population") or 0)
+            except (TypeError, ValueError):
+                population = 0
+            exact_match = int(name == clean_query)
+            admin_score = 2 if feature_code == "PPLC" else 1 if feature_code.startswith("PPL") else 0
+            return (exact_match, admin_score, population)
+
+        ranked = sorted(results, key=score, reverse=True)
+        top = ranked[0] if ranked and isinstance(ranked[0], dict) else {}
+        return top
 
     def _fetch_json(self, url: str) -> dict[str, Any]:
         request = urllib.request.Request(
@@ -131,30 +152,123 @@ class WeatherService:
         self.resolver = resolver or LocationResolver()
 
     def get_current_weather(self, location: str) -> dict[str, Any]:
-        resolved = self.resolver.resolve(location)
+        return self.get_weather(prompt="", location=location)
+
+    def get_weather(
+        self,
+        *,
+        prompt: str,
+        location: str | None = None,
+        location_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        day_offset = self._extract_day_offset(prompt)
+        resolved = self._resolve_weather_location(location=location, location_payload=location_payload)
         params = {
             "latitude": resolved.latitude,
             "longitude": resolved.longitude,
             "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+            "daily": (
+                "weather_code,temperature_2m_max,temperature_2m_min,"
+                "apparent_temperature_max,apparent_temperature_min,"
+                "precipitation_probability_max,wind_speed_10m_max"
+            ),
             "timezone": resolved.timezone,
+            "forecast_days": max(day_offset + 1, 2),
         }
         payload = self._fetch_json(f"{self.base_url}?{urllib.parse.urlencode(params)}")
-        current = payload.get("current") if isinstance(payload, dict) else None
-        if not isinstance(current, dict):
-            raise LiveToolError(f"Weather data was unavailable for '{resolved.name}'.")
+        if day_offset <= 0:
+            current = payload.get("current") if isinstance(payload, dict) else None
+            if not isinstance(current, dict):
+                raise LiveToolError(f"Weather data was unavailable for '{resolved.name}'.")
 
-        weather_code = int(current.get("weather_code") or 0)
+            weather_code = int(current.get("weather_code") or 0)
+            return {
+                "tool_name": "weather",
+                "forecast_type": "current",
+                "location": resolved.as_dict(),
+                "temperature_c": current.get("temperature_2m"),
+                "apparent_temperature_c": current.get("apparent_temperature"),
+                "wind_speed_kmh": current.get("wind_speed_10m"),
+                "weather_code": weather_code,
+                "weather_description": self.weather_codes.get(weather_code, "unknown conditions"),
+                "observed_at": current.get("time"),
+                "source": "open-meteo",
+            }
+
+        daily = payload.get("daily") if isinstance(payload, dict) else None
+        if not isinstance(daily, dict):
+            raise LiveToolError(f"Forecast data was unavailable for '{resolved.name}'.")
+
+        try:
+            forecast_date = str((daily.get("time") or [])[day_offset])
+            weather_code = int((daily.get("weather_code") or [])[day_offset] or 0)
+            temperature_max_c = (daily.get("temperature_2m_max") or [])[day_offset]
+            temperature_min_c = (daily.get("temperature_2m_min") or [])[day_offset]
+            apparent_temperature_max_c = (daily.get("apparent_temperature_max") or [])[day_offset]
+            apparent_temperature_min_c = (daily.get("apparent_temperature_min") or [])[day_offset]
+            precipitation_probability_max = (daily.get("precipitation_probability_max") or [])[day_offset]
+            wind_speed_kmh = (daily.get("wind_speed_10m_max") or [])[day_offset]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise LiveToolError(f"Forecast data was unavailable for '{resolved.name}'.") from exc
+
         return {
             "tool_name": "weather",
+            "forecast_type": "daily",
+            "forecast_day_offset": day_offset,
+            "forecast_day_label": "tomorrow" if day_offset == 1 else f"in {day_offset} days",
+            "forecast_date": forecast_date,
             "location": resolved.as_dict(),
-            "temperature_c": current.get("temperature_2m"),
-            "apparent_temperature_c": current.get("apparent_temperature"),
-            "wind_speed_kmh": current.get("wind_speed_10m"),
+            "temperature_max_c": temperature_max_c,
+            "temperature_min_c": temperature_min_c,
+            "apparent_temperature_max_c": apparent_temperature_max_c,
+            "apparent_temperature_min_c": apparent_temperature_min_c,
+            "precipitation_probability_max": precipitation_probability_max,
+            "wind_speed_kmh": wind_speed_kmh,
             "weather_code": weather_code,
             "weather_description": self.weather_codes.get(weather_code, "unknown conditions"),
-            "observed_at": current.get("time"),
             "source": "open-meteo",
         }
+
+    def _resolve_weather_location(
+        self,
+        *,
+        location: str | None,
+        location_payload: dict[str, Any] | None,
+    ) -> ResolvedLocation:
+        clean_location = " ".join(str(location or "").split()).strip()
+        if clean_location:
+            return self.resolver.resolve(clean_location)
+
+        candidate = location_payload if isinstance(location_payload, dict) else {}
+        try:
+            latitude = float(candidate.get("lat"))
+            longitude = float(candidate.get("lng"))
+        except (TypeError, ValueError):
+            raise LiveToolError("A location is required.") from None
+        timezone_name = " ".join(str(candidate.get("timezone") or "").split()).strip() or "auto"
+        label = "your location"
+        return ResolvedLocation(
+            query=label,
+            name=label,
+            latitude=latitude,
+            longitude=longitude,
+            country="",
+            timezone=timezone_name,
+        )
+
+    def _extract_day_offset(self, prompt: str) -> int:
+        lowered = " ".join(str(prompt or "").split()).strip().lower()
+        if not lowered:
+            return 0
+        if any(marker in lowered for marker in ("tomorrow", "утре")):
+            return 1
+        in_days_match = re.search(r"\b(?:in|след)\s+(\d+)\s+(?:days|day|дни|ден)\b", lowered)
+        if in_days_match:
+            try:
+                return max(0, int(in_days_match.group(1)))
+            except ValueError:
+                return 0
+        return 0
 
     def _fetch_json(self, url: str) -> dict[str, Any]:
         request = urllib.request.Request(

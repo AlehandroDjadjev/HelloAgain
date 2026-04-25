@@ -332,6 +332,8 @@ def respond_meetup_invite(request, invite_id: int):
 
     generated_notifications = []
     calendar_results = []
+    viewer_calendar_result = None
+    calendar_speech_text = ""
     if action == "accept":
         accepted_note = create_meetup_notification(
             recipient=invite.requester_profile,
@@ -391,6 +393,16 @@ def respond_meetup_invite(request, invite_id: int):
                     ),
                 }
             )
+        viewer_calendar_result = next(
+            (
+                item
+                for item in calendar_results
+                if str(item.get("user_id") or "") == str(viewer.user_id)
+            ),
+            None,
+        )
+        if isinstance(viewer_calendar_result, dict):
+            calendar_speech_text = str(viewer_calendar_result.get("speech_text") or "").strip()
 
     elif action == "decline":
         declined_note = create_meetup_notification(
@@ -425,5 +437,7 @@ def respond_meetup_invite(request, invite_id: int):
             "invite": invite_payload(invite, viewer.id),
             "notifications": generated_notifications,
             "calendar_results": calendar_results,
+            "viewer_calendar_result": viewer_calendar_result,
+            "speech_text": calendar_speech_text,
         }
     )

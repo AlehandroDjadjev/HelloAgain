@@ -162,6 +162,8 @@ class OnboardingService:
         *,
         microphone_permission_granted: bool,
         phone_permission_granted: bool,
+        home_lat: float,
+        home_lng: float,
     ) -> dict[str, Any]:
         draft = self._require_draft(session_id)
         missing = self._missing_fields(draft)
@@ -198,6 +200,8 @@ class OnboardingService:
                 voice_navigation_enabled=True,
                 microphone_permission_granted=microphone_permission_granted,
                 phone_permission_granted=phone_permission_granted,
+                home_lat=home_lat,
+                home_lng=home_lng,
             )
             sync_profile_to_recommendations(profile, preserve_adaptation=False)
             seed_social_graph_for_profile(profile)

@@ -49,7 +49,7 @@ class LLMParseError(LLMError):
 _PROVIDER_DEFAULTS: dict[str, dict] = {
     "ollama": {"base_url": "http://localhost:11434", "model": "qwen2.5:14b"},
     "groq": {"base_url": "https://api.groq.com/openai/v1", "model": "llama-3.1-8b-instant"},
-    "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-5-mini"},
+    "openai": {"base_url": "https://api.openai.com/v1", "model": "gpt-4o-mini"},
     "transformers": {"base_url": "", "model": "Qwen/Qwen3-14B"},
 }
 
@@ -118,7 +118,7 @@ class LLMClient:
         if provider_key == "openai":
             return cls(
                 provider="openai",
-                model=getattr(settings, "OPENAI_LLM_MODEL", "gpt-5-mini"),
+                model=getattr(settings, "OPENAI_LLM_MODEL", "gpt-4o-mini"),
                 api_key=getattr(settings, "OPENAI_LLM_API_KEY", ""),
                 base_url=getattr(settings, "OPENAI_LLM_BASE_URL", None),
                 timeout=getattr(

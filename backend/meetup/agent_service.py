@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 import re
 from typing import Any
 
@@ -126,8 +127,84 @@ def next_accepted_meeting(profile: AccountProfile, exclude_invite_id: int | None
     return qs.order_by("proposed_time", "id").first()
 
 
+_CYRILLIC_TO_LATIN = {
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "y",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "h",
+    "ц": "ts",
+    "ч": "ch",
+    "ш": "sh",
+    "щ": "sht",
+    "ъ": "a",
+    "ь": "",
+    "ю": "yu",
+    "я": "ya",
+}
+
+
+def _compact_name_tokens(value: str) -> str:
+    return " ".join(re.findall(r"[0-9a-zа-я]+", str(value or "").casefold()))
+
+
+def _latinize_bulgarian_name(value: str) -> str:
+    compact = _compact_name_tokens(value)
+    return "".join(_CYRILLIC_TO_LATIN.get(char, char) for char in compact)
+
+
 def normalize_friend_name(value: object) -> str:
-    return " ".join(str(value or "").split()).casefold()
+    return _compact_name_tokens(str(value or ""))
+
+
+def friend_name_variants(value: object) -> set[str]:
+    normalized = normalize_friend_name(value)
+    variants = {normalized} if normalized else set()
+    latinized = _latinize_bulgarian_name(str(value or ""))
+    if latinized:
+        variants.add(latinized)
+    return variants
+
+
+def _first_friend_name_tokens(value: object) -> set[str]:
+    variants = friend_name_variants(value)
+    tokens: set[str] = set()
+    for variant in variants:
+        first = variant.split(" ", 1)[0].strip()
+        if first:
+            tokens.add(first)
+    return tokens
+
+
+def _friend_name_similarity(left: object, right: object) -> float:
+    left_variants = friend_name_variants(left)
+    right_variants = friend_name_variants(right)
+    best_score = 0.0
+    for left_variant in left_variants:
+        for right_variant in right_variants:
+            best_score = max(best_score, SequenceMatcher(None, left_variant, right_variant).ratio())
+            left_first = left_variant.split(" ", 1)[0].strip()
+            right_first = right_variant.split(" ", 1)[0].strip()
+            if left_first and right_first:
+                best_score = max(best_score, SequenceMatcher(None, left_first, right_first).ratio())
+    return best_score
 
 
 def accepted_friends_for_profile(profile: AccountProfile) -> list[AccountProfile]:
@@ -190,11 +267,35 @@ def resolve_meetup_friend(
             )
 
     if has_friend_name:
-        normalized_name = normalize_friend_name(friend_name_raw)
+        requested_variants = friend_name_variants(friend_name_raw)
+        friends = accepted_friends_for_profile(viewer)
         matches = [
-            friend for friend in accepted_friends_for_profile(viewer)
-            if normalize_friend_name(friend.display_name) == normalized_name
+            friend
+            for friend in friends
+            if requested_variants & friend_name_variants(friend.display_name)
         ]
+        if not matches and len(requested_variants) == 1:
+            requested_first_token = next(iter(requested_variants)).split(" ", 1)[0].strip()
+            if requested_first_token:
+                matches = [
+                    friend
+                    for friend in friends
+                    if requested_first_token in _first_friend_name_tokens(friend.display_name)
+                ]
+        if not matches:
+            fuzzy_matches: list[tuple[float, AccountProfile]] = []
+            for friend in friends:
+                score = _friend_name_similarity(friend_name_raw, friend.display_name)
+                if score >= 0.82:
+                    fuzzy_matches.append((score, friend))
+            fuzzy_matches.sort(key=lambda item: item[0], reverse=True)
+            if fuzzy_matches:
+                best_score = fuzzy_matches[0][0]
+                matches = [
+                    friend
+                    for score, friend in fuzzy_matches
+                    if abs(score - best_score) < 0.015
+                ]
         if not matches:
             raise MeetupRequestError(
                 "No accepted friend was found with that name.",
@@ -502,6 +603,7 @@ class MeetupAgentService:
         agent_user_id: str | None,
         prompt: str,
         friend_name: str | None = None,
+        viewer_location: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         clean_prompt = " ".join(str(prompt or "").split()).strip()
         if not clean_prompt:
@@ -512,12 +614,12 @@ class MeetupAgentService:
         if not resolved_friend_name:
             raise ValueError("Friend name is required for meetup planning.")
 
-        proposed_time = timezone.now() + timedelta(hours=2)
         try:
             invite, notification = create_friend_meetup_proposal(
                 viewer=viewer,
                 friend_name=resolved_friend_name,
-                proposed_time=proposed_time,
+                requester_location=viewer_location or {},
+                proposed_time=None,
             )
         except MeetupRequestError as exc:
             raise ValueError(exc.message) from exc

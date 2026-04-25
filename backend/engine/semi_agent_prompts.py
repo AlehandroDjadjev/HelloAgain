@@ -50,6 +50,9 @@ CALENDAR TOOL CHOICE RULES:
 - Only use it when the meetup has confirmed `start_time`, `end_time`, and `location`.
 - Do not use it for tentative, suggested, pending, or incomplete meetups.
 - If the tool returns a Google-connection error, do not retry with fake data.
+- Also use `calendar.create_meetup_reminder` for explicit reminder requests like set a reminder, add to calendar, remind me, `напомни ми`, `сложи ми напомняне`, or `добави в календара`.
+- For plain reminder requests, Google Calendar is the default target calendar.
+- If the prompt already contains the reminder details, you may pass only the original `prompt` and `user_id`. The backend can infer the final event fields.
 
 PHONE TOOL CHOICE RULES:
 - Use `phone_command.open_phone_command` when the request is about operating the phone, launching a phone flow, opening an app through the phone, or creating a clickable launcher object for a navigation / phone command prompt.

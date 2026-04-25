@@ -116,6 +116,25 @@ class MeetupSemanticRankingTests(TestCase):
 		self.assertIn('graph_place_score', rows[0]['score_breakdown'])
 		self.assertGreaterEqual(rows[0]['score_breakdown']['graph_place_score'], 0.5)
 
+	def test_places_api_unavailable_falls_back_to_midpoint_suggestion(self, *_):
+		with patch('meetup.services.fetch_places', return_value=[]), patch(
+			'meetup.services.fetch_weather',
+			side_effect=_mock_weather,
+		):
+			rows = get_ranked_meetup_spots(
+				coordinates=[{'lat': 42.69, 'lng': 23.34}, {'lat': 42.688, 'lng': 23.335}],
+				participant_descriptions=[
+					'Обичам спокойни срещи на кафе.',
+					'И аз предпочитам разговори и спокойно място.',
+				],
+				top_n=1,
+			)
+
+		self.assertTrue(rows)
+		self.assertEqual(rows[0]['place_source'], 'fallback_midpoint')
+		self.assertIn('средна точка', rows[0]['vicinity'].lower())
+		self.assertIn('неутрална средна точка', rows[0]['explanation'].lower())
+
 	def test_similar_interests_different_tone_remain_high(self, *_):
 		rows = get_ranked_meetup_spots(
 			coordinates=[{'lat': 42.69, 'lng': 23.34}, {'lat': 42.688, 'lng': 23.335}],
@@ -383,6 +402,54 @@ class MeetupInviteNotificationApiTests(TestCase):
 		self.assertEqual(response.status_code, 201)
 		self.assertEqual(response.json()['invite']['invited_user_id'], self.invited_user.id)
 
+	@patch('meetup.views.get_best_meetup_spot')
+	def test_propose_accepts_bulgarian_transliterated_friend_name(self, mock_best):
+		mock_best.return_value = {
+			'place_name': 'Talk Cafe',
+			'place_lat': 42.688,
+			'place_lng': 23.335,
+			'weather': 'Ясно',
+			'temperature': 23,
+			'score': 82,
+			'recommended_time': '2026-03-28 16:00',
+		}
+		self.invited_profile.display_name = 'Georgi Marinov'
+		self.invited_profile.save(update_fields=['display_name'])
+
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps({'friend_name': 'Георги Маринов'}),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(response.json()['invite']['invited_user_id'], self.invited_user.id)
+
+	@patch('meetup.views.get_best_meetup_spot')
+	def test_propose_accepts_close_latin_spelling_variant(self, mock_best):
+		mock_best.return_value = {
+			'place_name': 'Talk Cafe',
+			'place_lat': 42.688,
+			'place_lng': 23.335,
+			'weather': 'Ясно',
+			'temperature': 23,
+			'score': 82,
+			'recommended_time': '2026-03-28 16:00',
+		}
+		self.invited_profile.display_name = 'Kristian Bonev'
+		self.invited_profile.save(update_fields=['display_name'])
+
+		response = self.client.post(
+			'/api/meetup/friends/propose/',
+			data=json.dumps({'friend_name': 'Kristiqn Bonev'}),
+			content_type='application/json',
+			**self._headers(self.requester_token.key),
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(response.json()['invite']['invited_user_id'], self.invited_user.id)
+
 	def test_propose_rejects_non_friend_user_id(self):
 		outsider_user = User.objects.create_user(username='outsider', password='x')
 		AccountProfile.objects.create(
@@ -562,6 +629,12 @@ class MeetupInviteNotificationApiTests(TestCase):
 		self.assertEqual(len(body['calendar_results']), 2)
 		self.assertTrue(body['calendar_results'][0]['success'])
 		self.assertEqual(body['calendar_results'][1]['error'], 'google_calendar_not_connected')
+		self.assertEqual(body['viewer_calendar_result']['user_id'], str(self.invited_user.id))
+		self.assertFalse(body['viewer_calendar_result']['success'])
+		self.assertEqual(
+			body['speech_text'],
+			'Срещата бе приета,но календарът не работи в момента.',
+		)
 
 	def test_notifications_feed_hides_future_reminders_until_due(self):
 		invite = MeetupInvite.objects.create(

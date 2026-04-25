@@ -20,6 +20,26 @@ urlpatterns = [
     path("login/", views.login_view, name="accounts_login"),
     path("logout/", views.logout_view, name="accounts_logout"),
     path("me/", views.me_view, name="accounts_me"),
+    path(
+        "integrations/google/calendar/connect/",
+        views.google_calendar_connect_view,
+        name="accounts_google_calendar_connect",
+    ),
+    path(
+        "integrations/google/calendar/callback/",
+        views.google_calendar_callback_view,
+        name="accounts_google_calendar_callback",
+    ),
+    path(
+        "integrations/google/calendar/status/",
+        views.google_calendar_status_view,
+        name="accounts_google_calendar_status",
+    ),
+    path(
+        "integrations/google/calendar/disconnect/",
+        views.google_calendar_disconnect_view,
+        name="accounts_google_calendar_disconnect",
+    ),
     path("me/board-state/", views.me_board_state_view, name="accounts_me_board_state"),
     path("agent/profile/update/", views.agent_profile_update_view, name="accounts_agent_profile_update"),
     path("agent/connections/find/", views.agent_find_connection_view, name="accounts_agent_find_connection"),

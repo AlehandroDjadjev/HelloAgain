@@ -2,14 +2,14 @@
   "id": "calendar",
   "protocol": "at_home_mcp",
   "kind": "backend_integrated_toolset",
-  "description": "Creates a Google Calendar reminder for a confirmed accepted meetup when time and place are already known.",
+  "description": "Creates a Google Calendar reminder or calendar event for an accepted meetup or an explicit reminder request.",
   "invoke_url": "/api/agent/mcps/calendar/invoke/",
   "tools": [
     {
       "name": "create_meetup_reminder",
       "method": "POST",
       "path": "/api/agent/mcps/calendar/invoke/",
-      "description": "Use this only for accepted meetups that already have a confirmed time and place, and only when the user has connected Google Calendar.",
+      "description": "Use this for accepted meetups with full details, or for explicit reminder and add to calendar requests. Google Calendar is the default target.",
       "body_schema": {
         "prompt": "string",
         "user_id": "string",
