@@ -9,6 +9,11 @@ import requests
 from django.utils import timezone
 
 from apps.accounts.models import AccountProfile, GoogleCalendarConnection
+from apps.accounts.google_calendar_crypto import encrypt_token
+from apps.accounts.google_calendar_oauth_service import (
+    decrypt_google_access_token,
+    decrypt_google_refresh_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +27,7 @@ class GoogleCalendarService:
         title: str,
         start_time: str,
         end_time: str,
-        location: str,
+        location: str = "",
         description: str | None = None,
         reminder_minutes: int = 30,
     ) -> dict[str, Any]:
@@ -34,7 +39,7 @@ class GoogleCalendarService:
         clean_description = str(description or "").strip()
         reminder_value = max(0, int(reminder_minutes or 30))
 
-        if not all([clean_user_id, clean_title, clean_start, clean_end, clean_location]):
+        if not all([clean_user_id, clean_title, clean_start, clean_end]):
             return {"success": False, "error": "missing_required_fields"}
 
         profile = AccountProfile.objects.select_related("user").filter(user_id=clean_user_id).first()
@@ -51,7 +56,6 @@ class GoogleCalendarService:
 
         payload = {
             "summary": clean_title,
-            "location": clean_location,
             "description": clean_description or "Meetup planned through HelloAgain",
             "start": {"dateTime": clean_start},
             "end": {"dateTime": clean_end},
@@ -60,6 +64,8 @@ class GoogleCalendarService:
                 "overrides": [{"method": "popup", "minutes": reminder_value}],
             },
         }
+        if clean_location:
+            payload["location"] = clean_location
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -134,8 +140,9 @@ class GoogleCalendarService:
         }
 
     def _get_valid_access_token(self, connection: GoogleCalendarConnection) -> str:
-        if connection.access_token and not self._token_is_expired(connection):
-            return connection.access_token
+        access_token = decrypt_google_access_token(connection)
+        if access_token and not self._token_is_expired(connection):
+            return access_token
         return self._refresh_access_token(connection)
 
     def _token_is_expired(self, connection: GoogleCalendarConnection) -> bool:
@@ -144,7 +151,8 @@ class GoogleCalendarService:
         return connection.expires_at <= timezone.now() + timedelta(minutes=2)
 
     def _refresh_access_token(self, connection: GoogleCalendarConnection) -> str:
-        if not connection.refresh_token:
+        refresh_token = decrypt_google_refresh_token(connection)
+        if not refresh_token:
             return ""
 
         client_id = str(os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or "").strip()
@@ -156,7 +164,7 @@ class GoogleCalendarService:
         payload = {
             "client_id": client_id,
             "client_secret": client_secret,
-            "refresh_token": connection.refresh_token,
+            "refresh_token": refresh_token,
             "grant_type": "refresh_token",
         }
         try:
@@ -184,7 +192,7 @@ class GoogleCalendarService:
         if not access_token:
             return ""
 
-        connection.access_token = access_token
+        connection.access_token = encrypt_token(access_token)
         connection.expires_at = timezone.now() + timedelta(seconds=max(60, expires_in))
         connection.save(update_fields=["access_token", "expires_at", "updated_at"])
         return access_token

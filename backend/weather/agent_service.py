@@ -4,7 +4,7 @@ from typing import Any
 
 from apps.accounts.models import AccountProfile
 
-from .services import get_current_weather_snapshot
+from .services import extract_weather_day_offset, get_weather_snapshot
 
 
 class WeatherAgentService:
@@ -51,9 +51,10 @@ class WeatherAgentService:
         if not clean_prompt:
             raise ValueError("prompt required")
         lat, lng = self.resolve_location(agent_user_id=agent_user_id, location=location)
-        return get_current_weather_snapshot(
+        return get_weather_snapshot(
             lat=lat,
             lng=lng,
+            day_offset=extract_weather_day_offset(clean_prompt),
             timezone_name=timezone_name,
         )
 

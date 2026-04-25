@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import json
+import logging
 import math
+import os
 import re
 import time
 import uuid
@@ -33,6 +36,9 @@ from voice_gateway.services.providers import (
 
 if TYPE_CHECKING:
     from .graph_service import GraphService
+
+
+logger = logging.getLogger(__name__)
 
 
 class SemiAgentService:
@@ -84,8 +90,12 @@ class SemiAgentService:
         self.registry = registry or CustomMcpRegistry()
         self.board_memory = board_memory or WhiteboardMemoryStore()
         self.llm_provider = llm_provider or OpenAILLMProvider()
-        self.router_llm_provider = router_llm_provider or OpenAILLMProvider(model="gpt-5.4-mini")
-        self.reasoning_llm_provider = reasoning_llm_provider or OpenAILLMProvider(model="gpt-5.4")
+        self.router_llm_provider = router_llm_provider or OpenAILLMProvider(
+            model=os.environ.get("SEMI_AGENT_ROUTER_MODEL", "gpt-4o-mini")
+        )
+        self.reasoning_llm_provider = reasoning_llm_provider or OpenAILLMProvider(
+            model=os.environ.get("SEMI_AGENT_REASONING_MODEL", "gpt-4o-mini")
+        )
         self.tts_provider = tts_provider or build_default_tts_provider()
         self.user_tracker = user_tracker or ActiveUserTracker()
         self.speech_history_store = speech_history_store or TemporaryChatHistoryStore()
@@ -553,6 +563,23 @@ class SemiAgentService:
     def _route_request(self, prompt: str, board_state: Dict[str, Any] | None) -> RouteDecision:
         clean_prompt = self._clean_text(prompt)
         fallback = self._fallback_route_decision(clean_prompt, board_state)
+        if self._looks_like_direct_weather_request(clean_prompt):
+            return RouteDecision(
+                route="live_tool",
+                reason="Heuristic routed to live_tool because the prompt is clearly about weather.",
+                tool_name="weather",
+                location=self._extract_location_hint(clean_prompt),
+            )
+        if self._looks_like_calendar_reminder_request(clean_prompt):
+            return RouteDecision(
+                route="semi_agent",
+                reason="Heuristic routed to semi_agent because the prompt explicitly asks to set a reminder or calendar event.",
+            )
+        if self._looks_like_direct_reasoning_request(clean_prompt):
+            return RouteDecision(
+                route="direct_reasoning",
+                reason="Heuristic routed to direct_reasoning because the prompt is a self contained knowledge request.",
+            )
         try:
             llm_result = self.router_llm_provider.generate_reply_with_messages(
                 system_prompt=self._build_route_system_prompt(),
@@ -580,11 +607,21 @@ class SemiAgentService:
                 decision = decision.model_copy(
                     update={
                         "tool_name": clean_tool_name,
-                        "location": self._clean_text(decision.location) or None,
+                        "location": self._extract_location_hint(clean_prompt)
+                        or self._clean_text(decision.location)
+                        or None,
                     }
                 )
             else:
                 decision = decision.model_copy(update={"tool_name": None, "location": None})
+            if self._looks_like_direct_weather_request(clean_prompt) and decision.route != "semi_agent":
+                decision = decision.model_copy(
+                    update={
+                        "route": "live_tool",
+                        "tool_name": "weather",
+                        "location": self._extract_location_hint(clean_prompt) or decision.location,
+                    }
+                )
             return decision
         except Exception:
             return fallback
@@ -641,10 +678,25 @@ class SemiAgentService:
     ) -> RouteDecision:
         lowered = self._clean_text(prompt).lower()
         location_hint = self._extract_location_hint(prompt)
+        if self._looks_like_direct_weather_request(prompt):
+            return RouteDecision(
+                route="live_tool",
+                reason="Fallback routed to live_tool because the prompt asks for weather or forecast information.",
+                tool_name="weather",
+                location=location_hint,
+            )
+        if self._looks_like_calendar_reminder_request(prompt):
+            return RouteDecision(
+                route="semi_agent",
+                reason="Fallback routed to semi_agent because the prompt explicitly asks to set a reminder or calendar event.",
+            )
         live_markers = {
             "weather": "weather",
             "temperature": "weather",
             "forecast": "weather",
+            "времето": "weather",
+            "температура": "weather",
+            "прогноза": "weather",
             "time in": "time",
             "current time": "time",
             "what time": "time",
@@ -682,8 +734,8 @@ class SemiAgentService:
             "show this on",
             "move this",
             "delete this",
-            "find me",
-            "connect me",
+            "find me a friend",
+            "connect me with",
         )
         if any(marker in lowered for marker in semi_agent_markers):
             return RouteDecision(
@@ -703,12 +755,14 @@ class SemiAgentService:
         )
 
     def _extract_location_hint(self, prompt: str) -> Optional[str]:
-        clean_prompt = self._clean_text(prompt)
+        clean_prompt = self._clean_text(prompt).rstrip(" .?!,;:")
         if not clean_prompt:
             return None
         patterns = (
             r"\b(?:in|for|at)\s+([A-ZА-Я][^?.!,]+)$",
             r"\b(?:weather|time)\s+(?:for|in)\s+([A-ZА-Я][^?.!,]+)$",
+            r"\b(?:в|за)\s+([A-ZА-Я][^?.!,]+)$",
+            r"\b(?:времето|часът|часа|прогнозата)\s+(?:в|за)\s+([A-ZА-Я][^?.!,]+)$",
         )
         for pattern in patterns:
             match = re.search(pattern, clean_prompt, flags=re.IGNORECASE)
@@ -788,7 +842,7 @@ class SemiAgentService:
         llm_source: str,
         warnings: List[str],
     ) -> Dict[str, Any]:
-        normalized_text = self._clean_text(assistant_text)
+        normalized_text = self._normalize_spoken_response_text(assistant_text)
         assistant_audio_base64 = ""
         assistant_audio_mime_type = ""
         tts_source = self.tts_provider.status()
@@ -845,6 +899,33 @@ class SemiAgentService:
             assistant_text=self._clean_text(assistant_text),
         )
 
+    def _normalize_spoken_response_text(self, text: str) -> str:
+        normalized = self._clean_text(text)
+        if not normalized:
+            return normalized
+        replacements = {
+            "“": "",
+            "”": "",
+            '"': "",
+            "'": "",
+            "(": ", ",
+            ")": "",
+            "[": ", ",
+            "]": "",
+            "{": ", ",
+            "}": "",
+            ";": ".",
+            ":": ".",
+        }
+        for source, target in replacements.items():
+            normalized = normalized.replace(source, target)
+        normalized = re.sub(r"\s*,\s*,+", ", ", normalized)
+        normalized = re.sub(r"\.\s*\.+", ".", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip(" ,.")
+        if normalized and normalized[-1] not in ".!?":
+            normalized = f"{normalized}."
+        return normalized
+
     def _run_direct_reasoning(
         self,
         *,
@@ -880,6 +961,7 @@ class SemiAgentService:
         *,
         prompt: str,
         board_state: Dict[str, Any] | None,
+        location: Dict[str, Any] | None,
         user_context: Dict[str, str],
         session_id: str,
         route_decision: RouteDecision,
@@ -890,6 +972,7 @@ class SemiAgentService:
             user_context=user_context,
             session_id=session_id,
             route_decision=route_decision,
+            location=location,
         )
         whitespace_payload = self._build_routed_whitespace_payload(
             prompt=prompt,
@@ -912,8 +995,23 @@ class SemiAgentService:
         tool_name: str,
         prompt: str,
         location: str,
+        location_payload: Dict[str, Any] | None,
+        user_id: str | None,
     ) -> Dict[str, Any]:
         if tool_name == "weather":
+            if not self._clean_text(location):
+                return self.weather_agent_service.get_current_weather_for_prompt(
+                    agent_user_id=user_id,
+                    prompt=prompt,
+                    location=location_payload,
+                    timezone_name=self._clean_text((location_payload or {}).get("timezone")) or None,
+                )
+            if hasattr(self.weather_service, "get_weather"):
+                return self.weather_service.get_weather(
+                    prompt=prompt,
+                    location=location or None,
+                    location_payload=location_payload,
+                )
             return self.weather_service.get_current_weather(location)
         if tool_name == "time":
             return self.time_service.get_current_time(location)
@@ -964,6 +1062,9 @@ class SemiAgentService:
             "You are HelloAgain's direct reasoning layer. "
             "Answer clearly, accurately, and helpfully. "
             "Use the same language as the user's latest message. "
+            "Write for text to speech. Use very simple punctuation. "
+            "Avoid parentheses, quotation marks, brackets, and semicolons. "
+            "Prefer one or two short sentences. "
             "Do not mention whiteboards, MCPs, tools, or hidden routing. "
             "If essential information is missing, ask exactly one short follow-up question."
         )
@@ -989,6 +1090,12 @@ class SemiAgentService:
             "Use only the provided live tool payload as factual grounding. "
             "Never invent current data. "
             "Answer naturally in the same language as the user's latest message. "
+            "Write for text to speech. Use very simple punctuation. "
+            "Avoid parentheses, quotation marks, brackets, and semicolons. "
+            "Prefer one or two short sentences. "
+            "For weather responses, round temperatures and percentages to whole numbers with no decimal places. "
+            "Do not say numeric wind speed. If wind matters, describe it only with simple words like calm, breezy, or windy. "
+            "Prefer weather condition words like sunny, cloudy, rainy, snowy, or windy. "
             "If the tool payload contains an error or missing data, say so plainly and ask at most one short follow-up question."
         )
 
@@ -1000,12 +1107,13 @@ class SemiAgentService:
         tool_payload: Dict[str, Any],
         recent_history: List[Dict[str, str]],
     ) -> str:
+        prepared_payload = self._prepare_live_tool_payload_for_summary(tool_payload)
         return json.dumps(
             {
                 "user_request": self._clean_text(prompt),
                 "recent_chat_history": recent_history,
                 "route_decision": route_decision.model_dump(),
-                "tool_payload": tool_payload,
+                "tool_payload": prepared_payload,
             },
             ensure_ascii=False,
             indent=2,
@@ -1019,7 +1127,7 @@ class SemiAgentService:
 
     def _missing_location_follow_up(self, tool_name: str) -> str:
         if tool_name == "weather":
-            return "Which location should I check the weather for?"
+            return "Кажи ми за кое място да проверя времето."
         return "Which location should I check the time for?"
 
     def _fallback_live_tool_response(self, tool_payload: Dict[str, Any]) -> str:
@@ -1036,8 +1144,18 @@ class SemiAgentService:
                 else {}
             )
             name = self._clean_text(location.get("name")) or "that place"
-            description = self._clean_text(tool_payload.get("weather_description")) or "unknown conditions"
-            temperature = tool_payload.get("temperature_c")
+            description = self._weather_speech_condition(tool_payload)
+            forecast_type = self._clean_text(tool_payload.get("forecast_type"))
+            if forecast_type == "daily":
+                temperature_max = self._whole_number_text(tool_payload.get("temperature_max_c"))
+                temperature_min = self._whole_number_text(tool_payload.get("temperature_min_c"))
+                if temperature_max is not None and temperature_min is not None:
+                    return (
+                        f"The weather tomorrow in {name} looks {description}, "
+                        f"between {temperature_min} and {temperature_max} degrees Celsius."
+                    )
+                return f"The weather tomorrow in {name} looks {description}."
+            temperature = self._whole_number_text(tool_payload.get("temperature_c"))
             if temperature is not None:
                 return f"The weather in {name} is {description}, around {temperature} degrees Celsius."
             return f"The weather in {name} is {description}."
@@ -1056,6 +1174,53 @@ class SemiAgentService:
         if heading and abstract:
             return f"{heading}: {abstract}"
         return "I fetched live data, but I need one more try to phrase it clearly."
+
+    def _prepare_live_tool_payload_for_summary(self, tool_payload: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = dict(tool_payload)
+        if self._clean_text(prepared.get("tool_name")).lower() == "weather":
+            prepared["weather_condition_for_speech"] = self._weather_speech_condition(prepared)
+            prepared.pop("wind_speed", None)
+            prepared.pop("wind_speed_kmh", None)
+            prepared.pop("wind_unit", None)
+        return prepared
+
+    def _weather_speech_condition(self, tool_payload: Dict[str, Any]) -> str:
+        base = self._clean_text(tool_payload.get("weather_description")).lower()
+        weather_code = tool_payload.get("weather_code")
+        wind_value = tool_payload.get("wind_speed_kmh")
+        if wind_value is None:
+            wind_value = tool_payload.get("wind_speed")
+        try:
+            wind_speed = float(wind_value)
+        except (TypeError, ValueError):
+            wind_speed = None
+        if wind_speed is not None and wind_speed >= 28:
+            return "windy"
+        if any(marker in base for marker in ("thunderstorm", "storm", "гръмот", "бур")):
+            return "stormy"
+        if any(marker in base for marker in ("snow", "сняг")):
+            return "snowy"
+        if any(marker in base for marker in ("rain", "drizzle", "валеж", "дъжд")):
+            return "rainy"
+        if any(marker in base for marker in ("cloud", "облач")):
+            return "cloudy"
+        if any(marker in base for marker in ("sun", "clear", "ясно", "слън")):
+            return "sunny"
+        try:
+            numeric_code = int(weather_code)
+        except (TypeError, ValueError):
+            numeric_code = None
+        if numeric_code == 0:
+            return "sunny"
+        if numeric_code in {1, 2, 3, 45, 48}:
+            return "cloudy"
+        if numeric_code in {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82}:
+            return "rainy"
+        if numeric_code in {71, 73, 75, 77, 85, 86}:
+            return "snowy"
+        if numeric_code in {95, 96, 99}:
+            return "stormy"
+        return base or "mild"
 
     def run(
         self,
@@ -1096,6 +1261,7 @@ class SemiAgentService:
                 **self._run_live_tool(
                     prompt=clean_prompt,
                     board_state=normalized_board_state,
+                    location=location,
                     user_context=user_context,
                     session_id=session_id,
                     route_decision=route_decision,
@@ -1188,6 +1354,7 @@ class SemiAgentService:
                     user_context=user_context,
                     session_id=session_id,
                     route_decision=route_decision,
+                    location=location,
                 )
             whitespace_future = self._build_completed_future(
                 self._build_routed_whitespace_payload(
@@ -1430,10 +1597,18 @@ class SemiAgentService:
         user_context: Dict[str, str],
         session_id: str,
         route_decision: RouteDecision,
+        location: Dict[str, Any] | None,
     ) -> Dict[str, Any]:
         warnings: List[str] = []
         tool_name = self._clean_text(route_decision.tool_name).lower() or "search"
-        if tool_name in {"weather", "time"} and not self._clean_text(route_decision.location):
+        normalized_location = self._normalize_location_payload(location)
+        effective_location = normalized_location
+        if tool_name == "weather":
+            effective_location = self._resolve_effective_weather_location_payload(
+                location_payload=normalized_location,
+                user_id=self._clean_text(user_context.get("resolved_user_id")) or None,
+            )
+        if tool_name == "time" and not self._clean_text(route_decision.location):
             assistant_text = self._missing_location_follow_up(tool_name)
             warnings.append(f"{tool_name}_missing_location")
             llm_source = "rule_based"
@@ -1443,11 +1618,29 @@ class SemiAgentService:
                     tool_name=tool_name,
                     prompt=prompt,
                     location=self._clean_text(route_decision.location),
+                    location_payload=effective_location,
+                    user_id=self._clean_text(user_context.get("resolved_user_id")) or None,
                 )
             except Exception as exc:
+                error_text = str(exc)
+                if tool_name == "weather" and "Location is required" in error_text:
+                    assistant_text = self._missing_location_follow_up(tool_name)
+                    warnings.append(f"{tool_name}_missing_location")
+                    llm_source = "rule_based"
+                    self._store_speech_turn(
+                        user_context=user_context,
+                        session_id=session_id,
+                        user_text=prompt,
+                        assistant_text=assistant_text,
+                    )
+                    return self._build_speech_payload_from_text(
+                        assistant_text=assistant_text,
+                        llm_source=llm_source,
+                        warnings=warnings,
+                    )
                 tool_payload = {
                     "tool_name": tool_name,
-                    "error": str(exc),
+                    "error": error_text,
                 }
                 warnings.append(f"live_tool_error={exc}")
             assistant_text, llm_source, summary_warnings = self._summarize_live_tool_payload(
@@ -2304,10 +2497,14 @@ class SemiAgentService:
     ) -> Dict[str, Any]:
         if tool_name == "propose_friend_meetup":
             friend_name = self._clean_text(arguments.get("friend_name"))
+            argument_location = (
+                arguments.get("location") if isinstance(arguments.get("location"), dict) else None
+            )
             return self.meetup_service.propose_friend_meetup_for_prompt(
                 agent_user_id=user_id,
                 prompt=prompt,
                 friend_name=friend_name,
+                viewer_location=argument_location or location,
             )
         if tool_name == "suggest_outdoor_place":
             argument_location = (
@@ -2339,8 +2536,28 @@ class SemiAgentService:
         description = self._clean_text(arguments.get("description")) or "Meetup planned through HelloAgain"
         reminder_minutes = int(arguments.get("reminder_minutes") or 30)
 
-        if not title or not start_time or not end_time or not location:
-            raise ValueError("Accepted meetup reminder requires title, start_time, end_time, and location.")
+        if not title or not start_time or not end_time:
+            inferred = self._extract_calendar_reminder_details(
+                prompt=prompt,
+                user_id=target_user_id,
+            )
+            title = title or self._clean_text(inferred.get("title"))
+            start_time = start_time or self._clean_text(inferred.get("start_time"))
+            end_time = end_time or self._clean_text(inferred.get("end_time"))
+            location = location or self._clean_text(inferred.get("location"))
+            description = (
+                self._clean_text(arguments.get("description"))
+                or self._clean_text(inferred.get("description"))
+                or description
+            )
+            reminder_minutes = int(
+                arguments.get("reminder_minutes")
+                or inferred.get("reminder_minutes")
+                or reminder_minutes
+            )
+
+        if not title or not start_time or not end_time:
+            raise ValueError("Calendar reminder requires at least title, start_time, and end_time.")
 
         result = self.calendar_service.create_meetup_reminder(
             user_id=target_user_id,
@@ -2351,11 +2568,14 @@ class SemiAgentService:
             description=description,
             reminder_minutes=reminder_minutes,
         )
-        speech_text = (
-            "Добавих срещата в календарът ти."
-            if result.get("success")
-            else "Срещата бе приета,но календарът не работи в момента."
-        )
+        if result.get("success"):
+            speech_text = self._build_calendar_success_speech(
+                title=title,
+                start_time=start_time,
+                location=location,
+            )
+        else:
+            speech_text = "Не успях да задам напомнянето в календара ти."
         return {
             **result,
             "message": result.get("message") or speech_text,
@@ -2428,10 +2648,13 @@ class SemiAgentService:
             return self._clean_text(result.get("message")) or "Meetup planning finished."
         if mcp_id == "calendar":
             if result.get("success"):
-                return "Added the accepted meetup to Google Calendar."
+                title = self._clean_text(result.get("title"))
+                if title:
+                    return f"Set a calendar reminder for {title}."
+                return "Set a calendar reminder."
             error_code = self._clean_text(result.get("error"))
             if error_code == "google_calendar_not_connected":
-                return "Accepted meetup could not be added because Google Calendar is not connected."
+                return "Could not set the reminder because Google Calendar is not connected."
             return self._clean_text(result.get("message")) or "Calendar reminder failed."
         if tool_name == "fetch_action":
             chosen = result.get("result") if isinstance(result.get("result"), dict) else {}
@@ -3007,6 +3230,8 @@ class SemiAgentService:
         request_kind = self._clean_text(raw.get("request_kind")).lower()
         if request_kind not in {"mechanical", "profile", "mixed"}:
             request_kind = self._default_request_kind(prompt)
+        if self._looks_like_calendar_reminder_request(prompt):
+            calls = self._force_calendar_reminder_calls(prompt, calls, request_kind)
         used_default_calls = False
         if not calls:
             calls = self._default_mcp_calls(prompt, request_kind)
@@ -3035,6 +3260,58 @@ class SemiAgentService:
             "speech_intent": self._clean_text(raw.get("speech_intent")) or "Step 3 should answer with awareness of the earlier steps.",
             "mcp_calls": calls if needs_mcps else [],
         }
+
+    def _force_calendar_reminder_calls(
+        self,
+        prompt: str,
+        calls: List[Dict[str, Any]],
+        request_kind: str,
+    ) -> List[Dict[str, Any]]:
+        normalized_prompt = self._clean_text(prompt)
+        original_calls = list(calls)
+        calendar_calls = [
+            call
+            for call in calls
+            if self._clean_text(call.get("mcp_id")) == "calendar"
+            and self._normalize_tool_name(call.get("tool_name")) == "create_meetup_reminder"
+        ]
+        if calendar_calls:
+            if not original_calls or any(
+                self._clean_text(call.get("mcp_id")) != "calendar"
+                or self._normalize_tool_name(call.get("tool_name")) != "create_meetup_reminder"
+                for call in original_calls
+            ):
+                logger.info(
+                    "semi_agent.calendar_reminder_forced prompt=%r original_calls=%s override=existing_calendar_call",
+                    normalized_prompt,
+                    [
+                        {
+                            "mcp_id": self._clean_text(call.get("mcp_id")),
+                            "tool_name": self._normalize_tool_name(call.get("tool_name")),
+                        }
+                        for call in original_calls
+                    ],
+                )
+            for call in calendar_calls:
+                arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                if not self._clean_text(arguments.get("prompt")):
+                    call["arguments"] = {
+                        **arguments,
+                        "prompt": normalized_prompt,
+                    }
+            return calendar_calls
+        logger.info(
+            "semi_agent.calendar_reminder_forced prompt=%r original_calls=%s override=default_calendar_call",
+            normalized_prompt,
+            [
+                {
+                    "mcp_id": self._clean_text(call.get("mcp_id")),
+                    "tool_name": self._normalize_tool_name(call.get("tool_name")),
+                }
+                for call in original_calls
+            ],
+        )
+        return self._default_mcp_calls(normalized_prompt, request_kind)
 
     def _normalize_step_two_plan(
         self,
@@ -3633,6 +3910,38 @@ class SemiAgentService:
             result["timezone"] = timezone_name
         return result
 
+    def _resolve_effective_weather_location_payload(
+        self,
+        *,
+        location_payload: Dict[str, Any] | None,
+        user_id: str | None,
+    ) -> Dict[str, Any]:
+        normalized = self._normalize_location_payload(location_payload)
+        if normalized:
+            return normalized
+        clean_user_id = self._clean_text(user_id)
+        if not clean_user_id:
+            return {}
+        resolve_profile = getattr(self.weather_agent_service, "resolve_profile", None)
+        if not callable(resolve_profile):
+            return {}
+        try:
+            profile = resolve_profile(clean_user_id)
+        except Exception:
+            return {}
+        if profile is None:
+            return {}
+        try:
+            lat = float(getattr(profile, "home_lat"))
+            lng = float(getattr(profile, "home_lng"))
+        except (AttributeError, TypeError, ValueError):
+            return {}
+        result = {"lat": lat, "lng": lng}
+        timezone_name = self._clean_text(getattr(profile, "timezone", ""))
+        if timezone_name:
+            result["timezone"] = timezone_name
+        return result
+
     def _viewer_prefers_popup_only(self, viewer: Dict[str, Any] | None) -> bool:
         if not isinstance(viewer, dict):
             return False
@@ -3690,18 +3999,118 @@ class SemiAgentService:
         weather_markers = (
             "weather",
             "forecast",
+            "tomorrow",
             "temperature",
             "rain",
             "sunny",
             "cloudy",
+            "outside",
+            "outdoors",
             "времето",
+            "утре",
+            "прогноза",
             "температура",
             "вали",
             "дъжд",
             "слънчево",
             "облачно",
+            "навън",
+            "на открито",
         )
         return any(marker in lowered for marker in weather_markers)
+
+    def _looks_like_calendar_reminder_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        reminder_markers = (
+            "remind me",
+            "set a reminder",
+            "create a reminder",
+            "add to calendar",
+            "put it in my calendar",
+            "google calendar",
+            "calendar reminder",
+            "напомни ми",
+            "сложи ми напомняне",
+            "сложи напомняне",
+            "създай напомняне",
+            "добави в календара",
+            "в календара",
+            "гугъл календар",
+            "google calendar",
+            "напомняне",
+        )
+        return any(marker in lowered for marker in reminder_markers)
+
+    def _looks_like_direct_reasoning_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        if self._looks_like_direct_weather_request(lowered):
+            return False
+        if self._looks_like_phone_command_request(lowered):
+            return False
+        if any(
+            marker in lowered
+            for marker in (
+                "meetup",
+                "friend",
+                "connection",
+                "memory",
+                "board",
+                "whiteboard",
+                "gnn",
+                "graph",
+                "искам да излеза с",
+                "искам да изляза с",
+                "среща с",
+            )
+        ):
+            return False
+        reasoning_markers = (
+            "what is",
+            "what's",
+            "why",
+            "how does",
+            "explain",
+            "compare",
+            "difference between",
+            "tell me about",
+            "summarize",
+            "какво е",
+            "какво представлява",
+            "защо",
+            "как работи",
+            "обясни",
+            "сравни",
+            "разкажи ми за",
+            "обобщи",
+        )
+        return any(marker in lowered for marker in reasoning_markers)
+
+    def _looks_like_phone_command_request(self, prompt: str) -> bool:
+        lowered = self._clean_text(prompt).lower()
+        if self._looks_like_calendar_reminder_request(lowered):
+            return False
+        action_markers = (
+            "open ",
+            "launch ",
+            "call ",
+            "text ",
+            "send a message",
+            "navigate to",
+            "open chrome",
+            "open maps",
+            "open gmail",
+            "open whatsapp",
+            "отвори ",
+            "пусни ",
+            "обади се",
+            "изпрати съобщение",
+            "намери в maps",
+            "отвори chrome",
+            "отвори maps",
+            "отвори gmail",
+            "отвори whatsapp",
+        )
+        return any(marker in lowered for marker in action_markers)
 
     def _looks_like_outdoor_social_request(self, prompt: str) -> bool:
         lowered = self._clean_text(prompt).lower()
@@ -3812,6 +4221,22 @@ class SemiAgentService:
         }
 
     def _default_mcp_calls(self, prompt: str, request_kind: str) -> List[Dict[str, Any]]:
+        if self._looks_like_calendar_reminder_request(prompt):
+            logger.info(
+                "semi_agent.calendar_reminder_default prompt=%r route=calendar.create_meetup_reminder",
+                self._clean_text(prompt),
+            )
+            return [
+                {
+                    "call_id": "calendar.create_meetup_reminder.1",
+                    "mcp_id": "calendar",
+                    "tool_name": "create_meetup_reminder",
+                    "arguments": {
+                        "prompt": prompt,
+                    },
+                    "why": "The user explicitly wants a reminder or calendar event.",
+                }
+            ]
         if self._looks_like_direct_weather_request(prompt):
             return [
                 {
@@ -4144,6 +4569,121 @@ class SemiAgentService:
         if value.count(",") >= 3 and len(value.split()) >= 6:
             return True
         return False
+
+    @staticmethod
+    def _whole_number_text(value: Any) -> int | None:
+        try:
+            return int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+
+    def _extract_calendar_reminder_details(
+        self,
+        *,
+        prompt: str,
+        user_id: str,
+    ) -> Dict[str, Any]:
+        clean_prompt = self._clean_text(prompt)
+        if not clean_prompt:
+            return {}
+        now_local = dt.datetime.now().astimezone()
+        default_start = now_local.replace(hour=9, minute=0, second=0, microsecond=0)
+        if default_start <= now_local:
+            default_start = default_start + dt.timedelta(days=1)
+        default_end = default_start + dt.timedelta(hours=1)
+        fallback = {
+            "title": clean_prompt[:120],
+            "start_time": default_start.isoformat(),
+            "end_time": default_end.isoformat(),
+            "location": "",
+            "description": "Reminder created through HelloAgain",
+            "reminder_minutes": 30,
+        }
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "title": {"type": "string"},
+                "start_time": {"type": "string"},
+                "end_time": {"type": "string"},
+                "location": {"type": "string"},
+                "description": {"type": "string"},
+                "reminder_minutes": {"type": "integer"},
+            },
+            "required": ["title", "start_time", "end_time", "location", "description", "reminder_minutes"],
+        }
+        try:
+            result = self.reasoning_llm_provider.generate_reply_with_messages(
+                system_prompt=(
+                    "Extract calendar reminder details from the user request. "
+                    "Return only valid JSON matching the schema. "
+                    "Assume the current local datetime is "
+                    f"{now_local.isoformat()}. "
+                    "If the user gives a date without a time, choose 09:00 local time. "
+                    "If the user gives no end time, set it to one hour after the start. "
+                    "For general reminders, keep location as an empty string unless the user clearly gives one."
+                ),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "prompt": clean_prompt,
+                                "user_id": user_id,
+                                "now_local": now_local.isoformat(),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                ],
+                session_id="calendar_reminder_extract",
+                user_id=user_id or "anonymous",
+                include_history=False,
+                store_history=False,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "calendar_reminder_extract",
+                        "strict": True,
+                        "schema": self._strict_openai_schema(schema),
+                    },
+                },
+            )
+            payload = json.loads(self._clean_text(result.text) or "{}")
+            if not isinstance(payload, dict):
+                return fallback
+            merged = {
+                "title": self._clean_text(payload.get("title")) or fallback["title"],
+                "start_time": self._clean_text(payload.get("start_time")) or fallback["start_time"],
+                "end_time": self._clean_text(payload.get("end_time")) or fallback["end_time"],
+                "location": self._clean_text(payload.get("location")),
+                "description": self._clean_text(payload.get("description")) or fallback["description"],
+                "reminder_minutes": int(payload.get("reminder_minutes") or fallback["reminder_minutes"]),
+            }
+            return merged
+        except Exception:
+            return fallback
+
+    def _build_calendar_success_speech(
+        self,
+        *,
+        title: str,
+        start_time: str,
+        location: str,
+    ) -> str:
+        clean_title = self._clean_text(title)
+        clean_location = self._clean_text(location)
+        when = clean_start = self._clean_text(start_time)
+        try:
+            when_dt = dt.datetime.fromisoformat(clean_start)
+            when = when_dt.strftime("%d.%m в %H:%M")
+        except Exception:
+            when = clean_start
+        if clean_title and clean_location:
+            return f"Зададох напомняне за {clean_title} на {when} в {clean_location}."
+        if clean_title:
+            return f"Зададох напомняне за {clean_title} на {when}."
+        return "Зададох напомнянето."
 
     def _fallback_speech_response(self, prompt: str, mcp_results: List[Dict[str, Any]], step_two: Dict[str, Any]) -> str:
         focus = step_two.get("focus_object", {})

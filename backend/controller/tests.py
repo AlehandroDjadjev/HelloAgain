@@ -495,6 +495,91 @@ class SemiAgentServiceTests(SimpleTestCase):
             "json_schema",
         )
 
+    def test_route_request_forces_weather_for_bulgarian_weather_prompt(self) -> None:
+        class MisroutingRouterProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "direct_reasoning",
+                            "reason": "wrong",
+                            "tool_name": None,
+                            "location": None,
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        service = SemiAgentService(
+            router_llm_provider=MisroutingRouterProvider(),
+            connections_service=self._stub_connections_service(),
+        )
+
+        decision = service._route_request(
+            "Какво ще е времето утре навън?",
+            {"board": {"width": 1000, "height": 700}, "objects": []},
+        )
+
+        self.assertEqual(decision.route, "live_tool")
+        self.assertEqual(decision.tool_name, "weather")
+
+    def test_route_request_forces_direct_reasoning_for_knowledge_prompt(self) -> None:
+        class MisroutingRouterProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "semi_agent",
+                            "reason": "wrong",
+                            "tool_name": None,
+                            "location": None,
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        service = SemiAgentService(
+            router_llm_provider=MisroutingRouterProvider(),
+            connections_service=self._stub_connections_service(),
+        )
+
+        decision = service._route_request(
+            "Обясни фундаменталната теорема на анализа.",
+            {"board": {"width": 1000, "height": 700}, "objects": []},
+        )
+
+        self.assertEqual(decision.route, "direct_reasoning")
+
+    def test_route_request_forces_semi_agent_for_reminder_prompt(self) -> None:
+        class MisroutingRouterProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "direct_reasoning",
+                            "reason": "wrong",
+                            "tool_name": None,
+                            "location": None,
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        service = SemiAgentService(
+            router_llm_provider=MisroutingRouterProvider(),
+            connections_service=self._stub_connections_service(),
+        )
+
+        decision = service._route_request(
+            "Сложи ми напомняне в Google календар за трети май да си извадя яйцата.",
+            {"board": {"width": 1000, "height": 700}, "objects": []},
+        )
+
+        self.assertEqual(decision.route, "semi_agent")
+
     def test_run_direct_reasoning_bypasses_board_pipeline(self) -> None:
         class RecordingRouterProvider:
             def generate_reply_with_messages(self, **kwargs):
@@ -628,6 +713,167 @@ class SemiAgentServiceTests(SimpleTestCase):
 
         self.assertEqual(speech_payload["status"], "completed")
         self.assertIn("sunny in Sofia", speech_payload["assistant_text"])
+
+    def test_run_live_tool_weather_uses_precise_location_without_follow_up(self) -> None:
+        class RouterProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "live_tool",
+                            "reason": "Needs weather data.",
+                            "tool_name": "weather",
+                            "location": None,
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        class SummaryProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text="Утре при теб ще е слънчево и около 24 градуса.",
+                    source="summary",
+                    warnings=[],
+                )
+
+        class FakeWeatherService:
+            def get_weather(self, *, prompt: str, location: str | None, location_payload: dict | None) -> dict:
+                return {
+                    "tool_name": "weather",
+                    "forecast_type": "daily",
+                    "location": {"name": "your location", "timezone": "Europe/Sofia"},
+                    "temperature_max_c": 24,
+                    "temperature_min_c": 15,
+                    "weather_description": "sunny",
+                    "source": "test_weather",
+                    "location_payload": location_payload,
+                }
+
+        class MissingTtsProvider:
+            def synthesize(self, text: str):
+                raise RuntimeError("tts unavailable")
+
+            def status(self) -> str:
+                return "unavailable: test"
+
+        service = SemiAgentService(
+            router_llm_provider=RouterProvider(),
+            reasoning_llm_provider=SummaryProvider(),
+            weather_service=FakeWeatherService(),
+            tts_provider=MissingTtsProvider(),
+            connections_service=self._stub_connections_service(),
+        )
+
+        payload = service.run(
+            prompt="Какво ще е времето утре?",
+            board_state={"board": {"width": 1000, "height": 700}, "objects": []},
+            largest_empty_space={"bbox": {"x": 0, "y": 0, "width": 1000, "height": 700}},
+            location={"lat": 42.6977, "lng": 23.3219, "timezone": "Europe/Sofia"},
+        )
+
+        self.assertEqual(payload["route"], "live_tool")
+        self.assertNotIn("Кажи ми за кое място", payload["speech_response"])
+        self.assertIn("слънчево", payload["speech_response"])
+
+    def test_run_live_tool_weather_uses_saved_profile_location_without_prompting(self) -> None:
+        class RouterProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "route": "live_tool",
+                            "reason": "Needs weather data.",
+                            "tool_name": "weather",
+                            "location": None,
+                        }
+                    ),
+                    source="router",
+                    warnings=[],
+                )
+
+        class SummaryProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text="Утре ще е ясно и около 22 градуса.",
+                    source="summary",
+                    warnings=[],
+                )
+
+        class FakeWeatherAgentService:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def resolve_profile(self, agent_user_id: str | None):
+                if agent_user_id != "17":
+                    return None
+                return SimpleNamespace(home_lat=42.6703437, home_lng=23.3548596)
+
+            def get_current_weather_for_prompt(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "tool_name": "weather",
+                    "forecast_type": "daily",
+                    "location": {"name": "your location"},
+                    "temperature_max_c": 22,
+                    "temperature_min_c": 14,
+                    "weather_description": "clear sky",
+                }
+
+        class MissingTtsProvider:
+            def synthesize(self, text: str):
+                raise RuntimeError("tts unavailable")
+
+            def status(self) -> str:
+                return "unavailable: test"
+
+        fake_weather_agent_service = FakeWeatherAgentService()
+        service = SemiAgentService(
+            router_llm_provider=RouterProvider(),
+            reasoning_llm_provider=SummaryProvider(),
+            weather_agent_service=fake_weather_agent_service,
+            tts_provider=MissingTtsProvider(),
+            connections_service=self._stub_connections_service(),
+        )
+
+        payload = service.run(
+            prompt="Какво ще е времето утре",
+            board_state={"board": {"width": 1000, "height": 700}, "objects": []},
+            largest_empty_space={"bbox": {"x": 0, "y": 0, "width": 1000, "height": 700}},
+            user_id="17",
+        )
+
+        self.assertEqual(payload["route"], "live_tool")
+        self.assertNotIn("Кажи ми за кое място", payload["speech_response"])
+        self.assertEqual(len(fake_weather_agent_service.calls), 1)
+        self.assertEqual(fake_weather_agent_service.calls[0]["agent_user_id"], "17")
+        self.assertEqual(
+            fake_weather_agent_service.calls[0]["location"],
+            {"lat": 42.6703437, "lng": 23.3548596},
+        )
+
+    def test_live_tool_summary_prompt_hides_numeric_wind_speed_for_weather(self) -> None:
+        service = SemiAgentService(
+            connections_service=self._stub_connections_service(),
+        )
+
+        prompt = service._build_live_tool_summary_user_prompt(
+            prompt="Какво ще е времето утре?",
+            route_decision=SimpleNamespace(model_dump=lambda: {"route": "live_tool", "tool_name": "weather"}),
+            tool_payload={
+                "tool_name": "weather",
+                "forecast_type": "daily",
+                "weather_description": "clear sky",
+                "weather_code": 0,
+                "wind_speed_kmh": 37.4,
+                "temperature_max_c": 23.6,
+            },
+            recent_history=[],
+        )
+
+        self.assertIn('"weather_condition_for_speech": "windy"', prompt)
+        self.assertNotIn("wind_speed_kmh", prompt)
 
     def test_default_focus_text_uses_compact_summary_title(self) -> None:
         service = SemiAgentService()
@@ -1291,7 +1537,93 @@ class SemiAgentServiceTests(SimpleTestCase):
 
         self.assertEqual(payload["tool_name"], "create_meetup_reminder")
         self.assertTrue(payload["result"]["success"])
-        self.assertEqual(payload["summary"], "Added the accepted meetup to Google Calendar.")
+        self.assertEqual(payload["summary"], "Set a calendar reminder for Meetup with Ivan.")
+
+    def test_calendar_mcp_can_infer_generic_reminder_from_prompt(self) -> None:
+        calls: list[dict] = []
+
+        def _create_meetup_reminder(**kwargs):
+            calls.append(kwargs)
+            return {
+                "success": True,
+                "event_id": "evt_555",
+                "html_link": "https://calendar.google.com/event?eid=evt_555",
+                "message": "Reminder added",
+            }
+
+        class ExtractorProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text=json.dumps(
+                        {
+                            "title": "Да си извадя яйцата",
+                            "start_time": "2026-05-03T09:00:00+03:00",
+                            "end_time": "2026-05-03T10:00:00+03:00",
+                            "location": "",
+                            "description": "Reminder created through HelloAgain",
+                            "reminder_minutes": 30,
+                        }
+                    ),
+                    source="extractor",
+                    warnings=[],
+                )
+
+        service = SemiAgentService(
+            calendar_service=SimpleNamespace(create_meetup_reminder=_create_meetup_reminder),
+            reasoning_llm_provider=ExtractorProvider(),
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+        )
+
+        payload = service.invoke_mcp(
+            mcp_id="calendar",
+            tool_name="create_meetup_reminder",
+            arguments={
+                "prompt": "Сложи ми напомняне в Google календар за трети май да си извадя яйцата.",
+            },
+            user_id="12",
+        )
+
+        self.assertTrue(payload["result"]["success"])
+        self.assertEqual(calls[0]["user_id"], "12")
+        self.assertEqual(calls[0]["title"], "Да си извадя яйцата")
+        self.assertEqual(calls[0]["start_time"], "2026-05-03T09:00:00+03:00")
+
+    def test_normalize_step_one_plan_forces_calendar_for_bulgarian_reminder_prompt(self) -> None:
+        service = SemiAgentService(
+            connections_service=SimpleNamespace(
+                save_board_state_for_user=lambda *args, **kwargs: None,
+                apply_board_commands_for_user=lambda *args, **kwargs: None,
+                build_user_widget_payload=lambda **kwargs: {},
+            ),
+        )
+
+        normalized = service._normalize_step_one_plan(
+            {
+                "needs_mcps": True,
+                "request_kind": "mechanical",
+                "mcp_calls": [
+                    {
+                        "mcp_id": "phone_command",
+                        "tool_name": "open_phone_command",
+                        "arguments": {"prompt": "Сложи ми напомняне за утре"},
+                        "why": "open calendar app",
+                    }
+                ],
+            },
+            "Сложи ми напомняне за утре",
+        )
+
+        self.assertEqual(len(normalized["mcp_calls"]), 1)
+        self.assertEqual(normalized["mcp_calls"][0]["mcp_id"], "calendar")
+        self.assertEqual(normalized["mcp_calls"][0]["tool_name"], "create_meetup_reminder")
+        self.assertEqual(
+            normalized["mcp_calls"][0]["arguments"]["prompt"],
+            "Сложи ми напомняне за утре",
+        )
 
     def test_meetup_mcp_infers_outdoor_place_tool_and_passes_location(self) -> None:
         calls: list[dict] = []
@@ -2087,7 +2419,7 @@ class SemiAgentWeatherFlowTests(SimpleTestCase):
 
 class WeatherEndpointTests(SimpleTestCase):
     def test_weather_endpoint_uses_explicit_location(self) -> None:
-        with patch("weather.views.get_current_weather_snapshot") as mock_weather:
+        with patch("weather.views.get_weather_snapshot") as mock_weather:
             mock_weather.return_value = {
                 "widget_type": "weather_snapshot",
                 "title": "Времето сега",

@@ -8,7 +8,7 @@ from django.views.decorators.http import require_http_methods
 
 from apps.accounts.services import profile_for_token
 
-from .services import get_current_weather_snapshot
+from .services import extract_weather_day_offset, get_weather_snapshot
 
 
 def _json_ok(data: dict, status_code: int = 200) -> JsonResponse:
@@ -45,6 +45,8 @@ def current_weather_view(request):
 
     location = body.get("location") if isinstance(body.get("location"), dict) else body
     timezone_name = str(body.get("timezone") or "").strip() or None
+    prompt = str(body.get("prompt") or "").strip()
+    day_offset = body.get("day_offset")
 
     lat = location.get("lat") if isinstance(location, dict) else None
     lng = location.get("lng") if isinstance(location, dict) else None
@@ -62,9 +64,13 @@ def current_weather_view(request):
         )
 
     try:
-        payload = get_current_weather_snapshot(
+        resolved_day_offset = extract_weather_day_offset(prompt)
+        if day_offset is not None:
+            resolved_day_offset = max(0, int(day_offset))
+        payload = get_weather_snapshot(
             lat=float(lat),
             lng=float(lng),
+            day_offset=resolved_day_offset,
             timezone_name=timezone_name,
         )
     except ValueError as exc:

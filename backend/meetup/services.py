@@ -735,6 +735,26 @@ def _place_type_preference_score(place_types, weights):
         return 0.0
     return max(candidates)
 
+
+def _fallback_place_for_center(center, selected_types):
+    top_type = (selected_types or ['park'])[0]
+    top_type_bg = _to_bg_place_type(top_type)
+    return {
+        'place_id': 'fallback-midpoint',
+        'name': f'Удобно място по средата за {top_type_bg}',
+        'types': selected_types or ['park'],
+        'vicinity': 'Средна точка между двамата',
+        'rating': 0.0,
+        'user_ratings_total': 0,
+        'geometry': {
+            'location': {
+                'lat': center['lat'],
+                'lng': center['lng'],
+            }
+        },
+        'is_fallback': True,
+    }
+
 def get_central_point(coordinates):
     if not coordinates:
         return None
@@ -923,8 +943,17 @@ def get_ranked_meetup_spots(
         valid_hours.sort(key=lambda item: abs(item['time'].timestamp() - preferred_time_ts))
         valid_hours = valid_hours[:4]
 
-    if not places or not valid_hours:
+    if not valid_hours:
         return []
+    using_fallback_place = False
+    if not places:
+        using_fallback_place = True
+        logger.warning(
+            "meetup.places_fallback center=%s selected_types=%s reason=no_places_from_api",
+            center,
+            selected_types,
+        )
+        places = [_fallback_place_for_center(center, selected_types)]
 
     recommendations = []
         
@@ -993,6 +1022,8 @@ def get_ranked_meetup_spots(
             if selected_types:
                 top_types_bg = ', '.join(_to_bg_place_type(item) for item in selected_types[:2])
                 explanation.append(f"Мястото съвпада с водещите интереси: {top_types_bg}.")
+            if using_fallback_place:
+                explanation.append('Избрах неутрална средна точка, защото външната услуга за места не беше достъпна.')
             if domain_affinity >= 0.62:
                 explanation.append('Отговаря на предпочитания стил за среща и на двамата.')
             if user_similarity >= 0.70:
@@ -1017,6 +1048,7 @@ def get_ranked_meetup_spots(
                 'rating': round(rating, 1),
                 'review_count': ratings_count,
                 'types': types,
+                'place_source': 'fallback_midpoint' if place.get('is_fallback') else 'google_places',
                 'amenities': 'Оптимизирано място според интереси, време и контекст',
                 'vicinity': place.get('vicinity', ''),
                 'preference_score': round(preference_score, 3),

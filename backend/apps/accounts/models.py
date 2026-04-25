@@ -379,6 +379,9 @@ class GoogleCalendarConnection(models.Model):
     token_uri = models.URLField(default="https://oauth2.googleapis.com/token")
     scopes = models.JSONField(default=list, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True)
+    connected_at = models.DateTimeField(null=True, blank=True)
+    oauth_state = models.CharField(max_length=120, blank=True, db_index=True)
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -390,4 +393,4 @@ class GoogleCalendarConnection(models.Model):
 
     @property
     def is_connected(self) -> bool:
-        return bool(self.refresh_token or self.access_token)
+        return self.is_active and bool(self.refresh_token or self.access_token)

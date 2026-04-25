@@ -22,6 +22,8 @@ class RegisterSerializer(serializers.Serializer):
     contacts_permission_granted = serializers.BooleanField(required=False, default=False)
     share_phone_with_friends = serializers.BooleanField(required=False, default=False)
     share_email_with_friends = serializers.BooleanField(required=False, default=False)
+    home_lat = serializers.FloatField(required=True, min_value=-90.0, max_value=90.0)
+    home_lng = serializers.FloatField(required=True, min_value=-180.0, max_value=180.0)
 
     def validate_name(self, value: str) -> str:
         value = value.strip()
@@ -45,6 +47,14 @@ class RegisterSerializer(serializers.Serializer):
         if not attrs.get("microphone_permission_granted"):
             raise serializers.ValidationError(
                 {"microphone_permission_granted": "Microphone access is required for voice navigation."}
+            )
+        if attrs.get("home_lat") is None or attrs.get("home_lng") is None:
+            raise serializers.ValidationError(
+                {
+                    "location": (
+                        "Location access is required so HelloAgain can plan meetups nearby."
+                    )
+                }
             )
         return attrs
 
@@ -118,6 +128,8 @@ class OnboardingCompleteSerializer(serializers.Serializer):
     session_id = serializers.CharField(max_length=64)
     microphone_permission_granted = serializers.BooleanField(required=False, default=True)
     phone_permission_granted = serializers.BooleanField(required=False, default=True)
+    home_lat = serializers.FloatField(required=True, min_value=-90.0, max_value=90.0)
+    home_lng = serializers.FloatField(required=True, min_value=-180.0, max_value=180.0)
 
 
 class FriendRequestCreateSerializer(serializers.Serializer):
