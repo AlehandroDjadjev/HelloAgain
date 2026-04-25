@@ -16,7 +16,7 @@ class AgentVoiceController extends ChangeNotifier {
     required Future<void> Function(String transcript) onTranscript,
     String userId = 'helloagain-agent',
     String? sessionId,
-    String language = 'en-US',
+    String language = 'bg-BG',
   }) : _client = client,
        _onTranscript = onTranscript,
        _userId = userId,
@@ -55,10 +55,11 @@ class AgentVoiceController extends ChangeNotifier {
   bool _suspended = false;
   bool _disposed = false;
   double _micLevel = 0;
-  String _status = 'Hands-free mode is off.';
+  String _status = 'Гласовият режим е изключен.';
   final String _language;
   String? _error;
   String _lastTranscript = '';
+  String _lastSpokenText = '';
   DateTime? _speechStartedAt;
   DateTime? _lastVoiceAt;
 
@@ -71,6 +72,7 @@ class AgentVoiceController extends ChangeNotifier {
   String get language => _language;
   String? get error => _error;
   String get lastTranscript => _lastTranscript;
+  String get lastSpokenText => _lastSpokenText;
 
   Future<void> start() async {
     if (_enabled) {
@@ -87,7 +89,7 @@ class AgentVoiceController extends ChangeNotifier {
     _enabled = true;
     _suspended = false;
     _error = null;
-    _status = 'Hands-free mode is active. Listening for speech...';
+    _status = 'Слушам Ви.';
     _emit();
     await _startListeningLoop();
   }
@@ -104,7 +106,7 @@ class AgentVoiceController extends ChangeNotifier {
     _processing = false;
     _speaking = false;
     _micLevel = 0;
-    _status = 'Hands-free mode is off.';
+    _status = 'Гласовият режим е изключен.';
     _emit();
   }
 
@@ -132,9 +134,7 @@ class AgentVoiceController extends ChangeNotifier {
     final cleanText = text.trim();
     if (cleanText.isEmpty) {
       if (resumeWhenDone) {
-        await resumeListening(
-          status: 'Hands-free mode is active. Listening for speech...',
-        );
+        await resumeListening(status: 'Слушам Ви.');
       }
       return;
     }
@@ -142,7 +142,7 @@ class AgentVoiceController extends ChangeNotifier {
     await _stopRecorder();
     _speaking = true;
     _error = null;
-    _status = 'Preparing a spoken reply...';
+    _status = 'Подготвям отговор.';
     _emit();
 
     try {
@@ -151,12 +151,13 @@ class AgentVoiceController extends ChangeNotifier {
         userId: _userId,
         sessionId: _sessionId,
       );
-      _status = 'Speaking...';
+      _lastSpokenText = speech.text.trim();
+      _status = 'Говоря.';
       _emit();
       await _playAudio(speech.audioBytes, speech.mimeType);
     } catch (error) {
       _error = _describeError(error);
-      _status = 'Could not play the spoken reply.';
+      _status = 'Не успях да пусна отговора.';
       _emit();
     } finally {
       _speaking = false;
@@ -177,9 +178,7 @@ class AgentVoiceController extends ChangeNotifier {
     final cleanPrompt = prompt.trim();
     if (cleanPrompt.isEmpty) {
       if (resumeWhenDone) {
-        await resumeListening(
-          status: 'Hands-free mode is active. Listening for speech...',
-        );
+        await resumeListening(status: 'Слушам Ви.');
       }
       return '';
     }
@@ -187,7 +186,7 @@ class AgentVoiceController extends ChangeNotifier {
     await _stopRecorder();
     _speaking = true;
     _error = null;
-    _status = 'Generating a spoken reply...';
+    _status = 'Подготвям отговор.';
     _emit();
 
     try {
@@ -196,7 +195,8 @@ class AgentVoiceController extends ChangeNotifier {
         userId: _userId,
         sessionId: _sessionId,
       );
-      _status = 'Speaking...';
+      _lastSpokenText = response.assistantText.trim();
+      _status = 'Говоря.';
       _emit();
       await _playAudio(
         response.assistantAudioBytes,
@@ -205,7 +205,7 @@ class AgentVoiceController extends ChangeNotifier {
       return response.assistantText;
     } catch (error) {
       _error = _describeError(error);
-      _status = 'Could not generate the spoken reply.';
+      _status = 'Не успях да създам отговор.';
       _emit();
       return '';
     } finally {
@@ -268,7 +268,7 @@ class AgentVoiceController extends ChangeNotifier {
 
     _listening = true;
     _micLevel = 0;
-    _status = 'Hands-free mode is active. Listening for speech...';
+    _status = 'Слушам Ви.';
     _emit();
   }
 
@@ -325,7 +325,7 @@ class AgentVoiceController extends ChangeNotifier {
         ..addAll(_preSpeechChunks)
         ..add(chunk);
       _preSpeechChunks.clear();
-      _status = 'Speech detected. Keep talking...';
+      _status = 'Чувам Ви. Продължете.';
       _emit();
     }
   }
@@ -352,7 +352,7 @@ class AgentVoiceController extends ChangeNotifier {
 
     _processing = true;
     _error = null;
-    _status = 'Transcribing with the voice gateway...';
+    _status = 'Разпознавам казаното.';
     _emit();
 
     try {
@@ -368,18 +368,18 @@ class AgentVoiceController extends ChangeNotifier {
       );
       final transcript = response.transcript.trim();
       if (transcript.isEmpty) {
-        _status = 'No speech detected. Listening again...';
+        _status = 'Не чух ясно. Слушам отново.';
         _emit();
         return;
       }
 
       _lastTranscript = transcript;
-      _status = 'Heard: "$transcript"';
+      _status = 'Чух: "$transcript"';
       _emit();
       await _onTranscript(transcript);
     } catch (error) {
       _error = _describeError(error);
-      _status = 'Could not transcribe that turn. Listening again...';
+      _status = 'Не успях да разпозная казаното.';
       _emit();
     } finally {
       _processing = false;
@@ -407,7 +407,7 @@ class AgentVoiceController extends ChangeNotifier {
     await _stopRecorder();
     _resetTurn();
     _error = _describeError(error);
-    _status = 'The microphone stream stopped unexpectedly.';
+    _status = 'Микрофонът спря неочаквано.';
     _emit();
   }
 

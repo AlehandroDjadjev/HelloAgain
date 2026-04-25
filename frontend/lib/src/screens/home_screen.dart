@@ -853,6 +853,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       status: _voiceController.status,
                       error: _voiceController.error,
                       lastTranscript: _voiceController.lastTranscript,
+                      lastSpokenText: _voiceController.lastSpokenText,
                       onToggle: _toggleHandsFree,
                     ),
                   ),
@@ -1128,6 +1129,7 @@ class _HandsFreeVoiceCard extends StatelessWidget {
     required this.status,
     required this.error,
     required this.lastTranscript,
+    required this.lastSpokenText,
     required this.onToggle,
   });
 
@@ -1139,86 +1141,133 @@ class _HandsFreeVoiceCard extends StatelessWidget {
   final String status;
   final String? error;
   final String lastTranscript;
+  final String lastSpokenText;
   final VoidCallback onToggle;
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     final activityLabel = speaking
-        ? 'Speaking'
+        ? 'Говоря'
         : processing
-        ? 'Processing'
+        ? 'Обработвам'
         : listening
-        ? 'Listening'
+        ? 'Слушам'
         : enabled
-        ? 'Standing by'
-        : 'Disabled';
+        ? 'В готовност'
+        : 'Изключено';
+    final spokenSubtitle = lastSpokenText.trim();
+    final subtitle = speaking && spokenSubtitle.isNotEmpty
+        ? spokenSubtitle
+        : _bulgarianVoiceStatus(status);
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: cs.primaryContainer.withAlpha(60),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: cs.primary.withAlpha(70)),
+        color: cs.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: cs.outlineVariant),
+        boxShadow: [
+          BoxShadow(
+            color: cs.shadow.withAlpha(12),
+            blurRadius: 18,
+            offset: const Offset(0, 8),
+          ),
+        ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(Icons.keyboard_voice_rounded, color: cs.primary, size: 20),
-              const SizedBox(width: 8),
-              Text(
-                'Hands-Free Agent Voice',
-                style: TextStyle(
-                  color: cs.onSurface,
-                  fontSize: 13,
-                  fontWeight: FontWeight.w700,
+              Container(
+                width: 38,
+                height: 38,
+                decoration: BoxDecoration(
+                  color: cs.primaryContainer.withAlpha(enabled ? 190 : 110),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(
+                  speaking
+                      ? Icons.graphic_eq_rounded
+                      : listening
+                      ? Icons.mic_rounded
+                      : Icons.keyboard_voice_rounded,
+                  color: cs.primary,
+                  size: 21,
                 ),
               ),
-              const Spacer(),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Гласов агент',
+                      style: TextStyle(
+                        color: cs.onSurface,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      activityLabel,
+                      style: TextStyle(
+                        color: cs.onSurface.withAlpha(155),
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
               FilledButton.tonalIcon(
                 onPressed: onToggle,
                 icon: Icon(enabled ? Icons.stop : Icons.play_arrow_rounded),
-                label: Text(enabled ? 'Stop' : 'Start'),
+                label: Text(enabled ? 'Стоп' : 'Старт'),
               ),
             ],
           ),
-          const SizedBox(height: 8),
-          Text(
-            'Uses /transcribe for live STT, /get-response for conversational spoken updates, and /speak for exact prompts like confirmations while the phone agent keeps listening.',
-            style: TextStyle(
-              fontSize: 13,
-              height: 1.35,
-              color: cs.onSurface.withAlpha(180),
+          const SizedBox(height: 14),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+            decoration: BoxDecoration(
+              color: cs.surfaceContainerHighest.withAlpha(125),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: cs.outlineVariant.withAlpha(150)),
+            ),
+            child: Text(
+              subtitle,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 15,
+                height: 1.28,
+                color: cs.onSurface,
+                fontWeight: FontWeight.w700,
+              ),
             ),
           ),
           const SizedBox(height: 12),
           LinearProgressIndicator(
             value: enabled ? (micLevel == 0 ? null : micLevel) : 0,
+            minHeight: 5,
+            borderRadius: BorderRadius.circular(99),
           ),
           const SizedBox(height: 10),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              Chip(label: Text(activityLabel)),
-              Chip(
-                label: Text(enabled ? 'Background ready' : 'Background idle'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Text(status, style: TextStyle(fontSize: 13, color: cs.onSurface)),
           if (lastTranscript.trim().isNotEmpty) ...[
-            const SizedBox(height: 8),
+            const SizedBox(height: 2),
             Text(
-              'Last transcript: $lastTranscript',
+              'Чух: $lastTranscript',
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 12,
                 color: cs.onSurface.withAlpha(170),
-                fontStyle: FontStyle.italic,
+                fontWeight: FontWeight.w600,
               ),
             ),
           ],
@@ -1233,6 +1282,23 @@ class _HandsFreeVoiceCard extends StatelessWidget {
       ),
     );
   }
+}
+
+String _bulgarianVoiceStatus(String status) {
+  final clean = status.trim();
+  if (clean.isEmpty) return 'Готов съм.';
+  if (RegExp(r'[\u0400-\u04FF]').hasMatch(clean)) return clean;
+  final lower = clean.toLowerCase();
+  if (lower.contains('listening')) return 'Слушам Ви.';
+  if (lower.contains('speaking')) return 'Говоря.';
+  if (lower.contains('transcrib')) return 'Разпознавам казаното.';
+  if (lower.contains('prepar') || lower.contains('generat')) {
+    return 'Подготвям отговор.';
+  }
+  if (lower.contains('off') || lower.contains('disabled')) {
+    return 'Гласовият режим е изключен.';
+  }
+  return 'Готов съм.';
 }
 
 class _PhaseIndicator extends StatelessWidget {

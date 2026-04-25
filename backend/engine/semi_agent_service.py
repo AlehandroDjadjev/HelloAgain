@@ -2166,7 +2166,7 @@ class SemiAgentService:
             "found": True,
             "object_name": object_name,
             "board_commands": board_commands,
-            "speech_response": summary or f"I opened {title}.",
+            "speech_response": summary or f"Отворих {title}.",
             "viewer": viewer,
         }
 

@@ -294,7 +294,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell>
             widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
         displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
         welcomeText:
-            'Whitespace board launched directly. Onboarding was skipped for this entrypoint.',
+            'Дъската е готова. Входът беше пропуснат.',
       );
     }
 
@@ -327,7 +327,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell>
               widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
           accountToken: explicitToken,
           welcomeText:
-              'The provided token could not be verified at startup, but the whitespace board was launched directly.',
+              'Дъската е готова. Токенът не беше потвърден при стартиране.',
           session: null,
         );
       }
@@ -336,8 +336,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell>
     return _ResolvedWhitespaceLaunch.guest(
       userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
       displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
-      welcomeText:
-          'Whitespace board launched with an explicit local user identity and no login flow.',
+      welcomeText: 'Дъската е готова. Използва се локален профил.',
     );
   }
 
@@ -871,7 +870,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell>
           accountToken: session?.token ?? launch?.accountToken,
           welcomeText: session == null
               ? launch?.welcomeText
-              : 'Welcome, ${session.displayName}. Your space is ready.',
+              : 'Добре дошли, ${session.displayName}. Дъската е готова.',
         );
     }
   }
@@ -895,7 +894,7 @@ class _ResolvedWhitespaceLaunch {
       userId: session.userId.toString(),
       accountToken: session.token,
       welcomeText:
-          'Welcome back, ${session.displayName}. The whitespace board is ready.',
+          'Добре дошли отново, ${session.displayName}. Дъската е готова.',
       session: session,
     );
   }
@@ -907,8 +906,8 @@ class _ResolvedWhitespaceLaunch {
   }) {
     final cleanDisplayName = displayName.trim();
     final fallbackWelcome = cleanDisplayName.isEmpty
-        ? 'Whitespace board ready.'
-        : 'Welcome, $cleanDisplayName. The whitespace board is ready.';
+        ? 'Дъската е готова.'
+        : 'Добре дошли, $cleanDisplayName. Дъската е готова.';
     return _ResolvedWhitespaceLaunch(
       userId: userId,
       welcomeText: welcomeText.isEmpty ? fallbackWelcome : welcomeText,
@@ -1187,10 +1186,10 @@ class RegistrationScreen extends StatelessWidget {
                               const SizedBox(width: 8),
                               Text(
                                 isListening
-                                    ? 'Listening'
+                                    ? 'Слушам'
                                     : isConfirming
-                                    ? 'Waiting for confirmation'
-                                    : 'Your answer',
+                                    ? 'Чакам потвърждение'
+                                    : 'Вашият отговор',
                                 style: TextStyle(
                                   fontSize: 14,
                                   fontWeight: FontWeight.w700,
@@ -1203,7 +1202,7 @@ class RegistrationScreen extends StatelessWidget {
                         const SizedBox(height: 18),
                         Text(
                           transcript.isEmpty
-                              ? 'Speak calmly. I will fill in the answer for you.'
+                              ? 'Говорете спокойно. Ще попълня отговора вместо Вас.'
                               : transcript,
                           style: const TextStyle(
                             fontSize: 24,
@@ -1247,7 +1246,7 @@ class RegistrationScreen extends StatelessWidget {
                       ),
                     ),
                     child: Text(
-                      isListening ? 'Listening...' : 'Repeat question',
+                      isListening ? 'Слушам...' : 'Повторете въпроса',
                       style: const TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.w700,
@@ -1394,8 +1393,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   late final String _sessionId;
   _ActiveUserPopup? _activeUserPopup;
   Map<String, dynamic>? _cachedLocationPayload;
-  String _lastSpeech =
-      'The board is ready for the whitespace conversation pipeline.';
+  String _lastSpeech = 'Готов съм. Кажете какво искате да направя.';
   String _statusText = 'Loading saved board memory...';
   bool _isBusy = false;
   bool _isListening = false;
@@ -2526,7 +2524,7 @@ class _VoiceToggleButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final label = isActive ? 'Voice On' : 'Voice Off';
+    final label = isActive ? 'Гласът е включен' : 'Гласът е изключен';
     final icon = isActive ? Icons.graphic_eq_rounded : Icons.mic_none_rounded;
     final background = isActive ? _bloodRed : Colors.white;
     final borderColor = _bloodRed;
@@ -2697,14 +2695,17 @@ class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
     if (_activeSentenceIndex < 0 || _activeSentenceIndex >= _sentences.length) {
       return const SizedBox.shrink();
     }
-    final width = widget.compact ? 320.0 : 620.0;
-    final fontSize = widget.compact ? 27.0 : 32.0;
-    final lineHeight = widget.compact ? 1.08 : 1.04;
+    final width = math.min(
+      widget.availableWidth,
+      widget.compact ? 340.0 : 640.0,
+    );
+    final fontSize = widget.compact ? 22.0 : 26.0;
+    final lineHeight = widget.compact ? 1.16 : 1.12;
     final rows = _splitSubtitleRows(
       _sentences[_activeSentenceIndex],
       maxWidth: width,
       fontSize: fontSize,
-      letterSpacing: -0.5,
+      letterSpacing: 0,
     );
 
     return ClipRect(
@@ -2756,60 +2757,67 @@ class _SubtitleSentenceBlock extends StatelessWidget {
   Widget build(BuildContext context) {
     return ConstrainedBox(
       constraints: BoxConstraints(maxWidth: maxWidth),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (var index = 0; index < rows.length; index++)
-            Padding(
-              padding: EdgeInsets.only(bottom: index == rows.length - 1 ? 0 : 4),
-              child: ShaderMask(
-                blendMode: BlendMode.srcIn,
-                shaderCallback: (bounds) {
-                  return const LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [
-                      Color(0xFFBF4342),
-                      Color(0xFF8C1C13),
-                      Colors.black,
-                    ],
-                  ).createShader(bounds);
-                },
-                child: Text(
-                  rows[index],
-                  textAlign: TextAlign.center,
-                  maxLines: 1,
-                  overflow: TextOverflow.visible,
-                  softWrap: false,
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: fontSize,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -0.5,
-                    height: lineHeight,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.92),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: _dustGrey.withValues(alpha: 0.9)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.08),
+              blurRadius: 22,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (var index = 0; index < rows.length; index++)
+                Padding(
+                  padding: EdgeInsets.only(
+                    bottom: index == rows.length - 1 ? 0 : 5,
+                  ),
+                  child: Text(
+                    rows[index],
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.visible,
+                    softWrap: false,
+                    style: TextStyle(
+                      color: const Color(0xFF2E1B1A),
+                      fontSize: fontSize,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0,
+                      height: lineHeight,
+                    ),
                   ),
                 ),
-              ),
-            ),
-        ],
+            ],
+          ),
+        ),
       ),
     );
   }
 }
 
 List<Duration> _estimateSpeechSubtitleTimings(List<String> sentences) {
-  return sentences.map((sentence) {
-    final words = sentence
-        .split(RegExp(r'\s+'))
-        .where((word) => word.trim().isNotEmpty)
-        .length;
-    final milliseconds = 700 + (words * 155);
-    return Duration(milliseconds: milliseconds.clamp(900, 2400));
-  }).toList(growable: false);
+  return sentences
+      .map((sentence) {
+        final words = sentence
+            .split(RegExp(r'\s+'))
+            .where((word) => word.trim().isNotEmpty)
+            .length;
+        final milliseconds = 780 + (words * 170);
+        return Duration(milliseconds: milliseconds.clamp(1100, 2600));
+      })
+      .toList(growable: false);
 }
 
 List<String> _speechSubtitleSentences(String speech) {
-  final normalized = speech.replaceAll(RegExp(r'\s+'), ' ').trim();
+  final normalized = _bulgarianSubtitleSpeech(speech);
   if (normalized.isEmpty) {
     return const <String>[];
   }
@@ -2830,9 +2838,9 @@ List<String> _speechSubtitleSentences(String speech) {
     if (words.isEmpty) {
       continue;
     }
-    for (var index = 0; index < words.length; index += 10) {
+    for (var index = 0; index < words.length; index += 8) {
       final chunk = words
-          .sublist(index, math.min(index + 10, words.length))
+          .sublist(index, math.min(index + 8, words.length))
           .join(' ')
           .trim();
       if (chunk.isNotEmpty) {
@@ -2841,6 +2849,20 @@ List<String> _speechSubtitleSentences(String speech) {
     }
   }
   return sentences;
+}
+
+String _bulgarianSubtitleSpeech(String speech) {
+  final normalized = speech.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.isEmpty) return '';
+  if (RegExp(r'[\u0400-\u04FF]').hasMatch(normalized)) return normalized;
+  final lower = normalized.toLowerCase();
+  if (lower.contains('board') || lower.contains('pipeline')) {
+    return 'Готов съм. Кажете какво искате да направя.';
+  }
+  if (lower.contains('speech') || lower.contains('voice')) {
+    return 'Подготвям гласовия отговор.';
+  }
+  return normalized;
 }
 
 List<String> _splitSubtitleRows(
@@ -3609,80 +3631,213 @@ class AgentWeatherSnapshotView extends StatelessWidget {
     final label = (weather['label'] ?? '').toString();
     final summary = (weather['summary'] ?? '').toString();
     final advice = (weather['advice'] ?? '').toString();
-    final temperature = weather['temperature_c']?.toString() ?? '';
-    final apparentTemperature =
-        weather['apparent_temperature_c']?.toString() ?? '';
-    final wind = weather['wind_speed']?.toString() ?? '';
+    final temperature = _formatWeatherNumber(weather['temperature_c']);
+    final apparentTemperature = _formatWeatherNumber(
+      weather['apparent_temperature_c'],
+    );
+    final wind = _formatWeatherNumber(weather['wind_speed']);
     final windUnit = (weather['wind_unit'] ?? 'km/h').toString();
     final iconKey = (weather['icon_key'] ?? 'cloud').toString();
+    final subtitle = _weatherSubtitle(weather);
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          children: [
-            Container(
-              width: 68,
-              height: 68,
-              decoration: BoxDecoration(
-                color: _almondCream,
-                borderRadius: BorderRadius.circular(22),
-              ),
-              child: Icon(
-                _weatherIcon(iconKey),
-                color: _bloodRed,
-                size: 34,
-              ),
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    label,
-                    style: const TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w800,
-                    ),
-                  ),
-                  if (summary.isNotEmpty)
-                    Text(
-                      summary,
-                      style: TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.black.withValues(alpha: 0.66),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ],
-        ),
-        if (advice.isNotEmpty) ...[
-          const SizedBox(height: 16),
-          _SoftInfoPanel(text: advice),
-        ],
-        const SizedBox(height: 14),
-        Wrap(
-          spacing: 10,
-          runSpacing: 10,
-          children: [
-            if (temperature.isNotEmpty)
-              _MiniFactCard(label: 'Температура', value: '$temperature°C'),
-            if (apparentTemperature.isNotEmpty)
-              _MiniFactCard(
-                label: 'Усеща се',
-                value: '$apparentTemperature°C',
-              ),
-            if (wind.isNotEmpty)
-              _MiniFactCard(label: 'Вятър', value: '$wind $windUnit'),
-          ],
-        ),
+    return WeatherCard(
+      icon: _weatherIcon(iconKey),
+      temperature: temperature,
+      description: label.isNotEmpty ? label : summary,
+      subtitle: subtitle,
+      supportingText: advice,
+      details: [
+        if (apparentTemperature.isNotEmpty)
+          ('Усеща се', '$apparentTemperature°C'),
+        if (wind.isNotEmpty) ('Вятър', '$wind $windUnit'),
       ],
     );
   }
+}
+
+class WeatherCard extends StatelessWidget {
+  const WeatherCard({
+    super.key,
+    required this.icon,
+    required this.temperature,
+    required this.description,
+    this.subtitle = '',
+    this.supportingText = '',
+    this.details = const [],
+  });
+
+  final IconData icon;
+  final String temperature;
+  final String description;
+  final String subtitle;
+  final String supportingText;
+  final List<(String, String)> details;
+
+  @override
+  Widget build(BuildContext context) {
+    final temp = temperature.trim();
+    final desc = description.trim();
+    final sub = subtitle.trim();
+    final support = supportingText.trim();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: _dustGrey),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.06),
+            blurRadius: 22,
+            offset: const Offset(0, 12),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF3ECE6),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Icon(icon, color: _bloodRed, size: 34),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (sub.isNotEmpty)
+                      Text(
+                        sub,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.black.withValues(alpha: 0.52),
+                        ),
+                      ),
+                    Text(
+                      temp.isEmpty ? '--°C' : '$temp°C',
+                      style: const TextStyle(
+                        fontSize: 42,
+                        fontWeight: FontWeight.w900,
+                        height: 1,
+                        color: Color(0xFF2E1B1A),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (desc.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Text(
+              desc,
+              style: const TextStyle(
+                fontSize: 20,
+                height: 1.15,
+                fontWeight: FontWeight.w800,
+                color: Color(0xFF2E1B1A),
+              ),
+            ),
+          ],
+          if (support.isNotEmpty) ...[
+            const SizedBox(height: 7),
+            Text(
+              support,
+              style: TextStyle(
+                fontSize: 14.5,
+                height: 1.35,
+                fontWeight: FontWeight.w600,
+                color: Colors.black.withValues(alpha: 0.64),
+              ),
+            ),
+          ],
+          if (details.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final item in details)
+                  _WeatherDetailPill(label: item.$1, value: item.$2),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _WeatherDetailPill extends StatelessWidget {
+  const _WeatherDetailPill({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF7F4F3),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _dustGrey.withValues(alpha: 0.8)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w700,
+              color: Colors.black.withValues(alpha: 0.52),
+            ),
+          ),
+          const SizedBox(width: 7),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w900,
+              color: Color(0xFF2E1B1A),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _formatWeatherNumber(Object? value) {
+  if (value == null) return '';
+  if (value is num) {
+    return value % 1 == 0 ? value.round().toString() : value.toStringAsFixed(1);
+  }
+  return value.toString().trim();
+}
+
+String _weatherSubtitle(Map<String, dynamic> weather) {
+  for (final key in const ['location_label', 'location', 'place_name']) {
+    final value = (weather[key] ?? '').toString().trim();
+    if (value.isNotEmpty) return value;
+  }
+  final timezone = (weather['timezone'] ?? '').toString().trim();
+  if (timezone == 'Europe/Sofia') return 'София';
+  return timezone.isEmpty ? '' : 'Текущо местоположение';
 }
 
 class AgentOutingSuggestionView extends StatelessWidget {
@@ -3769,47 +3924,6 @@ class AgentSummaryOnlyView extends StatelessWidget {
         ? summary.trim()
         : 'Няма нужда от допълнителна карта за този резултат.';
     return _SoftInfoPanel(text: text);
-  }
-}
-
-class _MiniFactCard extends StatelessWidget {
-  const _MiniFactCard({required this.label, required this.value});
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 110,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: _dustGrey),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            label,
-            style: TextStyle(
-              fontSize: 11.5,
-              fontWeight: FontWeight.w700,
-              color: Colors.black.withValues(alpha: 0.55),
-            ),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            value,
-            style: const TextStyle(
-              fontSize: 15,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-        ],
-      ),
-    );
   }
 }
 
