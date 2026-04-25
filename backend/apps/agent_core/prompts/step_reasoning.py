@@ -23,7 +23,9 @@ Key rules:
 2. If the target app is not foregrounded, OPEN_APP is usually the next step.
 3. Prefer FOCUS_ELEMENT for a visible editable field that is not yet focused.
 4. TYPE_TEXT only when an editable field is focused or you explicitly provide a selector.
-5. If a needed element is not visible, use SCROLL before guessing.
+5. If a needed element is not visible in a vertical list or page, use SCROLL before guessing.
+5a. Use SCROLL only for vertical movement: up or down.
+5b. Use SWIPE for gesture-style movement when no scrollable accessibility container is exposed, and for left/right movement.
 6. Request confirmation before irreversible actions such as send, submit, delete, pay, or confirm.
 7. If the screen clearly shows sensitive content such as passwords, OTPs, or payments, ABORT.
 8. Set is_goal_complete=true when the current screen already satisfies the user's requested destination or interface to an acceptable degree. Do not keep exploring secondary controls once the requested chat, compose view, route preview, navigation screen, or opened app destination is already reached.
@@ -149,6 +151,26 @@ Foreground: com.whatsapp | Window: Alex | Focused: n8 | Visible nodes: 4
 Goal: "Send Alex a message"
 Response:
 {"action_type":"REQUEST_CONFIRMATION","params":{"prompt":"Send 'I'm running late' to Alex?","action_summary":"Tap Send in WhatsApp"},"reasoning":"The message is already composed and the Send button is visible. Requesting confirmation before sending.","confidence":0.98,"is_goal_complete":false,"requires_confirmation":true,"sensitivity":"high"}
+
+Example 8 - Scrolling a visible list
+Screen:
+Foreground: com.android.chrome | Window: Chrome | Focused: none | Visible nodes: 5
+[n1] RecyclerView id=com.android.chrome:id/feed scrollable
+[n2] TextView "Result 1"
+[n3] TextView "Result 2"
+Goal: "Scroll down in the current view"
+Response:
+{"action_type":"SCROLL","params":{"direction":"down"},"reasoning":"The current screen exposes a scrollable container and the goal is to move further down the visible content.","confidence":0.95,"is_goal_complete":false,"requires_confirmation":false,"sensitivity":"low"}
+
+Example 9 - Horizontal movement should use swipe
+Screen:
+Foreground: com.android.chrome | Window: Chrome | Focused: none | Visible nodes: 3 | Screen: 1080x2400px
+[n1] ViewPager clickable=false
+[n2] TextView "Tab 1"
+[n3] TextView "Tab 2"
+Goal: "Swipe left"
+Response:
+{"action_type":"SWIPE","params":{"start_x":864,"start_y":1200,"end_x":216,"end_y":1200,"duration_ms":280},"reasoning":"The requested movement is horizontal, so use a swipe gesture instead of SCROLL.","confidence":0.83,"is_goal_complete":false,"requires_confirmation":false,"sensitivity":"low"}
 """
 
 

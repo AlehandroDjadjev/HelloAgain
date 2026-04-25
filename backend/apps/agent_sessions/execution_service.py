@@ -787,22 +787,26 @@ def _get_next_action_llm(
                 ),
             )
 
-    svc = StepReasoningService(reasoning_provider=session.reasoning_provider)
+    assisted_step = _maybe_build_scroll_assist(session, screen_state)
+    if assisted_step is not None:
+        reasoned = assisted_step
+    else:
+        svc = StepReasoningService(reasoning_provider=session.reasoning_provider)
 
-    constraints = {
-        "max_steps_remaining": MAX_STEPS_PER_SESSION - session.current_step_index,
-        "policy_notes": f"risk_level={session.risk_level}",
-    }
+        constraints = {
+            "max_steps_remaining": MAX_STEPS_PER_SESSION - session.current_step_index,
+            "policy_notes": f"risk_level={session.risk_level}",
+        }
 
-    reasoned = svc.reason_next_step(
-        goal=session.goal,
-        target_app=session.target_app,
-        entities=session.entities or {},
-        screen_state=screen_state,
-        step_history=session.get_recent_steps(10),
-        constraints=constraints,
-        session=session,
-    )
+        reasoned = svc.reason_next_step(
+            goal=session.goal,
+            target_app=session.target_app,
+            entities=session.entities or {},
+            screen_state=screen_state,
+            step_history=session.get_recent_steps(10),
+            constraints=constraints,
+            session=session,
+        )
     if reasoned.fallback_mode == "manual_takeover":
         AuditService.record(
             session=session,
@@ -1079,6 +1083,137 @@ def _build_action_from_reasoned(
         "timeout_ms":            5000,
         "retry_policy":          {"max_attempts": 2, "backoff_ms": 500},
     }
+
+
+def _maybe_build_scroll_assist(
+    session: AgentSession,
+    screen_state: dict,
+) -> "Optional[ReasonedStep]":
+    from apps.agent_core.services.step_reasoning import ReasonedStep
+
+    entities = session.entities or {}
+    direction = str(entities.get("direction") or "").strip().lower()
+    if direction not in {"up", "down", "left", "right"}:
+        return None
+    if session.current_step_index > 0:
+        return None
+    if not _looks_like_scroll_request(session):
+        return None
+
+    foreground_package = str(screen_state.get("foreground_package") or "").strip()
+    if session.target_app and foreground_package and foreground_package != session.target_app:
+        return None
+
+    if direction in {"up", "down"} and _screen_has_scrollable_node(screen_state):
+        return ReasonedStep(
+            action_type=ActionType.SCROLL.value,
+            params={"direction": direction},
+            reasoning=(
+                "The goal is an explicit vertical scroll and the current screen "
+                "already exposes a scrollable container, so dispatch SCROLL directly."
+            ),
+            confidence=0.97,
+            is_goal_complete=False,
+            requires_confirmation=False,
+            sensitivity=ActionSensitivity.LOW.value,
+            source="scroll_assist",
+        )
+
+    return ReasonedStep(
+        action_type=ActionType.SWIPE.value,
+        params=_swipe_params_for_direction(screen_state, direction),
+        reasoning=(
+            "The goal is an explicit scroll/swipe request, but no matching vertical "
+            "SCROLL action is available for this screen shape, so use a direct swipe gesture."
+        ),
+        confidence=0.9,
+        is_goal_complete=False,
+        requires_confirmation=False,
+        sensitivity=ActionSensitivity.LOW.value,
+        source="scroll_assist",
+    )
+
+
+def _looks_like_scroll_request(session: AgentSession) -> bool:
+    haystacks = [
+        str(session.goal or "").casefold(),
+        str(session.transcript or "").casefold(),
+    ]
+    markers = (
+        "scroll",
+        "swipe",
+        "current view",
+        "превърти",
+        "скрол",
+        "надолу",
+        "нагоре",
+        "наляво",
+        "надясно",
+    )
+    return any(marker in text for text in haystacks for marker in markers)
+
+
+def _screen_has_scrollable_node(screen_state: dict) -> bool:
+    return any(
+        isinstance(node, dict) and bool(node.get("scrollable"))
+        for node in (screen_state.get("nodes") or [])
+    )
+
+
+def _swipe_params_for_direction(screen_state: dict, direction: str) -> dict:
+    width, height = _screen_dimensions(screen_state)
+    center_x = width // 2
+    center_y = height // 2
+    left = max(1, int(width * 0.2))
+    right = max(left + 1, int(width * 0.8))
+    upper = max(1, int(height * 0.3))
+    lower = max(upper + 1, int(height * 0.75))
+
+    if direction == "up":
+        return {
+            "start_x": center_x,
+            "start_y": upper,
+            "end_x": center_x,
+            "end_y": lower,
+            "duration_ms": 280,
+        }
+    if direction == "left":
+        return {
+            "start_x": right,
+            "start_y": center_y,
+            "end_x": left,
+            "end_y": center_y,
+            "duration_ms": 280,
+        }
+    if direction == "right":
+        return {
+            "start_x": left,
+            "start_y": center_y,
+            "end_x": right,
+            "end_y": center_y,
+            "duration_ms": 280,
+        }
+    return {
+        "start_x": center_x,
+        "start_y": lower,
+        "end_x": center_x,
+        "end_y": upper,
+        "duration_ms": 280,
+    }
+
+
+def _screen_dimensions(screen_state: dict) -> tuple[int, int]:
+    max_right = 0
+    max_bottom = 0
+    for node in (screen_state.get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        bounds = node.get("bounds") or {}
+        if not isinstance(bounds, dict):
+            continue
+        max_right = max(max_right, int(bounds.get("right", 0) or 0))
+        max_bottom = max(max_bottom, int(bounds.get("bottom", 0) or 0))
+    return (max(max_right, 1080), max(max_bottom, 1920))
 
 
 def _create_llm_confirmation(

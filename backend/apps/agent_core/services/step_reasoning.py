@@ -34,7 +34,7 @@ _DEBUG_NODE_LIMIT = 14
 
 _VALID_ACTION_TYPES: frozenset[str] = frozenset(a.value for a in ActionType)
 _VALID_SENSITIVITIES = frozenset(a.value for a in ActionSensitivity)
-_VALID_SCROLL_DIRS = frozenset({"up", "down", "left", "right"})
+_VALID_SCROLL_DIRS = frozenset({"up", "down"})
 
 _REQUIRED_PARAMS: dict[str, list[str]] = {
     "OPEN_APP": ["package_name"],

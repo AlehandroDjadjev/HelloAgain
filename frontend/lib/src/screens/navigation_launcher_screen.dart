@@ -46,11 +46,13 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
   bool _overlayVisible = false;
   bool _completionHandled = false;
   bool _bringingAppToFront = false;
-  bool _pendingReturnToHome = false;
   bool _awaitingClarificationResponse = false;
   bool _awaitingPostCompletionInstruction = false;
   String? _pendingClarificationPrompt;
   String? _pendingClarificationQuestion;
+  PipelinePhase? _postTaskPhase;
+  String? _postTaskStatusMessage;
+  String? _lastTerminalMessage;
   String _lastSubmittedPrompt = '';
   String? _voiceError;
   PipelinePhase _lastObservedPhase = PipelinePhase.idle;
@@ -103,19 +105,10 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     if (_orch.phase != _lastObservedPhase) {
       _lastObservedPhase = _orch.phase;
       unawaited(_syncNavigationOverlay());
-      if (_orch.phase == PipelinePhase.completed && !_completionHandled) {
+      if (_isTerminalPhase(_orch.phase) && !_completionHandled) {
         _completionHandled = true;
-        unawaited(_enterPostCompletionConversation());
-      } else if (_orch.phase == PipelinePhase.failed ||
-          _orch.phase == PipelinePhase.cancelled) {
-        unawaited(
-          _voiceController.resumeListening(
-            status: _orch.phase == PipelinePhase.failed
-                ? _statusText()
-                : 'The current phone task stopped. I am listening again.',
-          ),
-        );
-      } else if (_orch.phase != PipelinePhase.completed) {
+        unawaited(_enterPostCompletionConversation(_orch.phase));
+      } else if (!_isTerminalPhase(_orch.phase)) {
         _completionHandled = false;
       }
     }
@@ -144,10 +137,6 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     if (_awaitingOverlayPermissionReturn) {
       _awaitingOverlayPermissionReturn = false;
       unawaited(_handleOverlayPermissionReturn());
-    }
-    if (_pendingReturnToHome) {
-      _pendingReturnToHome = false;
-      unawaited(_returnToAppAfterConversation());
     }
   }
 
@@ -192,6 +181,9 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
   }
 
   String _statusText() {
+    if (_awaitingPostCompletionInstruction && _postTaskStatusMessage != null) {
+      return _postTaskStatusMessage!;
+    }
     if (_awaitingClarificationResponse) {
       return _pendingClarificationQuestion ??
           'Трябва ми още една подробност, преди да продължа.';
@@ -270,28 +262,24 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
 
     await _overlayService.hide();
     _overlayVisible = false;
-
-    final lifecycleState = WidgetsBinding.instance.lifecycleState;
-    if (lifecycleState != AppLifecycleState.resumed) {
-      _pendingReturnToHome = true;
-      if (!_bringingAppToFront) {
-        _bringingAppToFront = true;
-        await _overlayService.bringToFront();
-        _bringingAppToFront = false;
-      }
-      return;
-    }
-
+    await _orch.endConversationLoop();
     _resetConversationWaitState();
 
     if (!mounted) {
       return;
     }
 
-    Navigator.of(
-      context,
-      rootNavigator: true,
-    ).popUntil((route) => route.isFirst);
+    final navigator = Navigator.of(context, rootNavigator: true);
+    if (navigator.canPop()) {
+      navigator.popUntil((route) => route.isFirst);
+    }
+
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    if (lifecycleState != AppLifecycleState.resumed && !_bringingAppToFront) {
+      _bringingAppToFront = true;
+      await _overlayService.bringToFront();
+      _bringingAppToFront = false;
+    }
   }
 
   Future<void> _syncNavigationOverlay() async {
@@ -351,7 +339,9 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       return 'Need one more detail';
     }
     if (_awaitingPostCompletionInstruction) {
-      return 'Phone task complete';
+      return _postTaskPhase == PipelinePhase.completed
+          ? 'Phone task complete'
+          : 'Phone task update';
     }
     return _guardTitle();
   }
@@ -494,21 +484,48 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     await _startCommand(promptOverride: mergedPrompt);
   }
 
-  Future<void> _enterPostCompletionConversation() async {
+  Future<void> _enterPostCompletionConversation(PipelinePhase phase) async {
     if (!mounted) {
       return;
     }
 
     setState(() {
       _awaitingPostCompletionInstruction = true;
+      _postTaskPhase = phase;
+      _postTaskStatusMessage = 'Подготвям следващия отговор...';
     });
     await _syncNavigationOverlay();
 
-    const prompt =
-        'Задачата е изпълнена. Ако искате следващо действие на телефона, кажете го сега. '
-        'Ако всичко е готово, кажете готово и ще се върна.';
     if (_voiceController.enabled) {
-      await _voiceController.speakText(prompt, resumeWhenDone: true);
+      await _voiceController.pauseForTask(
+        status: 'Подготвям следващия отговор...',
+      );
+    }
+
+    final terminalResponse = await _fetchTerminalResponse(phase);
+    if (!mounted || !_awaitingPostCompletionInstruction) {
+      return;
+    }
+
+    final terminalPrompt = (terminalResponse['message'] ?? '')
+        .toString()
+        .trim();
+    final statusLine = (terminalResponse['status_line'] ?? terminalPrompt)
+        .toString()
+        .trim();
+    final spokenPrompt = terminalPrompt.isNotEmpty
+        ? terminalPrompt
+        : statusLine;
+
+    setState(() {
+      _lastTerminalMessage = spokenPrompt;
+      _postTaskStatusMessage = statusLine.isNotEmpty
+          ? statusLine
+          : spokenPrompt;
+    });
+    await _syncNavigationOverlay();
+    if (_voiceController.enabled) {
+      await _voiceController.speakText(spokenPrompt, resumeWhenDone: true);
       return;
     }
 
@@ -518,23 +535,46 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
   }
 
   Future<void> _handlePostCompletionTranscript(String transcript) async {
-    if (_looksLikeDoneSignal(transcript)) {
-      await _voiceController.speakText('Добре. Връщам се сега.');
+    final followUpContext = await _buildFollowUpContext();
+    final decision = await _decidePostTaskAction(
+      transcript,
+      context: followUpContext,
+    );
+    final action = (decision['decision'] ?? '').toString().trim();
+    final replyMessage = (decision['reply_message'] ?? '').toString().trim();
+
+    if (action == 'return_to_app') {
+      if (replyMessage.isNotEmpty) {
+        await _voiceController.speakText(replyMessage);
+      }
       await _returnToAppAfterConversation();
       return;
     }
 
-    final followUpContext = await _buildFollowUpContext();
+    if (action == 'ask_for_clarification') {
+      if (replyMessage.isNotEmpty) {
+        await _voiceController.speakText(replyMessage, resumeWhenDone: true);
+      } else {
+        await _voiceController.resumeListening();
+      }
+      return;
+    }
+
+    final nextInstruction = (decision['next_instruction'] ?? transcript)
+        .toString()
+        .trim();
     _resetConversationWaitState();
     _promptController.value = TextEditingValue(
-      text: transcript,
-      selection: TextSelection.collapsed(offset: transcript.length),
+      text: nextInstruction,
+      selection: TextSelection.collapsed(offset: nextInstruction.length),
     );
     await _voiceController.pauseForTask(
-      status: 'Започвам следващата задача на телефона...',
+      status: replyMessage.isNotEmpty
+          ? replyMessage
+          : 'Подготвям следващата задача на телефона...',
     );
     await _startCommand(
-      promptOverride: transcript,
+      promptOverride: nextInstruction,
       contextOverride: followUpContext,
     );
   }
@@ -583,6 +623,49 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     }
 
     return context;
+  }
+
+  Future<Map<String, dynamic>> _decidePostTaskAction(
+    String transcript, {
+    required Map<String, dynamic> context,
+  }) async {
+    final sessionId = _orch.sessionId;
+    if (sessionId == null || sessionId.isEmpty) {
+      return {
+        'decision': 'ask_for_clarification',
+        'reply_message':
+            'Не успях да обработя отговора ви. Кажете отново дали да продължим на телефона или да се върнем в приложението.',
+        'next_instruction': '',
+      };
+    }
+
+    try {
+      final response = await _orch.client.decidePostTaskAction(
+        sessionId,
+        transcript: transcript,
+        phase: _terminalPhaseName(_postTaskPhase ?? _orch.phase),
+        currentAppPackage: (context['current_app_package'] ?? '')
+            .toString()
+            .trim(),
+        currentAppName: (context['current_app_name'] ?? '').toString().trim(),
+        currentWindowTitle: (context['current_window_title'] ?? '')
+            .toString()
+            .trim(),
+        lastAssistantMessage:
+            (_lastTerminalMessage ?? _postTaskStatusMessage ?? '').trim(),
+      );
+      final decision = (response['decision'] ?? '').toString().trim();
+      if (decision.isNotEmpty) {
+        return response;
+      }
+    } catch (_) {}
+
+    return {
+      'decision': 'ask_for_clarification',
+      'reply_message':
+          'Не успях да обработя отговора ви. Кажете отново дали да продължим на телефона или да се върнем в приложението.',
+      'next_instruction': '',
+    };
   }
 
   Future<void> _handleVoiceConfirmation(String transcript) async {
@@ -682,12 +765,51 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     return '$cleanBase. $cleanAnswer';
   }
 
+  Future<Map<String, dynamic>> _fetchTerminalResponse(
+    PipelinePhase phase,
+  ) async {
+    final sessionId = _orch.sessionId;
+    if (sessionId == null || sessionId.isEmpty) {
+      return _genericTerminalResponseFallback(phase);
+    }
+
+    try {
+      final response = await _orch.client.getTerminalResponse(
+        sessionId,
+        phase: _terminalPhaseName(phase),
+        errorMessage: _orch.errorMessage ?? '',
+        currentReasoning: _orch.currentReasoning,
+      );
+      final message = (response['message'] ?? '').toString().trim();
+      final statusLine = (response['status_line'] ?? '').toString().trim();
+      if (message.isEmpty && statusLine.isEmpty) {
+        return _genericTerminalResponseFallback(phase);
+      }
+      return response;
+    } catch (_) {
+      return _genericTerminalResponseFallback(phase);
+    }
+  }
+
+  Map<String, dynamic> _genericTerminalResponseFallback(PipelinePhase phase) {
+    const message =
+        'Задачата приключи. Можете да дадете нова инструкция за телефона или да поискате връщане към основното приложение.';
+    return {
+      'phase': _terminalPhaseName(phase),
+      'message': message,
+      'status_line': message,
+    };
+  }
+
   void _resetConversationWaitState() {
     if (!mounted) {
       _awaitingClarificationResponse = false;
       _awaitingPostCompletionInstruction = false;
       _pendingClarificationPrompt = null;
       _pendingClarificationQuestion = null;
+      _postTaskPhase = null;
+      _postTaskStatusMessage = null;
+      _lastTerminalMessage = null;
       return;
     }
     setState(() {
@@ -695,8 +817,33 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       _awaitingPostCompletionInstruction = false;
       _pendingClarificationPrompt = null;
       _pendingClarificationQuestion = null;
+      _postTaskPhase = null;
+      _postTaskStatusMessage = null;
+      _lastTerminalMessage = null;
     });
     unawaited(_syncNavigationOverlay());
+  }
+
+  bool _isTerminalPhase(PipelinePhase phase) =>
+      phase == PipelinePhase.completed ||
+      phase == PipelinePhase.failed ||
+      phase == PipelinePhase.cancelled;
+
+  String _terminalPhaseName(PipelinePhase phase) {
+    switch (phase) {
+      case PipelinePhase.completed:
+        return 'completed';
+      case PipelinePhase.failed:
+        return 'failed';
+      case PipelinePhase.cancelled:
+        return 'cancelled';
+      case PipelinePhase.creatingSession:
+      case PipelinePhase.parsingIntent:
+      case PipelinePhase.executing:
+      case PipelinePhase.awaitingConfirmation:
+      case PipelinePhase.idle:
+        return 'completed';
+    }
   }
 
   _VoiceDecision _parseVoiceDecision(String transcript) {
@@ -732,26 +879,6 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     return _VoiceDecision.unknown;
   }
 
-  bool _looksLikeDoneSignal(String transcript) {
-    final normalized = _normalizeVoiceText(transcript);
-    return _matchesAny(normalized, const [
-      'done',
-      'готово',
-      'all done',
-      'that is all',
-      'that s all',
-      'finished',
-      'свършихме',
-      'това е',
-      'стига',
-      'nothing else',
-      'return',
-      'върни се',
-      'върни се обратно',
-      'go back',
-    ]);
-  }
-
   String _normalizeVoiceText(String value) => value
       .toLowerCase()
       .replaceAll(RegExp(r'[^0-9a-zа-я\s]'), ' ')
@@ -772,7 +899,10 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       return value;
     }
     final lowered = value?.toString().trim().toLowerCase();
-    return lowered == 'true' || lowered == '1' || lowered == 'yes' || lowered == 'да';
+    return lowered == 'true' ||
+        lowered == '1' ||
+        lowered == 'yes' ||
+        lowered == 'да';
   }
 
   @override

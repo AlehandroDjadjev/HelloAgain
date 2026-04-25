@@ -1187,6 +1187,26 @@ class SemiAgentServiceTests(SimpleTestCase):
             self.assertEqual(payload["viewer"]["prompt"], "Open Chrome")
             self.assertTrue(payload["viewer"]["auto_run_on_open"])
 
+    def test_phone_command_launcher_is_not_auto_opened_from_run_results(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = WhiteboardMemoryStore(memory_dir=Path(temp_dir))
+            service = SemiAgentService(board_memory=store)
+
+            viewer = service._extract_auto_open_viewer(
+                [
+                    {
+                        "result": {
+                            "widget_type": "phone_command_launcher",
+                            "prompt": "Open Chrome",
+                            "auto_run_on_open": True,
+                        }
+                    }
+                ],
+                user_id="viewer",
+            )
+
+            self.assertIsNone(viewer)
+
     def test_meetup_mcp_infers_single_tool_and_returns_invite_metadata(self) -> None:
         fake_meetup_service = SimpleNamespace(
             propose_friend_meetup_for_prompt=lambda **kwargs: {

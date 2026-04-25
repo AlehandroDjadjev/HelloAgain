@@ -3660,8 +3660,9 @@ class SemiAgentService:
             return None
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         widget_type = self._clean_text(result.get("widget_type"))
+        if widget_type == "phone_command_launcher":
+            return None
         if widget_type in {
-            "phone_command_launcher",
             "meetup_invite",
             "weather_snapshot",
             "outing_suggestion",

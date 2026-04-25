@@ -40,7 +40,9 @@ from apps.audit_log.services import AuditService
 from apps.audit_log.models import AuditEventType, AuditActor
 
 from .execution_service import ExecutionService
+from .post_task_decision_service import PostTaskDecisionService
 from .models import AgentSession, ConfirmationRecord, SessionStatus
+from .post_task_response_service import PostTaskResponseService
 from .serializers import (
     ActionResultV2Serializer,
     AgentCommandResponseSerializer,
@@ -55,6 +57,10 @@ from .serializers import (
     NavigationPrepareSerializer,
     NextStepRequestSerializer,
     PendingConfirmationResponseSerializer,
+    SessionPostTaskDecisionRequestSerializer,
+    SessionPostTaskDecisionSerializer,
+    SessionTerminalResponseRequestSerializer,
+    SessionTerminalResponseSerializer,
     SessionApproveSerializer,
     SessionCreateResponseSerializer,
 )
@@ -303,6 +309,51 @@ class SessionCancelView(APIView):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
         return Response(AgentSessionDetailSerializer(session).data)
+
+
+class SessionTerminalResponseView(APIView):
+    """POST /api/agent/sessions/{id}/terminal-response/"""
+
+    def post(self, request: Request, session_id: UUID) -> Response:
+        session = _get_session(session_id)
+        ser = SessionTerminalResponseRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        payload = PostTaskResponseService().build_response(
+            session=session,
+            phase=d["phase"],
+            error_message=d.get("error_message", ""),
+            current_reasoning=d.get("current_reasoning", ""),
+        )
+        return Response(
+            SessionTerminalResponseSerializer(payload).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class SessionPostTaskDecisionView(APIView):
+    """POST /api/agent/sessions/{id}/post-task-decision/"""
+
+    def post(self, request: Request, session_id: UUID) -> Response:
+        session = _get_session(session_id)
+        ser = SessionPostTaskDecisionRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        payload = PostTaskDecisionService().decide(
+            session=session,
+            transcript=d["transcript"],
+            phase=d["phase"],
+            current_app_package=d.get("current_app_package", ""),
+            current_app_name=d.get("current_app_name", ""),
+            current_window_title=d.get("current_window_title", ""),
+            last_assistant_message=d.get("last_assistant_message", ""),
+        )
+        return Response(
+            SessionPostTaskDecisionSerializer(payload).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 # ---------------------------------------------------------------------------

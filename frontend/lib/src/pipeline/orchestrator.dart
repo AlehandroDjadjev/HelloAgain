@@ -42,7 +42,10 @@ class PipelineOrchestrator extends ChangeNotifier {
   bool get _cancelled => _cancelRequested;
   bool get hasPreparedCommand => sessionId != null && parsedIntent != null;
 
-  Future<void> run(String command, {String reasoningProvider = 'openai'}) async {
+  Future<void> run(
+    String command, {
+    String reasoningProvider = 'openai',
+  }) async {
     if (phase.isRunning) return;
 
     await prepare(command, reasoningProvider: reasoningProvider);
@@ -97,7 +100,8 @@ class PipelineOrchestrator extends ChangeNotifier {
       sessionId = resp['session_id'] as String?;
       parsedIntent = (resp['intent'] as Map?)?.cast<String, dynamic>() ?? {};
       final destination =
-          ((parsedIntent?['entities'] as Map?)?['destination'] ?? '').toString();
+          ((parsedIntent?['entities'] as Map?)?['destination'] ?? '')
+              .toString();
       if (destination.isNotEmpty) {
         _log('Navigation ready for $destination.', level: LogLevel.success);
       } else {
@@ -236,6 +240,17 @@ class PipelineOrchestrator extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> endConversationLoop() async {
+    _runner?.cancel();
+    if (sessionId != null) {
+      try {
+        await client.cancelSession(sessionId!);
+      } catch (_) {}
+    }
+    _reset();
+    notifyListeners();
+  }
+
   Future<void> _discoverSupportedPackages() async {
     _setPhase(PipelinePhase.creatingSession);
     _log('Discovering installed Android apps...');
@@ -283,7 +298,7 @@ class PipelineOrchestrator extends ChangeNotifier {
     final appPackage =
         parsedIntent?['app_package'] as String? ??
         parsedIntent?['target_app'] as String? ??
-          '';
+        '';
     final result = await _gateway.startSession(
       SessionConfig(
         sessionId: sessionId!,

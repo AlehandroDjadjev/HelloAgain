@@ -14,9 +14,11 @@ from .views import (
     SessionIntentView,
     SessionNextStepView,
     SessionPauseView,
+    SessionPostTaskDecisionView,
     SessionPendingConfirmationView,
     SessionPlanView,
     SessionResumeView,
+    SessionTerminalResponseView,
 )
 
 urlpatterns = [
@@ -30,6 +32,8 @@ urlpatterns = [
     path("sessions/<uuid:session_id>/pause/", SessionPauseView.as_view(), name="session-pause"),
     path("sessions/<uuid:session_id>/resume/", SessionResumeView.as_view(), name="session-resume"),
     path("sessions/<uuid:session_id>/cancel/", SessionCancelView.as_view(), name="session-cancel"),
+    path("sessions/<uuid:session_id>/post-task-decision/", SessionPostTaskDecisionView.as_view(), name="session-post-task-decision"),
+    path("sessions/<uuid:session_id>/terminal-response/", SessionTerminalResponseView.as_view(), name="session-terminal-response"),
 
     # Intent & planning
     path("sessions/<uuid:session_id>/intent/", SessionIntentView.as_view(), name="session-intent"),
