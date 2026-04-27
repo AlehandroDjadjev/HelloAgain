@@ -87,16 +87,10 @@ class OnboardingService:
             missing = self._missing_fields(draft)
             if not missing:
                 draft.current_mode = OnboardingDraft.Mode.READY_TO_REGISTER
-                assistant_reply = (
-                    extracted.get("assistant_reply")
-                    or "Благодаря Ви. Вече имам достатъчно информация и ще подготвя профила Ви."
-                )
+                assistant_reply = self._ready_to_register_reply()
             else:
                 draft.current_mode = OnboardingDraft.Mode.COLLECTING
-                assistant_reply = (
-                    extracted.get("assistant_reply")
-                    or self._follow_up_for_missing(draft, missing)
-                )
+                assistant_reply = self._follow_up_for_missing(draft, missing)
 
         self._append_history(draft, "assistant", assistant_reply)
         draft.save()
@@ -404,8 +398,11 @@ assistant_reply трябва да е кратък, ясен и естестве�
                 "Ако е правилен и искате да влезете, кажете да."
             )
         if draft.current_mode == OnboardingDraft.Mode.READY_TO_REGISTER:
-            return "Вече имам достатъчно информация и мога да довърша регистрацията Ви."
+            return self._ready_to_register_reply()
         return "Продължаваме спокойно. Разкажете ми още малко за себе си."
+
+    def _ready_to_register_reply(self) -> str:
+        return "Вече имам достатъчно информация и мога да довърша регистрацията Ви."
 
     def _missing_fields(self, draft: OnboardingDraft) -> list[str]:
         return self._missing_fields_preview(

@@ -11,7 +11,7 @@
 
 ## Agent MCP Discovery
 
-- `GET /api/agent/mcps/`
+- `GET /api/agent/mcp-registry/`
   Returns the MCP registry used by the semi-agent planner.
 - `GET /api/agent/mcps/<mcp_id>/`
   Returns one MCP descriptor.
@@ -65,7 +65,7 @@ Whitespace responses may include:
 
 ## Maps / Navigation
 
-- `POST /api/agent/navigation/prepare/`
+- `POST /api/agent/navigation/`
 
 Use this when the app needs a prepared navigation or map handoff from an agent prompt.
 

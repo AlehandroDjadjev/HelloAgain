@@ -19,6 +19,7 @@ from .models import (
     OnboardingDraft,
     RecommendationActivity,
 )
+from .onboarding_service import OnboardingService
 from .services import issue_token, recommend_profiles_for_viewer
 
 
@@ -296,6 +297,30 @@ class AccountApiTests(TestCase):
         self.assertIn("шах", payload["draft"]["dynamic_profile_summary"].lower())
         self.assertEqual(payload["mode"], "collecting")
         self.assertIn("phone_number", payload["missing_fields"])
+
+    def test_onboarding_ignores_stale_model_follow_up_after_progress(self):
+        draft = OnboardingDraft.objects.create(
+            session_id="stale-follow-up",
+            display_name="Ivan",
+            dynamic_profile_summary="Enjoys calm walks and thoughtful talks.",
+        )
+        service = OnboardingService()
+
+        with patch.object(
+            service,
+            "_extract",
+            return_value={
+                "display_name": "",
+                "phone_number": "+359 888 123 999",
+                "profile_summary": "",
+                "assistant_reply": "Please tell me your phone number.",
+            },
+        ):
+            payload = service.process_turn(draft.session_id, "My phone is +359 888 123 999")
+
+        self.assertEqual(payload["mode"], "ready_to_register")
+        self.assertEqual(payload["missing_fields"], [])
+        self.assertNotEqual(payload["assistant_reply"], "Please tell me your phone number.")
 
     def test_onboarding_turn_with_existing_phone_switches_to_login_confirmation(self):
         existing = self._create_profile(

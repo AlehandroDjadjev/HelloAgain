@@ -411,24 +411,8 @@ class SessionIntentView(APIView):
         )
 
         # ── Auto-transition to EXECUTING (skip /plan/ and /approve/) ──────────
+        # Transition and first-run started_at stamping are handled in this helper.
         execution_ready = _apply_intent_to_session(session, intent_result)
-
-        if False:
-            if session.status not in (SessionStatus.EXECUTING,
-                                      SessionStatus.AWAITING_CONFIRMATION):
-                # CREATED → PLANNING → EXECUTING
-                if session.status == SessionStatus.CREATED:
-                    SessionService.transition(session, SessionStatus.PLANNING)
-                    session.refresh_from_db()
-                if session.status not in (SessionStatus.EXECUTING,
-                                          SessionStatus.AWAITING_CONFIRMATION):
-                    SessionService.transition(session, SessionStatus.EXECUTING)
-                    session.refresh_from_db()
-
-            # Record started_at on first transition
-            if not session.started_at:
-                session.started_at = datetime.now(timezone.utc)
-                session.save(update_fields=["started_at", "updated_at"])
 
         session.refresh_from_db()
         execution_ready = session.status == SessionStatus.EXECUTING
