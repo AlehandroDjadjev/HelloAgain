@@ -43,7 +43,10 @@ DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "Usually answer in 1 or 2 short sentences. "
     "If important information is missing, ask exactly one clear follow-up question instead of guessing. "
     "Do not add extra suggestions, warnings, or recommendations unless the user asks for them or safety requires it. "
-    "Prefer short spoken-friendly responses."
+    "Prefer short spoken-friendly responses. "
+    "App context: HelloAgain has a whiteboard, friend discovery, friend requests, saved chats, voice chat input, weather cards, meetup planning, Google Calendar reminders, upcoming calendar checks, and phone-control handoff. "
+    "When asked how to use the app, explain these real features from this context instead of inventing screens. "
+    "When the user asks for weather, calendar, meetup, friend, or chat actions, say what will happen in the app and avoid generic unsupported instructions."
 )
 DEFAULT_GOOGLE_SPEECH_HINTS = (
     "български, здравей, помощ, сметка, баланс, превод, моля, искам, "

@@ -697,6 +697,9 @@ class _HelloAgainShellState extends State<HelloAgainShell>
     if (isLoginConfirmationMode) {
       return '';
     }
+    if (assistantReply.isNotEmpty) {
+      return assistantReply;
+    }
     if (needsPhoneNumber && hasCompletedIntroduction) {
       return 'Споделете телефонния си номер, за да продължите. Това е задължителна стъпка за вход.';
     }
@@ -713,7 +716,12 @@ class _HelloAgainShellState extends State<HelloAgainShell>
     required bool needsPhoneNumber,
   }) {
     if (isLoginConfirmationMode) {
-      return 'Потвърдете дали това е вашият профил.';
+      return assistantReply.isNotEmpty
+          ? assistantReply
+          : 'Потвърдете дали това е вашият профил.';
+    }
+    if (assistantReply.isNotEmpty) {
+      return assistantReply;
     }
     if (needsPhoneNumber && hasCompletedIntroduction) {
       return 'Очаквам телефонния ви номер. Това е задължителна стъпка за вход.';
@@ -721,9 +729,7 @@ class _HelloAgainShellState extends State<HelloAgainShell>
     if (!hasCompletedIntroduction) {
       return 'Очаквам да кажете името си и малко за себе си.';
     }
-    return assistantReply.isEmpty
-        ? 'Продължаваме спокойно напред.'
-        : assistantReply;
+    return 'Продължаваме спокойно напред.';
   }
 
   Future<String> _resolveCapturedTranscript(

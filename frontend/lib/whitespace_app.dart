@@ -2241,8 +2241,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     required SceneObjectData object,
     required Map<String, dynamic> viewer,
   }) {
-    const popupWidth = 360.0;
-    const popupHeight = 430.0;
+    const popupWidth = 460.0;
+    const popupHeight = 560.0;
     const gap = 18.0;
     final width = math.min(popupWidth, math.max(280.0, boardSize.width - 24.0));
     final height = math.min(
@@ -2968,11 +2968,16 @@ class UserConnectionPopup extends StatefulWidget {
 
 class _UserConnectionPopupState extends State<UserConnectionPopup> {
   final TextEditingController _messageController = TextEditingController();
+  final BrowserVoiceBridge _voiceBridge = createBrowserVoiceBridge();
+  final AgentBackendClient _voiceClient = AgentBackendClient();
   bool _isSending = false;
+  bool _isTranscribing = false;
   String _errorText = '';
 
   @override
   void dispose() {
+    _voiceBridge.stopRecognition();
+    _voiceBridge.stopAudio();
     _messageController.dispose();
     super.dispose();
   }
@@ -2996,6 +3001,61 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
       if (mounted) {
         setState(() {
           _isSending = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _captureVoiceMessage(int threadId) async {
+    if (!_voiceBridge.isSpeechRecognitionSupported) {
+      setState(() {
+        _errorText = 'Voice input is not available on this device.';
+      });
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _isTranscribing = true;
+      _errorText = '';
+    });
+    try {
+      await _voiceBridge.primeVoiceExperience();
+      final captured = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
+      var transcript = (captured.transcript ?? '').trim();
+      if (transcript.isEmpty) {
+        final payload = await _voiceClient.transcribeSpeechTurn(
+          audioBase64: captured.audioBase64,
+          audioMimeType: captured.mimeType,
+          userId: 'chat-thread-$threadId',
+          sessionId: 'chat-thread-$threadId',
+          language: captured.language,
+        );
+        transcript = (payload['transcript'] ?? payload['message'] ?? '')
+            .toString()
+            .trim();
+      }
+      if (!mounted) return;
+      if (transcript.isEmpty) {
+        setState(() {
+          _errorText = 'No speech was captured.';
+        });
+        return;
+      }
+      setState(() {
+        _messageController.text = transcript;
+        _messageController.selection = TextSelection.collapsed(
+          offset: transcript.length,
+        );
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorText = error.toString().trim();
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTranscribing = false;
         });
       }
     }
@@ -3029,7 +3089,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.97),
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(14),
           border: Border.all(
             color: Colors.black.withValues(alpha: 0.08),
             width: 0.9,
@@ -3115,7 +3175,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: const Color(0xFFF7F0E7),
-                  borderRadius: BorderRadius.circular(18),
+                  borderRadius: BorderRadius.circular(10),
                 ),
                 child: messages.isEmpty
                     ? Center(
@@ -3141,7 +3201,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                                 ? Alignment.centerRight
                                 : Alignment.centerLeft,
                             child: Container(
-                              constraints: const BoxConstraints(maxWidth: 230),
+                              constraints: const BoxConstraints(maxWidth: 310),
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 12,
                                 vertical: 10,
@@ -3150,7 +3210,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                                 color: isMe
                                     ? const Color(0xFFB85A40)
                                     : Colors.white,
-                                borderRadius: BorderRadius.circular(16),
+                                borderRadius: BorderRadius.circular(10),
                               ),
                               child: Text(
                                 (message['text'] ?? '').toString(),
@@ -3235,26 +3295,46 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
             Container(
               decoration: BoxDecoration(
                 color: const Color(0xFFF4E8D9),
-                borderRadius: BorderRadius.circular(18),
+                borderRadius: BorderRadius.circular(10),
               ),
-              child: TextField(
-                controller: _messageController,
-                enabled: !_isSending && threadId > 0,
-                minLines: 1,
-                maxLines: 3,
-                decoration: const InputDecoration(
-                  hintText: 'Send a message...',
-                  border: InputBorder.none,
-                  contentPadding: EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 14,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  IconButton(
+                    tooltip: 'Voice message',
+                    onPressed: (_isSending || _isTranscribing || threadId <= 0)
+                        ? null
+                        : () => _captureVoiceMessage(threadId),
+                    icon: Icon(
+                      _isTranscribing
+                          ? Icons.hearing_rounded
+                          : Icons.mic_rounded,
+                    ),
                   ),
-                ),
-                onSubmitted: (value) {
-                  final text = value.trim();
-                  if (text.isEmpty || _isSending || threadId <= 0) return;
-                  _runAction(() => widget.onSendMessage(threadId, text));
-                },
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      enabled: !_isSending && !_isTranscribing && threadId > 0,
+                      minLines: 2,
+                      maxLines: 5,
+                      decoration: const InputDecoration(
+                        hintText: 'Send a message...',
+                        border: InputBorder.none,
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 14,
+                        ),
+                      ),
+                      onSubmitted: (value) {
+                        final text = value.trim();
+                        if (text.isEmpty || _isSending || threadId <= 0) {
+                          return;
+                        }
+                        _runAction(() => widget.onSendMessage(threadId, text));
+                      },
+                    ),
+                  ),
+                ],
               ),
             ),
             const SizedBox(height: 10),
@@ -3272,7 +3352,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                 ),
                 const SizedBox(width: 8),
                 FilledButton(
-                  onPressed: (_isSending || threadId <= 0)
+                  onPressed: (_isSending || _isTranscribing || threadId <= 0)
                       ? null
                       : () {
                           final text = _messageController.text.trim();
@@ -3289,7 +3369,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                       vertical: 13,
                     ),
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
+                      borderRadius: BorderRadius.circular(10),
                     ),
                   ),
                   child: Text(_isSending ? 'Sending' : 'Send'),

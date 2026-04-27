@@ -1097,6 +1097,8 @@ def respond_to_friend_request(request, request_id: int):
 
     if action == "accept":
         refresh_social_edge_for_friendship(request_obj.from_profile, request_obj.to_profile)
+        thread = whiteboard_service.ensure_thread(request_obj.from_profile, request_obj.to_profile)
+        whiteboard_service.sync_thread_objects(thread)
         record_recommendation_activity(
             viewer,
             event_type="friend_request_accepted",

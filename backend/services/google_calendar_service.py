@@ -117,6 +117,90 @@ class GoogleCalendarService:
             "message": "Meetup reminder added to Google Calendar",
         }
 
+    def list_upcoming_events(
+        self,
+        user_id: str,
+        max_results: int = 5,
+    ) -> dict[str, Any]:
+        clean_user_id = str(user_id or "").strip()
+        if not clean_user_id:
+            return {"success": False, "error": "missing_required_fields"}
+
+        profile = AccountProfile.objects.select_related("user").filter(user_id=clean_user_id).first()
+        if profile is None:
+            return {"success": False, "error": "user_not_found"}
+
+        connection = GoogleCalendarConnection.objects.filter(profile=profile).first()
+        if connection is None or not connection.is_connected:
+            return {"success": False, "error": "google_calendar_not_connected"}
+
+        access_token = self._get_valid_access_token(connection)
+        if not access_token:
+            return {"success": False, "error": "google_calendar_not_connected"}
+
+        headers = {"Authorization": f"Bearer {access_token}"}
+        params = {
+            "timeMin": timezone.now().isoformat(),
+            "singleEvents": "true",
+            "orderBy": "startTime",
+            "maxResults": max(1, min(int(max_results or 5), 10)),
+        }
+        try:
+            response = requests.get(
+                f"{self.calendar_base_url}/calendars/primary/events",
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+        except requests.RequestException as exc:
+            logger.warning("google_calendar.list_events_network_error user_id=%s error=%s", clean_user_id, exc)
+            return {"success": False, "error": "google_calendar_request_failed"}
+
+        if response.status_code == 401:
+            access_token = self._refresh_access_token(connection)
+            if not access_token:
+                return {"success": False, "error": "google_calendar_not_connected"}
+            headers["Authorization"] = f"Bearer {access_token}"
+            try:
+                response = requests.get(
+                    f"{self.calendar_base_url}/calendars/primary/events",
+                    headers=headers,
+                    params=params,
+                    timeout=20,
+                )
+            except requests.RequestException as exc:
+                logger.warning("google_calendar.list_events_retry_error user_id=%s error=%s", clean_user_id, exc)
+                return {"success": False, "error": "google_calendar_request_failed"}
+
+        if response.status_code != 200:
+            logger.warning(
+                "google_calendar.list_events_failed user_id=%s status=%s body=%s",
+                clean_user_id,
+                response.status_code,
+                response.text[:500],
+            )
+            return {"success": False, "error": "google_calendar_request_failed"}
+
+        items = []
+        for raw in response.json().get("items", []) or []:
+            start = raw.get("start") if isinstance(raw.get("start"), dict) else {}
+            end = raw.get("end") if isinstance(raw.get("end"), dict) else {}
+            items.append(
+                {
+                    "event_id": str(raw.get("id") or ""),
+                    "title": str(raw.get("summary") or "Untitled event"),
+                    "start_time": str(start.get("dateTime") or start.get("date") or ""),
+                    "end_time": str(end.get("dateTime") or end.get("date") or ""),
+                    "location": str(raw.get("location") or ""),
+                    "html_link": str(raw.get("htmlLink") or ""),
+                }
+            )
+        return {
+            "success": True,
+            "events": items,
+            "message": "Upcoming calendar events loaded.",
+        }
+
     def build_meetup_reminder_payload(
         self,
         *,
