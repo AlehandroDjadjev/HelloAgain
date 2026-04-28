@@ -17,6 +17,7 @@ from .views import (
     SessionPendingConfirmationView,
     SessionPlanView,
     SessionResumeView,
+    SessionUserInputView,
 )
 
 urlpatterns = [
@@ -39,6 +40,7 @@ urlpatterns = [
     # Execution loop
     path("sessions/<uuid:session_id>/next-step/", SessionNextStepView.as_view(), name="session-next-step"),
     path("sessions/<uuid:session_id>/action-result/", SessionActionResultView.as_view(), name="session-action-result"),
+    path("sessions/<uuid:session_id>/user-input/", SessionUserInputView.as_view(), name="session-user-input"),
 
     # Confirmation
     path("sessions/<uuid:session_id>/pending-confirmation/", SessionPendingConfirmationView.as_view(), name="session-pending-confirmation"),

@@ -119,6 +119,20 @@ class DummyTTSProvider:
         return "ready"
 
 
+class FakeJsonResponse:
+    def __init__(self, payload: dict):
+        self._payload = json.dumps(payload).encode("utf-8")
+
+    def read(self):
+        return self._payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 class AudioPreparationTests(SimpleTestCase):
     def test_prepare_audio_for_stt_trims_silence_with_vad(self):
         wav_bytes = _wav_with_silence()
@@ -225,6 +239,67 @@ class OpenAiProviderTests(SimpleTestCase):
         finally:
             os.unlink(temp_path)
 
+    def test_plain_text_requests_use_chat_completions_model(self):
+        provider = OpenAILLMProvider(api_key="test-key")
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeJsonResponse(
+                {"choices": [{"message": {"content": "Hello back"}}]},
+            )
+
+        with patch("voice_gateway.services.providers.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = provider.generate_reply("Hi", "session-1", "user-1")
+
+        self.assertEqual(result.text, "Hello back")
+        self.assertIn("llm_model=gpt-5.4-mini", result.warnings)
+        self.assertEqual(captured["payload"]["model"], "gpt-5.4-mini")
+
+    def test_plain_text_requests_ignore_realtime_model_for_chat_completions(self):
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeJsonResponse(
+                {"choices": [{"message": {"content": "Hello back"}}]},
+            )
+
+        with patch.dict(os.environ, {"OPENAI_REALTIME_MODEL": "gpt-realtime"}, clear=False):
+            with patch("voice_gateway.services.providers.urllib.request.urlopen", side_effect=fake_urlopen):
+                provider = OpenAILLMProvider(api_key="test-key")
+                result = provider.generate_reply("Hi", "session-1", "user-1")
+
+        self.assertEqual(result.text, "Hello back")
+        self.assertIn("llm_model=gpt-5.4-mini", result.warnings)
+        self.assertEqual(captured["payload"]["model"], "gpt-5.4-mini")
+
+    def test_structured_requests_stay_on_structured_model(self):
+        provider = OpenAILLMProvider(api_key="test-key", model="gpt-5.4-mini")
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeJsonResponse(
+                {"choices": [{"message": {"content": "{\"ok\":true}"}}]},
+            )
+
+        with patch("voice_gateway.services.providers.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = provider.generate_reply_with_messages(
+                system_prompt="Return JSON",
+                messages=[{"role": "user", "content": "Do it"}],
+                session_id="session-1",
+                user_id="user-1",
+                include_history=False,
+                store_history=False,
+                response_format={"type": "json_object"},
+            )
+
+        self.assertEqual(result.text, "{\"ok\":true}")
+        self.assertIn("llm_model=gpt-5.4-mini", result.warnings)
+        self.assertEqual(captured["payload"]["model"], "gpt-5.4-mini")
+
 
 class ElevenLabsProviderTests(SimpleTestCase):
     def test_stt_provider_reads_labs_api_key_alias_from_backend_env(self):
@@ -245,10 +320,35 @@ class ElevenLabsProviderTests(SimpleTestCase):
         finally:
             os.unlink(temp_path)
 
-    def test_default_provider_factories_prefer_elevenlabs_when_key_exists(self):
+    def test_default_provider_factories_use_elevenlabs_for_stt_and_tts(self):
         with patch.dict(os.environ, {"LABS_API_KEY": "test-elevenlabs"}, clear=False):
             self.assertIsInstance(build_default_stt_provider(), ElevenLabsSpeechToTextProvider)
             self.assertIsInstance(build_default_tts_provider(), ElevenLabsTTSProvider)
+
+    def test_elevenlabs_tts_defaults_to_flash_2_5_with_adam_stone_voice_id(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ELEVENLABS_TTS_MODEL", None)
+            os.environ.pop("ELEVENLABS_TTS_VOICE_ID", None)
+            os.environ.pop("ELEVENLABS_VOICE_ID", None)
+            os.environ.pop("ELEVENLABS_TTS_VOICE_NAME", None)
+            os.environ.pop("ELEVENLABS_VOICE_NAME", None)
+            provider = ElevenLabsTTSProvider(api_key="test-elevenlabs")
+
+        self.assertEqual(provider.model, "eleven_flash_v2_5")
+        self.assertEqual(provider.voice_id, "auq43ws1oslv0tO4BDa7")
+        self.assertEqual(provider.voice_name, "Adam Stone - Smooth and Relaxed")
+        self.assertEqual(
+            provider.status(),
+            "configured: elevenlabs/eleven_flash_v2_5/auq43ws1oslv0tO4BDa7",
+        )
+
+    def test_elevenlabs_tts_normalizes_adam_stone_alias(self):
+        provider = ElevenLabsTTSProvider(
+            api_key="test-elevenlabs",
+            voice_name="adam-stone",
+        )
+
+        self.assertEqual(provider.voice_name, "Adam Stone - Smooth and Relaxed")
 
 
 class VoiceGatewayViewTests(SimpleTestCase):
@@ -290,6 +390,7 @@ class VoiceGatewayViewTests(SimpleTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["Content-Type"], "audio/wav")
+        self.assertEqual(response["X-Voice-Provider"], "piper_stub")
         self.assertEqual(response.content, self.wav_bytes)
 
     def test_get_response_view_returns_text_and_audio_payload(self):

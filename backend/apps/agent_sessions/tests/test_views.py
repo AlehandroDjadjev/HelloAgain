@@ -144,3 +144,150 @@ class AgentCommandViewTests(TestCase):
 
         session = SessionService.get(payload["session_id"])
         self.assertEqual(session.reasoning_provider, "openai")
+
+
+class SessionUserInputViewTests(TestCase):
+    def _make_session_with_pending_query(self):
+        session = SessionService.create(
+            user_id="clarification-test",
+            device_id="device-1",
+            transcript="Message Alex on WhatsApp",
+            input_mode="text",
+            supported_packages=["com.whatsapp"],
+        )
+        session.store_intent_data(
+            goal="Message Alex on WhatsApp",
+            target_app="com.whatsapp",
+            entities={},
+        )
+        session.status = SessionStatus.AWAITING_USER_INPUT
+        session.pending_user_input = {
+            "query_id": "query_abc",
+            "status": "pending",
+            "question": "Which Alex should I message? I see Alex Chen and Alex Johnson.",
+            "followup_question": "Which Alex should I message? I see Alex Chen and Alex Johnson.",
+            "attempt_count": 1,
+            "max_attempts": 3,
+            "required_fields": ["recipient"],
+            "candidates": ["Alex Chen", "Alex Johnson"],
+            "ui_context": {"candidates": ["Alex Chen", "Alex Johnson"]},
+            "reason": "multiple_visible_matches",
+            "last_user_reply": "",
+            "why_unresolved": "",
+            "fallback_mode": "",
+            "entity_updates": {},
+        }
+        session.save(update_fields=["status", "pending_user_input", "updated_at"])
+        return session.id
+
+    def test_user_input_endpoint_resolves_and_merges_entities(self):
+        session_id = self._make_session_with_pending_query()
+
+        response = self.client.post(
+            f"/api/agent/sessions/{session_id}/user-input/",
+            data={
+                "query_id": "query_abc",
+                "transcript": "Alex Johnson",
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "resolved")
+        self.assertTrue(payload["resolved"])
+        self.assertEqual(payload["entity_updates"]["recipient"], "Alex Johnson")
+        self.assertEqual(payload["resolved_values"]["recipient"], "Alex Johnson")
+        self.assertEqual(payload["missing_fields"], [])
+        self.assertEqual(payload["matched_candidate_id"], "candidate_2")
+        self.assertFalse(payload["should_fallback"])
+
+        session = SessionService.get(session_id)
+        self.assertEqual(session.status, SessionStatus.EXECUTING)
+        self.assertEqual(session.entities["recipient"], "Alex Johnson")
+        self.assertEqual(session.pending_user_input, {})
+
+    def test_user_input_endpoint_returns_409_for_stale_query_id(self):
+        session_id = self._make_session_with_pending_query()
+
+        response = self.client.post(
+            f"/api/agent/sessions/{session_id}/user-input/",
+            data={
+                "query_id": "wrong_query",
+                "transcript": "Alex Johnson",
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_user_input_endpoint_returns_409_when_session_is_not_awaiting_input(self):
+        session_id = self._make_session_with_pending_query()
+        session = SessionService.get(session_id)
+        session.status = SessionStatus.EXECUTING
+        session.save(update_fields=["status", "updated_at"])
+
+        response = self.client.post(
+            f"/api/agent/sessions/{session_id}/user-input/",
+            data={
+                "query_id": "query_abc",
+                "transcript": "Alex Johnson",
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_user_input_endpoint_returns_retryable_followup(self):
+        session_id = self._make_session_with_pending_query()
+
+        response = self.client.post(
+            f"/api/agent/sessions/{session_id}/user-input/",
+            data={
+                "query_id": "query_abc",
+                "transcript": "Alex",
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "needs_user_input")
+        self.assertFalse(payload["resolved"])
+        self.assertEqual(payload["attempt"], 2)
+        self.assertEqual(payload["missing_fields"], ["recipient"])
+        self.assertEqual(payload["reason_unresolved"], "multiple_matches")
+        self.assertFalse(payload["should_fallback"])
+        self.assertIn("Please choose exactly one", payload["followup_question"])
+
+        session = SessionService.get(session_id)
+        self.assertEqual(session.status, SessionStatus.AWAITING_USER_INPUT)
+        self.assertEqual(session.pending_user_input["attempt_count"], 2)
+        self.assertEqual(session.pending_user_input["followup_question"], payload["followup_question"])
+
+    def test_user_input_endpoint_falls_back_after_final_unresolved_attempt(self):
+        session_id = self._make_session_with_pending_query()
+        session = SessionService.get(session_id)
+        session.pending_user_input["attempt_count"] = 3
+        session.save(update_fields=["pending_user_input", "updated_at"])
+
+        response = self.client.post(
+            f"/api/agent/sessions/{session_id}/user-input/",
+            data={
+                "query_id": "query_abc",
+                "transcript": "[silence]",
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "manual_takeover")
+        self.assertFalse(payload["resolved"])
+        self.assertEqual(payload["reason_unresolved"], "empty_reply")
+        self.assertTrue(payload["should_fallback"])
+        self.assertEqual(payload["missing_fields"], ["recipient"])
+
+        session.refresh_from_db()
+        self.assertEqual(session.pending_user_input["status"], "fallback")
+        self.assertEqual(session.pending_user_input["reason_unresolved"], "empty_reply")

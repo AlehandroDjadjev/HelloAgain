@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_APPS: dict[str, str] = {
     "com.whatsapp":                    "WhatsApp (messaging)",
+    "com.viber.voip":                  "Viber (messaging / calls)",
+    "org.telegram.messenger":          "Telegram (messaging)",
+    "com.facebook.orca":               "Messenger (messaging)",
+    "com.google.android.apps.messaging": "Google Messages (SMS / RCS messaging)",
     "com.google.android.apps.maps":    "Google Maps (navigation / directions)",
     "com.android.chrome":              "Chrome (web browser / URL / search)",
     "com.google.android.gm":           "Gmail (email composition)",
@@ -32,7 +36,103 @@ SUPPORTED_APPS: dict[str, str] = {
 
 
 def _describe_supported_app(package_name: str) -> str:
-    return SUPPORTED_APPS.get(package_name, "Installed Android app")
+    if package_name in SUPPORTED_APPS:
+        return SUPPORTED_APPS[package_name]
+
+    lower = package_name.lower()
+    if any(token in lower for token in ("viber", "whatsapp", "telegram", "messenger", "messages", "sms")):
+        return "Messaging app"
+    if any(token in lower for token in ("maps", "navigation", "waze")):
+        return "Navigation / directions app"
+    if any(token in lower for token in ("chrome", "browser", "firefox", "edge")):
+        return "Web browser / search app"
+    if any(token in lower for token in ("gmail", "mail", "email")):
+        return "Email app"
+    return "Installed Android app"
+
+
+def _package_category(package_name: str) -> str:
+    description = _describe_supported_app(package_name).lower()
+    lower = package_name.lower()
+    if "messaging" in description or any(
+        token in lower
+        for token in ("viber", "whatsapp", "telegram", "messenger", "messages", "sms")
+    ):
+        return "messaging"
+    if "navigation" in description or any(token in lower for token in ("maps", "navigation", "waze")):
+        return "navigation"
+    if "browser" in description or "search" in description or any(
+        token in lower for token in ("chrome", "browser", "firefox", "edge")
+    ):
+        return "browser"
+    if "email" in description or any(token in lower for token in ("gmail", "mail", "email")):
+        return "email"
+    return "app"
+
+
+def _category_for_goal_type(goal_type: str) -> str:
+    if goal_type == "send_message":
+        return "messaging"
+    if goal_type in ("navigate_to", "start_navigation"):
+        return "navigation"
+    if goal_type in ("search", "open_website"):
+        return "browser"
+    if goal_type == "draft_email":
+        return "email"
+    return "app"
+
+
+def _pick_package_for_category(
+    supported_packages: list[str],
+    category: str,
+    transcript: str = "",
+) -> tuple[str, str]:
+    packages = supported_packages or list(SUPPORTED_APPS.keys())
+    lower_transcript = transcript.lower()
+    candidates = [
+        package
+        for package in packages
+        if _package_category(package) == category
+    ]
+    if not candidates:
+        return "", ""
+
+    for package in candidates:
+        package_tail = package.rsplit(".", 1)[-1].lower()
+        if package_tail and package_tail in lower_transcript:
+            return package, _describe_supported_app(package).split(" (", 1)[0]
+
+    if len(candidates) == 1:
+        package = candidates[0]
+        return package, _describe_supported_app(package).split(" (", 1)[0]
+
+    preferred = {
+        "messaging": [
+            "com.viber.voip",
+            "com.whatsapp",
+            "org.telegram.messenger",
+            "com.google.android.apps.messaging",
+            "com.facebook.orca",
+        ],
+        "navigation": [
+            "com.google.android.apps.maps",
+            "com.waze",
+        ],
+        "browser": [
+            "com.android.chrome",
+            "org.mozilla.firefox",
+            "com.microsoft.emmx",
+        ],
+        "email": [
+            "com.google.android.gm",
+        ],
+    }.get(category, [])
+    for package in preferred:
+        if package in candidates:
+            return package, _describe_supported_app(package).split(" (", 1)[0]
+
+    package = candidates[0]
+    return package, _describe_supported_app(package).split(" (", 1)[0]
 
 SUPPORTED_GOAL_TYPES: list[str] = [
     "send_message",        # send a chat/SMS message to a recipient
@@ -101,17 +201,21 @@ OUTPUT RULES (non-negotiable):
    - "low"    → reading, searching, opening apps
    - "medium" → navigation, web browsing, non-destructive actions
    - "high"   → sending messages, composing emails, actions that cannot be undone
-7. "confidence" is 0.0–1.0. Use < 0.5 if the target app or goal is genuinely ambiguous.
-8. "ambiguity_flags" lists specific things you are uncertain about.
-9. If the user input is chit-chat, nonsense, a general knowledge question, not actionable on the phone,
+7. If the command is clearly a phone action but the user did not name an app,
+   choose the best installed app from SUPPORTED APPS based on the task:
+   messaging -> a messaging app, navigation -> a maps app, search/website -> a browser,
+   email -> an email app. Add "target_app_inferred" to ambiguity_flags.
+8. "confidence" is 0.0–1.0. Use < 0.5 only if the task itself is unsafe or genuinely unclear.
+9. "ambiguity_flags" lists specific things you are uncertain about.
+10. If the user input is chit-chat, nonsense, a general knowledge question, not actionable on the phone,
    or too unclear to execute safely, return:
    - "goal_type": "invalid_request"
    - "target_app": ""
    - "risk_level": "low"
    - "confidence": 0.0-0.35
    - "ambiguity_flags": ["not_actionable_request"] or another specific reason
-10. Do NOT guess an app just to satisfy the schema. If the request is not clearly actionable,
-    use "invalid_request".
+11. Do NOT mark a real phone task invalid just because the app was not named.
+    Use invalid_request only when the requested action itself is not executable on the phone.
 
 REQUIRED OUTPUT SCHEMA:
 {{
@@ -197,7 +301,7 @@ class IntentService:
             if parsed.app_package and parsed.goal:
                 return parsed
 
-            fallback = self._fallback_service.parse(transcript)
+            fallback = self._fallback_service.parse(transcript, packages)
             fallback.raw_llm_response = raw_response
             fallback.ambiguity_flags = list(parsed.ambiguity_flags) + [
                 "LLM returned incomplete intent data — used keyword detection fallback"
@@ -209,7 +313,7 @@ class IntentService:
             logger.warning(
                 "LLM unavailable, falling back to keyword detection: %s", exc
             )
-            fallback = self._fallback_service.parse(transcript)
+            fallback = self._fallback_service.parse(transcript, packages)
             fallback.raw_llm_response = f"LLM_ERROR: {exc}"
             fallback.ambiguity_flags.append(
                 f"LLM unavailable ({type(exc).__name__}) — used keyword detection"
@@ -295,9 +399,21 @@ class IntentService:
             confidence = min(confidence, 0.35)
         # Validate app_package
         elif app_package not in allowed_package_set:
-            ambiguity.append(f"Unknown app package '{app_package}'")
-            confidence = min(confidence, 0.4)
-            app_package = ""
+            inferred_package, _ = _pick_package_for_category(
+                list(allowed_package_set),
+                _category_for_goal_type(goal_type),
+                transcript,
+            )
+            if inferred_package:
+                ambiguity.append(
+                    f"Unknown app package '{app_package}' - inferred '{inferred_package}' from installed apps"
+                )
+                confidence = min(confidence, 0.72)
+                app_package = inferred_package
+            else:
+                ambiguity.append(f"Unknown app package '{app_package}'")
+                confidence = min(confidence, 0.4)
+                app_package = ""
 
         # Normalise entities — strip empties
         raw_entities: dict = data.get("entities", {}) or {}
@@ -328,9 +444,16 @@ class _KeywordFallback:
     Accuracy is limited — the LLM path is always preferred.
     """
 
-    def parse(self, transcript: str) -> IntentResult:
+    def parse(
+        self,
+        transcript: str,
+        supported_packages: list[str] | None = None,
+    ) -> IntentResult:
         lower = transcript.lower()
-        app_package, target_app, goal_type, risk = self._detect(lower)
+        app_package, target_app, goal_type, risk = self._detect(
+            lower,
+            supported_packages=supported_packages or list(SUPPORTED_APPS.keys()),
+        )
         entities = self._extract_entities(lower, goal_type)
 
         goal = self._build_goal(goal_type, app_package, entities, transcript)
@@ -352,21 +475,56 @@ class _KeywordFallback:
         )
 
     @staticmethod
-    def _detect(lower: str) -> tuple[str, str, str, str]:
+    def _detect(
+        lower: str,
+        supported_packages: list[str],
+    ) -> tuple[str, str, str, str]:
         import re
         has_url = bool(re.search(r"https?://|www\.|\.com|\.org|\.net|\.io", lower))
 
         if "whatsapp" in lower:
             goal_type = "send_message" if any(
-                w in lower for w in ("send", "message", "tell", "say", "write")
+                w in lower for w in ("send", "message", "tell", "say", "write", "text")
             ) else "open_app"
             return "com.whatsapp", "WhatsApp", goal_type, "high" if goal_type == "send_message" else "medium"
+        if "viber" in lower:
+            goal_type = "send_message" if any(
+                w in lower for w in ("send", "message", "tell", "say", "write", "text")
+            ) else "open_app"
+            return "com.viber.voip", "Viber", goal_type, "high" if goal_type == "send_message" else "medium"
+        if "telegram" in lower:
+            goal_type = "send_message" if any(
+                w in lower for w in ("send", "message", "tell", "say", "write", "text")
+            ) else "open_app"
+            return "org.telegram.messenger", "Telegram", goal_type, "high" if goal_type == "send_message" else "medium"
+        has_message_verb = any(
+            w in lower
+            for w in ("send", "message", "say", "write", "text", "chat")
+        ) or ("tell " in lower and "tell me " not in lower)
+        if has_message_verb:
+            package, label = _pick_package_for_category(
+                supported_packages,
+                "messaging",
+                lower,
+            )
+            if package:
+                return package, label, "send_message", "high"
         if any(w in lower for w in ("gmail", "email", "send email", "draft")):
-            return "com.google.android.gm", "Gmail", "draft_email", "high"
+            package, label = _pick_package_for_category(
+                supported_packages,
+                "email",
+                lower,
+            )
+            return package or "com.google.android.gm", label or "Gmail", "draft_email", "high"
         # Chrome: explicit browser keywords OR URL/domain detected
         if any(w in lower for w in ("chrome", "browser", "open website", "go to website")) or has_url:
             goal_type = "open_website" if has_url else "search"
-            return "com.android.chrome", "Chrome", goal_type, "medium"
+            package, label = _pick_package_for_category(
+                supported_packages,
+                "browser",
+                lower,
+            )
+            return package or "com.android.chrome", label or "Chrome", goal_type, "medium"
         if any(
             w in lower
             for w in (
@@ -383,11 +541,21 @@ class _KeywordFallback:
                 "отведи ме до",
             )
         ):
-            return "com.google.android.apps.maps", "Google Maps", "navigate_to", "medium"
+            package, label = _pick_package_for_category(
+                supported_packages,
+                "navigation",
+                lower,
+            )
+            return package or "com.google.android.apps.maps", label or "Google Maps", "navigate_to", "medium"
         if "brawl stars" in lower or "brawlstars" in lower or "brawl star" in lower:
             return "com.supercell.brawlstars", "Brawl Stars", "open_app", "low"
         if any(w in lower for w in ("search", "google", "look up", "find")):
-            return "com.android.chrome", "Chrome", "search", "low"
+            package, label = _pick_package_for_category(
+                supported_packages,
+                "browser",
+                lower,
+            )
+            return package or "com.android.chrome", label or "Chrome", "search", "low"
         return "", "unknown", "invalid_request", "low"
 
     @staticmethod
@@ -480,7 +648,8 @@ class _KeywordFallback:
             recipient = entities.get("recipient", "contact")
             msg = entities.get("message", "")
             preview = f": '{msg[:40]}'" if msg else ""
-            return f"Send WhatsApp message to {recipient}{preview}"
+            app_label = _describe_supported_app(app).split(" (", 1)[0] if app else "message"
+            return f"Send {app_label} message to {recipient}{preview}"
         if goal_type in ("navigate_to", "start_navigation"):
             dest = entities.get("destination", "destination")
             return f"Navigate to {dest}"

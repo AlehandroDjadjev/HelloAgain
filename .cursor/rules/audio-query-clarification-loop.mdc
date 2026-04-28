@@ -1,0 +1,74 @@
+---
+description: Audio clarification loop for the phone controller agent
+alwaysApply: false
+---
+
+# Audio Clarification Feature
+
+Use this rule when implementing or editing the audio clarification flow.
+
+@docs/audio-query-clarification-loop.md
+
+## Intent
+Add clarification as a third pause-and-resume mode so the agent can ask the user for missing or ambiguous data, reflect on the reply, and continue safely.
+
+## Required behavior
+- Clarification is distinct from confirmation.
+- Clarification is used only when the agent cannot safely continue from UI state and current session knowledge alone.
+- Treat clarification as a paused run, not a failed run.
+
+## Clarification state machine
+- `executing`
+- `needs_clarification`
+- `clarification_attempt_1`
+- `clarification_attempt_2`
+- `clarification_attempt_3`
+- `fallback`
+
+## When clarification is allowed
+- required slot/value is missing
+- multiple plausible UI targets exist
+- current context is underdetermined
+- the next safe step cannot be justified without user input
+
+## Persistence requirements
+Persist a pending clarification object with at least:
+- `query_id`
+- `attempt_count`
+- `required_fields`
+- `candidate_set`
+- relevant UI context snapshot
+- latest follow-up question
+- resolution metadata
+
+## Reflection requirements
+A clarification reply is resolved only if it:
+- fills the required slot(s)
+- maps to exactly one actionable interpretation
+- does not conflict with current context
+
+Reflection output should be structured and include:
+- `resolved`
+- `entity_updates`
+- `followup_question`
+- `why_unresolved`
+
+## Retry rules
+- max 3 clarification attempts
+- each retry must be more specific than the last
+- prefer UI-derived candidates over invented entities
+- treat silence and irrelevant replies as first-class outcomes
+- on final failure, use a safe fallback instead of guessing
+
+## Frontend behavior
+- recognize `needs_user_input`
+- pause device execution
+- speak the question
+- listen for one answer
+- send reply back to backend
+- resume only after backend resolves or falls back
+
+## Safety
+- clarification must not weaken confirmation policy
+- do not continue after unresolved ambiguity
+- do not silently substitute likely values

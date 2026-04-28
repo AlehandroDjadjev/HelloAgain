@@ -45,6 +45,7 @@ from apps.agent_core.enums import ActionErrorCode, ActionResultStatus, ActionSen
 from apps.audit_log.models import AuditActor, AuditEventType
 from apps.audit_log.services import AuditService
 
+from apps.agent_core.services.screen_formatter import summarize_screen_for_history
 from apps.agent_core.services.step_reasoning import StepReasoningService
 from apps.agent_core.services.vision_reasoning import VisionReasoningService, VisionTapTarget
 from apps.agent_policy.models import UserAutomationPolicy
@@ -52,6 +53,7 @@ from apps.agent_policy.services import PolicyEnforcer
 from apps.agent_plans.services import PlanService
 from apps.device_bridge.services import pop_screenshot
 
+from .clarification_service import ClarificationService
 from .models import AgentSession, ConfirmationRecord, SessionStatus
 from .services import SessionService
 
@@ -140,6 +142,7 @@ class NextActionResponse:
     status:
       "execute"         → run next_action on device now
       "confirm"         → show confirmation dialog
+      "needs_user_input"→ pause and ask a clarification question
       "retry"           → wait and call get_next_action again
       "complete"        → goal achieved; session finished
       "abort"           → fatal error; stop and report
@@ -298,6 +301,29 @@ class ExecutionService:
                 reason=f"Pending confirmation for step '{pending_conf.step_id}'.",
             )
 
+        # ── Pending clarification gate ─────────────────────────────────────────
+        pending_user_input = dict(session.pending_user_input or {})
+        if pending_user_input.get("query_id"):
+            if pending_user_input.get("status") == "fallback":
+                return NextActionResponse(
+                    None,
+                    "manual_takeover",
+                    "",
+                    (
+                        f"Clarification fallback: "
+                        f"{pending_user_input.get('why_unresolved') or 'manual takeover required'}."
+                    ),
+                )
+            return NextActionResponse(
+                next_action=_build_user_input_action(
+                    query_id=str(pending_user_input.get("query_id") or ""),
+                    pending_query=pending_user_input,
+                ),
+                status="needs_user_input",
+                executor_hint="",
+                reason=f"Pending user input for query '{pending_user_input.get('query_id', '')}'.",
+            )
+
         # ── Sensitive screen (always abort regardless of mode) ─────────────────
         if (
             screen_state
@@ -334,6 +360,7 @@ class ExecutionService:
         reasoning: str = "",
         screen_hash_before: str = "",
         screen_hash_after: str = "",
+        screen_state_after: Optional[dict] = None,
     ) -> ExecutionDecision:
         """
         Process an action result and return the next instruction.
@@ -374,6 +401,7 @@ class ExecutionService:
                 "result_success":    result_success,
                 "screen_hash_before": screen_hash_before,
                 "screen_hash_after":  screen_hash_after,
+                "screen_summary_after": summarize_screen_for_history(screen_state_after),
             })
 
         # ── Audit log ──────────────────────────────────────────────────────────
@@ -680,6 +708,13 @@ def _dispatch_vision_step(
 
 # ── LLM-mode execution path ────────────────────────────────────────────────────
 
+def _package_from_reasoned_open_app(reasoned: "ReasonedStep") -> str:
+    if reasoned.action_type != ActionType.OPEN_APP.value:
+        return ""
+    params = reasoned.params or {}
+    return str(params.get("package_name") or params.get("package") or "").strip()
+
+
 def _get_next_action_llm(
     session: AgentSession,
     screen_state: dict,
@@ -792,6 +827,7 @@ def _get_next_action_llm(
     constraints = {
         "max_steps_remaining": MAX_STEPS_PER_SESSION - session.current_step_index,
         "policy_notes": f"risk_level={session.risk_level}",
+        "available_apps": list(session.supported_packages or []),
     }
 
     reasoned = svc.reason_next_step(
@@ -799,7 +835,7 @@ def _get_next_action_llm(
         target_app=session.target_app,
         entities=session.entities or {},
         screen_state=screen_state,
-        step_history=session.get_recent_steps(10),
+        step_history=list(session.step_history or []),
         constraints=constraints,
         session=session,
     )
@@ -823,11 +859,13 @@ def _get_next_action_llm(
             confidence=reasoned.confidence,
         )
 
+    inferred_target_app = _package_from_reasoned_open_app(reasoned)
+    effective_target_app = session.target_app or inferred_target_app
     user_policy = _resolve_user_policy(session)
     policy_result = PolicyEnforcer.check_step(
         step=reasoned,
         session_goal=session.goal,
-        target_package=session.target_app,
+        target_package=effective_target_app,
         user_policy=user_policy,
         step_count=session.get_step_count(),
         screen_state=screen_state,
@@ -882,18 +920,23 @@ def _get_next_action_llm(
         return NextActionResponse(
             None,
             "abort",
-            session.target_app,
+            effective_target_app,
             blocked_reason,
             reasoning=reasoned.reasoning,
             confidence=reasoned.confidence,
         )
 
     # ── LLM chose ABORT ───────────────────────────────────────────────────────
+    if inferred_target_app and not session.target_app:
+        session.target_app = inferred_target_app
+        session.save(update_fields=["target_app", "updated_at"])
+        effective_target_app = inferred_target_app
+
     if reasoned.action_type == ActionType.ABORT.value:
         reason_text = reasoned.params.get("reason", "llm_abort")
         _abort_session(session, None, "llm_abort", reason_text)
         return NextActionResponse(
-            None, "abort", session.target_app, reason_text,
+            None, "abort", effective_target_app, reason_text,
             reasoning=reasoned.reasoning,
         )
 
@@ -917,8 +960,28 @@ def _get_next_action_llm(
         return NextActionResponse(
             next_action=confirmation_action,
             status="confirm",
-            executor_hint=session.target_app,
+            executor_hint=effective_target_app,
             reason="Confirmation required before continuing.",
+            reasoning=reasoned.reasoning,
+            confidence=reasoned.confidence,
+        )
+
+    # ── LLM chose REQUEST_USER_INPUT ───────────────────────────────────────────
+    if reasoned.action_type == ActionType.REQUEST_USER_INPUT.value:
+        pending_query = ClarificationService.create_pending_query(
+            session=session,
+            params=reasoned.params,
+            screen_state=screen_state,
+            reasoning=reasoned.reasoning,
+        )
+        return NextActionResponse(
+            next_action=_build_user_input_action(
+                query_id=pending_query["query_id"],
+                pending_query=pending_query,
+            ),
+            status="needs_user_input",
+            executor_hint=effective_target_app,
+            reason="User input is required before continuing.",
             reasoning=reasoned.reasoning,
             confidence=reasoned.confidence,
         )
@@ -928,7 +991,7 @@ def _get_next_action_llm(
         reasoned,
         action_id=action_id,
         screen_state=screen_state,
-        target_app=session.target_app or "",
+        target_app=effective_target_app or "",
     )
     _log_llm_dispatch_block(
         session=session,
@@ -957,7 +1020,7 @@ def _get_next_action_llm(
     return NextActionResponse(
         next_action=next_action,
         status="execute",
-        executor_hint=session.target_app,
+        executor_hint=effective_target_app,
         reason="",
         reasoning=reasoned.reasoning,
         confidence=reasoned.confidence,
@@ -1116,6 +1179,27 @@ def _build_confirmation_action(action_id: str, reasoned: "ReasonedStep") -> dict
         "params": params,
         "sensitivity": reasoned.sensitivity,
         "requires_confirmation": True,
+        "timeout_ms": 0,
+        "retry_policy": {"max_attempts": 1, "backoff_ms": 0},
+    }
+
+
+def _build_user_input_action(*, query_id: str, pending_query: dict) -> dict:
+    return {
+        "id": query_id,
+        "type": ActionType.REQUEST_USER_INPUT.value,
+        "params": {
+            "query_id": query_id,
+            "question": pending_query.get("followup_question") or pending_query.get("question", ""),
+            "required_fields": pending_query.get("required_fields") or [],
+            "candidates": pending_query.get("candidates") or [],
+            "reason": pending_query.get("reason") or "",
+            "max_attempts": int(pending_query.get("max_attempts") or 3),
+            "attempt": int(pending_query.get("attempt_count") or 1),
+            "why_unresolved": pending_query.get("why_unresolved") or "",
+        },
+        "sensitivity": ActionSensitivity.LOW.value,
+        "requires_confirmation": False,
         "timeout_ms": 0,
         "retry_policy": {"max_attempts": 1, "backoff_ms": 0},
     }

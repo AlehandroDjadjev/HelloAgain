@@ -159,11 +159,9 @@ prompt = build_step_reasoning_user_prompt(
     screen_tree="[n5] EditText contentDesc='Search or type web address' clickable editable",
     failure_context="TAP_ELEMENT on n5 returned NOT_FOUND. The element may have moved.",
     goal_progress="The target app is open and the task is in the first interaction phase.",
-    app_context="ChromeExecutor classifies this screen as 'browser_open'. Common elements: address bar and page content.",
 )
 check("15: prompt contains progress section", "GOAL PROGRESS ESTIMATE:" in prompt)
 check("16: prompt contains failure section", "LAST ACTION FAILED:" in prompt)
-check("17: prompt contains app context", "APP CONTEXT:" in prompt)
 
 retry_prompt = build_step_reasoning_user_prompt(
     goal="Test",
@@ -175,7 +173,7 @@ retry_prompt = build_step_reasoning_user_prompt(
     screen_tree="[n1] TextView 'x'",
     validation_error="Missing action_type field.",
 )
-check("18: prompt contains correction block", "CORRECTION REQUIRED:" in retry_prompt)
+check("17: prompt contains correction block", "CORRECTION REQUIRED:" in retry_prompt)
 
 
 print("\n-- response validation --")

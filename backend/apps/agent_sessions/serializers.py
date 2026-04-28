@@ -181,6 +181,46 @@ class ExecutionDecisionSerializer(serializers.Serializer):
     reasoning = serializers.CharField(required=False, allow_blank=True, default="")
 
 
+class UserInputSubmitSerializer(serializers.Serializer):
+    query_id = serializers.CharField()
+    transcript = serializers.CharField(min_length=1)
+    source = serializers.CharField(required=False, allow_blank=True, default="voice")
+
+
+class UserInputDecisionSerializer(serializers.Serializer):
+    status = serializers.CharField()
+    query_id = serializers.CharField()
+    resolved = serializers.BooleanField()
+    entity_updates = serializers.DictField(required=False, default=dict)
+    missing_fields = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+    )
+    resolved_values = serializers.DictField(required=False, default=dict)
+    matched_candidate_id = serializers.CharField(required=False, allow_blank=True, allow_null=True, default=None)
+    question = serializers.CharField(required=False, allow_blank=True, default="")
+    followup_question = serializers.CharField(required=False, allow_blank=True, default="")
+    required_fields = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+    )
+    candidates = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list,
+    )
+    attempt = serializers.IntegerField(required=False)
+    max_attempts = serializers.IntegerField(required=False)
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    reason_unresolved = serializers.CharField(required=False, allow_blank=True, default="")
+    why_unresolved = serializers.CharField(required=False, allow_blank=True, default="")
+    should_fallback = serializers.BooleanField(required=False, default=False)
+    fallback_mode = serializers.CharField(required=False, allow_blank=True, default="")
+    session_status = serializers.CharField(required=False, allow_blank=True, default="")
+
+
 class ReasonedStepResponseSerializer(serializers.Serializer):
     """
     Embeds LLM decision metadata in the next-step response so the Flutter UI

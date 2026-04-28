@@ -57,8 +57,11 @@ from .serializers import (
     PendingConfirmationResponseSerializer,
     SessionApproveSerializer,
     SessionCreateResponseSerializer,
+    UserInputDecisionSerializer,
+    UserInputSubmitSerializer,
 )
 from .services import SessionService
+from .clarification_service import ClarificationService
 
 
 logger = logging.getLogger(__name__)
@@ -162,6 +165,7 @@ def _prepare_session_for_transcript(
         if session.status not in (
             SessionStatus.EXECUTING,
             SessionStatus.AWAITING_CONFIRMATION,
+                SessionStatus.AWAITING_USER_INPUT,
         ):
             if session.status == SessionStatus.CREATED:
                 SessionService.transition(session, SessionStatus.PLANNING)
@@ -169,6 +173,7 @@ def _prepare_session_for_transcript(
             if session.status not in (
                 SessionStatus.EXECUTING,
                 SessionStatus.AWAITING_CONFIRMATION,
+                SessionStatus.AWAITING_USER_INPUT,
             ):
                 SessionService.transition(session, SessionStatus.EXECUTING)
                 session.refresh_from_db()
@@ -338,13 +343,15 @@ class SessionIntentView(APIView):
         # ── Auto-transition to EXECUTING (skip /plan/ and /approve/) ──────────
         if session.status not in SessionService.TERMINAL:
             if session.status not in (SessionStatus.EXECUTING,
-                                      SessionStatus.AWAITING_CONFIRMATION):
+                                      SessionStatus.AWAITING_CONFIRMATION,
+                                      SessionStatus.AWAITING_USER_INPUT):
                 # CREATED → PLANNING → EXECUTING
                 if session.status == SessionStatus.CREATED:
                     SessionService.transition(session, SessionStatus.PLANNING)
                     session.refresh_from_db()
                 if session.status not in (SessionStatus.EXECUTING,
-                                          SessionStatus.AWAITING_CONFIRMATION):
+                                          SessionStatus.AWAITING_CONFIRMATION,
+                                          SessionStatus.AWAITING_USER_INPUT):
                     SessionService.transition(session, SessionStatus.EXECUTING)
                     session.refresh_from_db()
 
@@ -850,9 +857,35 @@ class SessionActionResultView(APIView):
             reasoning=d.get("reasoning", ""),
             screen_hash_before=d.get("screen_hash_before", ""),
             screen_hash_after=(screen_state or {}).get("screen_hash", ""),
+            screen_state_after=screen_state or {},
         )
         return Response(
             ExecutionDecisionSerializer(decision.to_dict()).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class SessionUserInputView(APIView):
+    """POST /api/agent/sessions/{id}/user-input/"""
+
+    def post(self, request: Request, session_id: UUID) -> Response:
+        session = _get_session(session_id)
+        ser = UserInputSubmitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+
+        try:
+            result = ClarificationService.submit_reply(
+                session=session,
+                query_id=data["query_id"],
+                transcript=data["transcript"],
+                source=data.get("source") or "voice",
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        return Response(
+            UserInputDecisionSerializer(result).data,
             status=status.HTTP_200_OK,
         )
 

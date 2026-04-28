@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import re
 import time
@@ -29,6 +30,9 @@ from voice_gateway.services.providers import (
 
 if TYPE_CHECKING:
     from .graph_service import GraphService
+
+
+logger = logging.getLogger(__name__)
 
 
 class SemiAgentService:
@@ -784,42 +788,30 @@ class SemiAgentService:
             history_key=history_key,
             session_id=clean_session_id,
         )
-        try:
-            llm_result = self.llm_provider.generate_reply_with_messages(
-                system_prompt=self._build_parallel_speech_system_prompt(),
-                messages=[
-                    {
-                        "role": "user",
-                        "content": self._build_parallel_speech_user_prompt(
-                            clean_prompt=clean_prompt,
-                            step_one=step_one,
-                            mcp_results=mcp_results,
-                            registry_payload=registry_payload,
-                            recent_history=recent_history,
-                        ),
-                    }
-                ],
-                session_id=clean_session_id,
-                user_id=self._clean_text(user_context.get("resolved_user_id")) or "anonymous",
-                include_history=False,
-                store_history=False,
-            )
-            assistant_text = llm_result.text
-            warnings.extend(llm_result.warnings)
-            llm_source = llm_result.source
-        except Exception as exc:
-            assistant_text = self._fallback_parallel_speech_response(clean_prompt)
-            warnings.append(f"llm_fallback={exc}")
-            llm_source = "fallback"
-
-        normalized_assistant_text = self._normalize_parallel_speech_response(
-            assistant_text,
-            clean_prompt=clean_prompt,
-            mcp_results=mcp_results,
+        llm_result = self.llm_provider.generate_reply_with_messages(
+            system_prompt=self._build_parallel_speech_system_prompt(),
+            messages=[
+                {
+                    "role": "user",
+                    "content": self._build_parallel_speech_user_prompt(
+                        clean_prompt=clean_prompt,
+                        step_one=step_one,
+                        mcp_results=mcp_results,
+                        registry_payload=registry_payload,
+                        recent_history=recent_history,
+                    ),
+                }
+            ],
+            session_id=clean_session_id,
+            user_id=self._clean_text(user_context.get("resolved_user_id")) or "anonymous",
+            include_history=False,
+            store_history=False,
         )
-        if normalized_assistant_text != assistant_text:
-            warnings.append("speech_text_normalized=bulgarian_user_facing")
-            assistant_text = normalized_assistant_text
+        assistant_text = self._clean_text(llm_result.text)
+        if not assistant_text:
+            raise ValueError("LLM returned an empty speech response.")
+        warnings.extend(llm_result.warnings)
+        llm_source = llm_result.source
 
         self.speech_history_store.append_turn(
             history_key=history_key,
@@ -856,55 +848,21 @@ class SemiAgentService:
             "warnings": warnings,
         }
 
-    def _normalize_parallel_speech_response(
-        self,
-        text: str,
-        *,
-        clean_prompt: str,
-        mcp_results: List[Dict[str, Any]],
-    ) -> str:
-        cleaned = self._clean_text(text)
-        if not cleaned:
-            return self._fallback_parallel_speech_response(clean_prompt)
-
-        has_cyrillic = bool(re.search(r"[\u0400-\u04FF]", cleaned))
-        has_latin = bool(re.search(r"[A-Za-z]", cleaned))
-        internal_markers = (
-            "the user",
-            "expected to",
-            "prompt to clarify",
-            "assistant should",
-            "mcp",
-            "payload",
-            "json",
-        )
-        lower = cleaned.lower()
-        looks_internal = any(marker in lower for marker in internal_markers)
-        if has_cyrillic and not looks_internal:
-            return cleaned
-
-        if mcp_results:
-            return "Готово. Подготвих резултата и го показвам на дъската."
-        if has_latin or looks_internal:
-            return "Имам нужда от още малко уточнение, за да го направя правилно."
-        return cleaned
-
     def _build_parallel_speech_system_prompt(self) -> str:
         return (
-            "You are HelloAgain speaking for a semi-agent that has already finished "
-            "stage 1 MCP work. You are generally having a conversation with the user, "
-            "so be tolerant, patient, and helpful. Use the MCP context "
-            "only when it helps the answer. This reply will go directly into text to "
-            "speech, so keep it natural and easy to say aloud. "
+            "You are HelloAgain, a human-sounding voice assistant. "
+            "Answer the user directly, in simple everyday language. "
+            "Be warm, clear, and lightly explanatory. "
+            "Do not narrate internal systems, tools, MCPs, pipelines, stages, JSON, "
+            "or board mechanics. The user does not need to hear that. "
+            "Use hidden tool context only as factual background. "
+            "This reply will go directly into text to speech, so make it sound spoken. "
             "Keep every sentence subtitle-friendly, with no more than 10 words per sentence. "
             "Prefer several very short sentences over one long sentence. "
-            "If an MCP already completed the concrete action, keep the reply semi-short: "
-            "briefly acknowledge what was done, mention where the result now lives when relevant, "
-            "and do not repeat the full operational payload because the MCP or board object is handling that part. "
+            "If an action was completed, respond naturally. "
+            "Say the useful outcome, not how the system processed it. "
             "If the request is missing something needed to act, ask one direct follow-up question. "
-            "If an MCP already completed the concrete action, briefly acknowledge what was done, "
-            "mention where the result now lives when relevant, and do not repeat the full operational payload "
-            "because the MCP or board object is handling that part. "
+            "Do not use stock completion phrases or system-report wording. "
             "Do not add extra tips or recommendations unless the user asked for them. "
             "THIS IS EXTREMELY IMPORTANT: you MUST answer in Bulgarian written in "
             "Bulgarian Cyrillic. Do not answer in English unless the user explicitly "
@@ -933,11 +891,12 @@ class SemiAgentService:
         }
         return (
             "Hold a helpful conversation with the user about their request. "
-            "The agent has already completed the stage 1 MCP work below, so you can "
-            "use it as factual context while answering. Respond directly to the user. "
-            "Be warm and explanatory when the request is unclear or difficult. "
-            "If `used_mcp_count` is above 0, keep the reply semi-short and mostly acknowledge the completed tool work. "
-            "Let the MCP result or whiteboard object carry the detailed action payload, and explicitly mention that the action/result is already prepared when that helps the user. "
+            "Use the context below only to know what happened. "
+            "Do not mention MCPs, tools, payloads, JSON, the board, or pipeline steps. "
+            "Respond like a normal person helping another person. "
+            "Be simple, direct, and gently explanatory. "
+            "If something was done, say the useful result naturally. "
+            "Avoid robotic completion phrases completely. "
             "THIS IS EXTREMELY IMPORTANT: the final answer must be in Bulgarian.\n\n"
             f"{json.dumps(context_payload, ensure_ascii=False, indent=2)}"
         )
@@ -1008,6 +967,7 @@ class SemiAgentService:
         try:
             payload = future.result()
         except Exception as exc:
+            logger.exception("Semi-agent %s job failed for run %s.", kind, run_id)
             return {
                 "ok": False,
                 "run_id": run_id,
@@ -1170,7 +1130,7 @@ class SemiAgentService:
             "found": True,
             "object_name": object_name,
             "board_commands": board_commands,
-            "speech_response": summary or f"I opened {title}.",
+            "speech_response": summary,
             "viewer": viewer,
         }
 
@@ -2648,24 +2608,6 @@ class SemiAgentService:
         if value.count(",") >= 3 and len(value.split()) >= 6:
             return True
         return False
-
-    def _fallback_speech_response(self, prompt: str, mcp_results: List[Dict[str, Any]], step_two: Dict[str, Any]) -> str:
-        focus = step_two.get("focus_object", {})
-        focus_text = self._clean_text(focus.get("text"))
-        if mcp_results:
-            summary = self._clean_text(mcp_results[0].get("summary"))
-            if summary:
-                return f"{summary} I also moved the board around {focus_text or 'the new object'} so the result is front and center."
-        return f"I worked through your request and put a focused board object up for {focus_text or prompt}."
-
-    def _fallback_parallel_speech_response(self, prompt: str) -> str:
-        focus = self._clean_text(prompt)
-        if focus:
-            return (
-                f"Обработих заявката ти за {focus} и подготвих резултата. "
-                "Ще ти го покажа на дъската след малко."
-            )
-        return "Обработих заявката ти и подготвих резултата. Ще ти го покажа на дъската след малко."
 
     @staticmethod
     def _slugify(value: str) -> str:

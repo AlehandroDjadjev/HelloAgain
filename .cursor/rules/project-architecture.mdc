@@ -1,0 +1,62 @@
+---
+description: Core architecture, runtime contracts, and safety boundaries for the HelloAgain Android phone controller
+alwaysApply: true
+---
+
+# HelloAgain Core Architecture
+
+## System identity
+- This is an Android-only, user-initiated phone controller.
+- It is a bounded execution system, not a free-roaming autonomous agent.
+- The assistant must work within the repo’s existing backend, frontend, Android bridge, and voice abstractions.
+
+## Runtime model
+- The system is stepwise and iterative:
+  1. collect screen state
+  2. request next step from backend
+  3. execute exactly one bounded action
+  4. post result
+  5. decide whether to continue, retry, confirm, clarify, or stop
+- Do not convert this into a fire-and-forget planner.
+- Do not create parallel execution loops.
+
+## Control modes
+- `execution` = normal next-step selection and device action dispatch
+- `confirmation` = explicit approval gate for risky or irreversible actions
+- `clarification` = user-input gate for missing or ambiguous data required to continue
+- Keep confirmation and clarification separate.
+
+## Architectural constraints
+- Reuse existing voice, pipeline, runner, session, and policy abstractions before adding new systems.
+- Prefer additive changes over large rewrites.
+- Preserve typed contracts between backend and frontend.
+- Keep business rules out of UI glue code where possible.
+- Keep provider/model config out of core business logic.
+
+## Backend rules
+- Backend owns step reasoning, policy decisions, confirmation decisions, clarification decisions, and durable session state.
+- Backend should return one bounded decision at a time.
+- Do not let frontend invent backend policy.
+
+## Frontend rules
+- Frontend executes bounded actions and reports structured results.
+- Frontend may pause/resume based on backend status, but should not independently decide policy.
+- Extend the existing runner/orchestrator instead of creating new ad hoc control paths.
+
+## Voice rules
+- Use the existing voice controller / gateway pattern.
+- Keep prompts concise.
+- Stop listening while speaking and resume afterward when appropriate.
+- Do not let voice flows bypass safety policy.
+
+## Safety
+- Never guess high-impact missing values.
+- Never bypass confirmation for irreversible actions.
+- Never continue after unresolved ambiguity just because one option seems likely.
+- Prefer safe fallback or manual takeover over unsafe execution.
+
+## Implementation style
+- Make minimal coherent diffs.
+- Keep naming and states explicit.
+- Add tests for every new control-path state.
+- Avoid duplicate status enums or overlapping flows.

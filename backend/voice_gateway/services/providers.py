@@ -27,15 +27,20 @@ DEFAULT_GOOGLE_SPEECH_LOCATION = "global"
 DEFAULT_GOOGLE_SPEECH_RECOGNIZER = "_"
 DEFAULT_ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 DEFAULT_ELEVENLABS_STT_MODEL = "scribe_v2"
-DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
+DEFAULT_ELEVENLABS_TTS_MODEL = "eleven_flash_v2_5"
 DEFAULT_ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
+DEFAULT_ELEVENLABS_TTS_VOICE_ID = "auq43ws1oslv0tO4BDa7"
+DEFAULT_ELEVENLABS_TTS_VOICE_NAME = "Adam Stone - Smooth and Relaxed"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+DEFAULT_OPENAI_CHAT_MODEL = DEFAULT_OPENAI_MODEL
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_SYSTEM_PROMPT = (
     "You are HelloAgain, a warm real-time voice assistant. "
     "You are speaking with an older adult, so use calm, respectful, everyday language. "
     "Avoid emojis, slang, jargon, and difficult words unless the user clearly asks for them. "
     "Keep replies concise, natural, easy to understand, and easy to speak aloud. "
+    "Answer like a normal helpful person, not like a system report. "
+    "Do not mention tools, pipelines, JSON, processing, or board actions. "
     "Keep each sentence to 10 words or fewer. "
     "Prefer short subtitle-friendly sentences. "
     "Usually answer in 1 or 2 short sentences. "
@@ -58,6 +63,11 @@ DEFAULT_PIPER_CONFIG_URL = (
     "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
     "bg/bg_BG/dimitar/medium/bg_BG-dimitar-medium.onnx.json?download=true"
 )
+ELEVENLABS_TTS_VOICE_NAME_ALIASES = {
+    "adam stone": DEFAULT_ELEVENLABS_TTS_VOICE_NAME,
+    "adam-stone": DEFAULT_ELEVENLABS_TTS_VOICE_NAME,
+    "adam_stone": DEFAULT_ELEVENLABS_TTS_VOICE_NAME,
+}
 
 
 class ProviderNotReadyError(RuntimeError):
@@ -97,6 +107,13 @@ def _read_elevenlabs_api_key() -> str:
         or _read_env_value("LABS_API_KEY")
         or _read_env_value("ELEVEN_API_KEY")
     )
+
+
+def _normalize_elevenlabs_voice_name(voice_name: Optional[str]) -> str:
+    normalized = (voice_name or "").strip()
+    if not normalized:
+        return DEFAULT_ELEVENLABS_TTS_VOICE_NAME
+    return ELEVENLABS_TTS_VOICE_NAME_ALIASES.get(normalized.casefold(), normalized)
 
 
 def _normalize_language_code(language: Optional[str]) -> str:
@@ -781,6 +798,12 @@ class OpenAILLMProvider(LLMProvider):
             or _read_env_value("OPENAI_MODEL")
             or DEFAULT_OPENAI_MODEL
         ).strip()
+        self.chat_model = (
+            _read_env_value("OPENAI_CHAT_MODEL")
+            or _read_env_value("OPENAI_LLM_MODEL")
+            or _read_env_value("OPENAI_MODEL")
+            or DEFAULT_OPENAI_CHAT_MODEL
+        ).strip()
         self.base_url = (
             base_url
             or _read_env_value("OPENAI_BASE_URL")
@@ -801,9 +824,14 @@ class OpenAILLMProvider(LLMProvider):
         messages: list[dict[str, str]],
         *,
         response_format: Optional[dict] = None,
-    ) -> str:
+    ) -> tuple[str, str]:
+        selected_model = (
+            self.model
+            if isinstance(response_format, dict) and response_format
+            else self.chat_model
+        )
         payload = {
-            "model": self.model,
+            "model": selected_model,
             "messages": messages,
         }
         if isinstance(response_format, dict) and response_format:
@@ -839,7 +867,7 @@ class OpenAILLMProvider(LLMProvider):
             content = parsed_response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("OpenAI returned an unexpected response shape.") from exc
-        return str(content).strip()
+        return str(content).strip(), selected_model
 
     def generate_reply_with_messages(
         self,
@@ -884,12 +912,11 @@ class OpenAILLMProvider(LLMProvider):
         if not payload_messages:
             raise ValueError("At least one message is required for OpenAI generation.")
 
-        message = self._normalize_reply(
-            self._request_openai(
-                payload_messages,
-                response_format=response_format,
-            )
+        message, used_model = self._request_openai(
+            payload_messages,
+            response_format=response_format,
         )
+        message = self._normalize_reply(message)
         if not message:
             raise ValueError("OpenAI returned an empty response.")
 
@@ -916,7 +943,7 @@ class OpenAILLMProvider(LLMProvider):
         return LLMResult(
             text=message,
             source="openai_chat_completions",
-            warnings=[f"llm_model={self.model}"],
+            warnings=[f"llm_model={used_model}"],
         )
 
     def generate_reply(self, prompt: str, session_id: str, user_id: str):
@@ -933,7 +960,7 @@ class OpenAILLMProvider(LLMProvider):
     def status(self) -> str:
         if not self.api_key:
             return "unavailable: api_key_missing"
-        return f"configured: {self.model}"
+        return f"configured: structured={self.model}; chat={self.chat_model}"
 
 
 class ElevenLabsTTSProvider(TextToSpeechProvider):
@@ -963,12 +990,15 @@ class ElevenLabsTTSProvider(TextToSpeechProvider):
             voice_id
             or _read_env_value("ELEVENLABS_TTS_VOICE_ID")
             or _read_env_value("ELEVENLABS_VOICE_ID")
+            or DEFAULT_ELEVENLABS_TTS_VOICE_ID
         ).strip()
         self.voice_name = (
             voice_name
             or _read_env_value("ELEVENLABS_TTS_VOICE_NAME")
             or _read_env_value("ELEVENLABS_VOICE_NAME")
+            or DEFAULT_ELEVENLABS_TTS_VOICE_NAME
         ).strip()
+        self.voice_name = _normalize_elevenlabs_voice_name(self.voice_name)
         self.output_format = (
             output_format
             or _read_env_value("ELEVENLABS_TTS_OUTPUT_FORMAT")
@@ -1011,6 +1041,10 @@ class ElevenLabsTTSProvider(TextToSpeechProvider):
                 voice_name = str(voice.get("name") or "").strip().casefold()
                 if voice_name == desired_name:
                     return voice
+            raise ProviderNotReadyError(
+                f"Configured ElevenLabs voice '{self.voice_name}' was not found "
+                "on this account.",
+            )
 
         if preferred_language:
             for voice in voices:
@@ -1150,7 +1184,7 @@ class ElevenLabsTTSProvider(TextToSpeechProvider):
     def status(self) -> str:
         if not self.api_key:
             return "unavailable: api_key_missing"
-        voice_hint = self.voice_id or self.voice_name or "auto_voice"
+        voice_hint = self.voice_id or self.voice_name or DEFAULT_ELEVENLABS_TTS_VOICE_ID
         return f"configured: elevenlabs/{self.model}/{voice_hint}"
 
 
@@ -1294,6 +1328,4 @@ def build_default_stt_provider() -> SpeechToTextProvider:
 
 
 def build_default_tts_provider() -> TextToSpeechProvider:
-    if _read_elevenlabs_api_key():
-        return ElevenLabsTTSProvider()
-    return PiperTTSProvider()
+    return ElevenLabsTTSProvider()

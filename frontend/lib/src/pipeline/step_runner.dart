@@ -16,6 +16,7 @@ class StepRunner {
     required this.onStepCompleted,
     required this.onLog,
     required this.onConfirmation,
+    required this.onUserInputRequested,
     required this.onComplete,
     required this.onAbort,
     required this.onManualTakeover,
@@ -32,6 +33,8 @@ class StepRunner {
   final void Function(String message, LogLevel level) onLog;
   final Future<void> Function(Map<String, dynamic> confirmAction)
   onConfirmation;
+  final Future<void> Function(Map<String, dynamic> userInputAction)
+  onUserInputRequested;
   final void Function() onComplete;
   final void Function(String reason) onAbort;
   final void Function(String reason) onManualTakeover;
@@ -133,6 +136,18 @@ class StepRunner {
           await Future.delayed(_pollInterval);
           break;
 
+        case 'needs_user_input':
+          if (action != null) {
+            if (reasoning.isNotEmpty) {
+              _log('Reasoning: $reasoning', LogLevel.info);
+            }
+            _log('Clarification required for ${action['id']}', LogLevel.warning);
+            await onUserInputRequested(action);
+            return;
+          }
+          await Future.delayed(_pollInterval);
+          break;
+
         case 'retry':
           final stepId = action?['id'] as String? ?? '';
           final count = (_retryCounts[stepId] ?? 0) + 1;
@@ -155,6 +170,23 @@ class StepRunner {
         default:
           if (action == null) {
             onComplete();
+            return;
+          }
+          final actionType = (action['type'] as String? ?? '').trim();
+          if (actionType == 'REQUEST_CONFIRMATION') {
+            _log(
+              'Contract mismatch: execute status carried REQUEST_CONFIRMATION; routing to confirmation.',
+              LogLevel.warning,
+            );
+            await onConfirmation(action);
+            return;
+          }
+          if (actionType == 'REQUEST_USER_INPUT') {
+            _log(
+              'Contract mismatch: execute status carried REQUEST_USER_INPUT; routing to clarification.',
+              LogLevel.warning,
+            );
+            await onUserInputRequested(action);
             return;
           }
           final done = await _executeStep(action, reasoning);

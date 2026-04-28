@@ -4,15 +4,53 @@ import 'package:android_control_plugin/android_control_plugin.dart';
 import 'package:flutter/foundation.dart';
 
 import '../api/agent_client.dart';
+import '../native/mic_bridge_client.dart';
 import 'pipeline_state.dart';
 import 'step_runner.dart';
 
+typedef StepRunnerFactory = StepRunner Function({
+  required AgentClient client,
+  required DeviceControlChannel gateway,
+  required String sessionId,
+  required String expectedPackage,
+  required void Function(StepEntry step) onStepStarted,
+  required void Function(String stepId, ActionResult result) onStepCompleted,
+  required void Function(String message, LogLevel level) onLog,
+  required Future<void> Function(Map<String, dynamic> confirmAction)
+  onConfirmation,
+  required Future<void> Function(Map<String, dynamic> userInputAction)
+  onUserInputRequested,
+  required void Function() onComplete,
+  required void Function(String reason) onAbort,
+  required void Function(String reason) onManualTakeover,
+  required void Function(String? actualPackage) onUnexpectedAppChange,
+});
+
 /// Drives the text-to-execution pipeline for LLM-in-the-loop automation.
 class PipelineOrchestrator extends ChangeNotifier {
-  PipelineOrchestrator({required this.client});
+  PipelineOrchestrator({
+    required this.client,
+    DeviceControlChannel? gateway,
+    StepRunnerFactory? stepRunnerFactory,
+    MicBridgeClient? micBridgeClient,
+  }) : _gateway = gateway ?? const DeviceControlChannel(),
+       _stepRunnerFactory = stepRunnerFactory ?? _defaultStepRunnerFactory,
+       _micBridgeClient =
+           micBridgeClient ?? MicBridgeClient(baseUrl: client.baseUrl),
+       _ownsMicBridgeClient = micBridgeClient == null {
+    _micBridgeEventsSubscription = _micBridgeClient.events.listen(
+      _handleMicBridgeEvent,
+      onError: (Object error, StackTrace stackTrace) {
+        _log('Mic bridge event error: $error', level: LogLevel.warning);
+      },
+    );
+  }
 
   final AgentClient client;
-  final _gateway = const DeviceControlChannel();
+  final DeviceControlChannel _gateway;
+  final StepRunnerFactory _stepRunnerFactory;
+  final MicBridgeClient _micBridgeClient;
+  final bool _ownsMicBridgeClient;
 
   PipelinePhase phase = PipelinePhase.idle;
   String? sessionId;
@@ -21,13 +59,15 @@ class PipelineOrchestrator extends ChangeNotifier {
   int currentStepIndex = -1;
   String currentReasoning = '';
   ConfirmationRequest? pendingConfirmation;
+  UserInputRequest? pendingUserInput;
   String? errorMessage;
   final List<LogEntry> log = [];
   List<String> _supportedPackages = const [];
 
   bool get canPause =>
       phase == PipelinePhase.executing ||
-      phase == PipelinePhase.awaitingConfirmation;
+      phase == PipelinePhase.awaitingConfirmation ||
+      phase == PipelinePhase.awaitingUserInput;
   bool get canResume => phase == PipelinePhase.idle && sessionId != null;
   bool get canCancel => phase.isRunning;
 
@@ -38,9 +78,13 @@ class PipelineOrchestrator extends ChangeNotifier {
 
   StepRunner? _runner;
   bool _cancelRequested = false;
+  StreamSubscription<MicBridgeEvent>? _micBridgeEventsSubscription;
 
   bool get _cancelled => _cancelRequested;
   bool get hasPreparedCommand => sessionId != null && parsedIntent != null;
+
+  Future<void> ensureMicBridgeReady() => _micBridgeClient.ensureServiceReady();
+  Future<void> stopMicBridgeService() => _micBridgeClient.stopService();
 
   Future<void> run(String command, {String reasoningProvider = 'openai'}) async {
     if (phase.isRunning) return;
@@ -95,6 +139,7 @@ class PipelineOrchestrator extends ChangeNotifier {
         supportedPackages: _supportedPackages,
       );
       sessionId = resp['session_id'] as String?;
+      _syncMicBridgeSessionContext();
       parsedIntent = (resp['intent'] as Map?)?.cast<String, dynamic>() ?? {};
       final destination =
           ((parsedIntent?['entities'] as Map?)?['destination'] ?? '').toString();
@@ -135,6 +180,7 @@ class PipelineOrchestrator extends ChangeNotifier {
         supportedPackages: _supportedPackages,
       );
       sessionId = resp['session_id'] as String?;
+      _syncMicBridgeSessionContext();
       parsedIntent = (resp['intent'] as Map?)?.cast<String, dynamic>() ?? {};
       final goal = (parsedIntent?['goal'] ?? '').toString().trim();
       if (goal.isNotEmpty) {
@@ -171,6 +217,11 @@ class PipelineOrchestrator extends ChangeNotifier {
   Future<void> pause() async {
     if (!canPause || sessionId == null) return;
     _runner?.cancel();
+    if (phase == PipelinePhase.awaitingUserInput) {
+      await _micBridgeClient.cancelListening(
+        requestId: pendingUserInput?.queryId,
+      );
+    }
     try {
       await client.pauseSession(sessionId!);
       _log('Session paused.', level: LogLevel.warning);
@@ -183,6 +234,7 @@ class PipelineOrchestrator extends ChangeNotifier {
   Future<void> cancel() async {
     _cancelRequested = true;
     _runner?.cancel();
+    await _micBridgeClient.cancelListening(requestId: pendingUserInput?.queryId);
     if (sessionId != null) {
       try {
         await client.cancelSession(sessionId!);
@@ -225,6 +277,7 @@ class PipelineOrchestrator extends ChangeNotifier {
 
   Future<void> discardPrepared() async {
     _runner?.cancel();
+    await _micBridgeClient.cancelListening(requestId: pendingUserInput?.queryId);
     if (sessionId != null) {
       try {
         await client.cancelSession(sessionId!);
@@ -258,6 +311,7 @@ class PipelineOrchestrator extends ChangeNotifier {
       supportedPackages: _supportedPackages,
     );
     sessionId = resp['session_id'] as String;
+    _syncMicBridgeSessionContext();
     _log('Session created: $sessionId', level: LogLevel.success);
     notifyListeners();
   }
@@ -312,7 +366,7 @@ class PipelineOrchestrator extends ChangeNotifier {
   Future<void> _startExecutionLoop() async {
     _setPhase(PipelinePhase.executing);
 
-    _runner = StepRunner(
+    _runner = _stepRunnerFactory(
       client: client,
       gateway: _gateway,
       sessionId: sessionId!,
@@ -340,6 +394,9 @@ class PipelineOrchestrator extends ChangeNotifier {
         _setPhase(PipelinePhase.awaitingConfirmation);
         await _fetchAndShowConfirmation(action);
       },
+      onUserInputRequested: (action) async {
+        await _handleUserInputRequested(UserInputRequest.fromJson(action));
+      },
       onComplete: () {
         _log('Pipeline complete.', level: LogLevel.success);
         _setPhase(PipelinePhase.completed);
@@ -361,6 +418,40 @@ class PipelineOrchestrator extends ChangeNotifier {
     );
 
     await _runner!.runLoop();
+  }
+
+  static StepRunner _defaultStepRunnerFactory({
+    required AgentClient client,
+    required DeviceControlChannel gateway,
+    required String sessionId,
+    required String expectedPackage,
+    required void Function(StepEntry step) onStepStarted,
+    required void Function(String stepId, ActionResult result) onStepCompleted,
+    required void Function(String message, LogLevel level) onLog,
+    required Future<void> Function(Map<String, dynamic> confirmAction)
+    onConfirmation,
+    required Future<void> Function(Map<String, dynamic> userInputAction)
+    onUserInputRequested,
+    required void Function() onComplete,
+    required void Function(String reason) onAbort,
+    required void Function(String reason) onManualTakeover,
+    required void Function(String? actualPackage) onUnexpectedAppChange,
+  }) {
+    return StepRunner(
+      client: client,
+      gateway: gateway,
+      sessionId: sessionId,
+      expectedPackage: expectedPackage,
+      onStepStarted: onStepStarted,
+      onStepCompleted: onStepCompleted,
+      onLog: onLog,
+      onConfirmation: onConfirmation,
+      onUserInputRequested: onUserInputRequested,
+      onComplete: onComplete,
+      onAbort: onAbort,
+      onManualTakeover: onManualTakeover,
+      onUnexpectedAppChange: onUnexpectedAppChange,
+    );
   }
 
   Future<void> _fetchAndShowConfirmation(
@@ -397,6 +488,108 @@ class PipelineOrchestrator extends ChangeNotifier {
       contentPreview: params['content_preview'] as String? ?? '',
     );
     notifyListeners();
+  }
+
+  Future<void> _handleUserInputRequested(UserInputRequest request) async {
+    if (sessionId == null) {
+      _fail('Cannot collect clarification without an active session.');
+      return;
+    }
+
+    var currentRequest = request;
+    while (!_cancelled) {
+      pendingUserInput = currentRequest;
+      currentReasoning = currentRequest.question;
+      _log(
+        'Clarification requested (${currentRequest.attempt}/${currentRequest.maxAttempts}).',
+        level: LogLevel.warning,
+      );
+      _setPhase(PipelinePhase.awaitingUserInput);
+
+      try {
+        final result = await _micBridgeClient.beginOneShotQuery(
+          currentRequest.question,
+        );
+        if (_cancelled) {
+          return;
+        }
+
+        final spokenReply = (result?.transcript ?? '').trim();
+        final submittedTranscript = spokenReply.isEmpty
+            ? '__silence__'
+            : spokenReply;
+        final decision = await client.submitUserInput(
+          sessionId!,
+          queryId: currentRequest.queryId,
+          transcript: submittedTranscript,
+          source: 'voice',
+        );
+        if (_cancelled) {
+          return;
+        }
+
+        final status = (decision['status'] ?? '').toString();
+        switch (status) {
+          case 'resolved':
+            pendingUserInput = null;
+            notifyListeners();
+            _log('Clarification resolved.', level: LogLevel.success);
+            _setPhase(PipelinePhase.executing);
+            await _runner?.runLoop();
+            return;
+          case 'needs_user_input':
+            final nextRequest = UserInputRequest.fromJson(decision);
+            if (nextRequest.queryId.isEmpty ||
+                nextRequest.queryId != currentRequest.queryId) {
+              _fail(
+                'Clarification contract error: backend returned a mismatched query id.',
+              );
+              return;
+            }
+            if (nextRequest.attempt <= currentRequest.attempt) {
+              _fail(
+                'Clarification contract error: follow-up attempt did not advance.',
+              );
+              return;
+            }
+            if (nextRequest.attempt > nextRequest.maxAttempts) {
+              _fail(
+                'Clarification contract error: follow-up exceeded max attempts.',
+              );
+              return;
+            }
+            currentRequest = nextRequest;
+            final whyUnresolved = currentRequest.whyUnresolved.trim();
+            _log(
+              whyUnresolved.isEmpty
+                  ? 'Clarification still unresolved; asking a follow-up.'
+                  : 'Clarification unresolved: $whyUnresolved',
+              level: LogLevel.warning,
+            );
+            continue;
+          case 'manual_takeover':
+            pendingUserInput = null;
+            errorMessage =
+                (decision['reason'] ??
+                        decision['why_unresolved'] ??
+                        'Manual takeover required after clarification.')
+                    .toString();
+            _log(errorMessage!, level: LogLevel.warning);
+            _setPhase(PipelinePhase.failed);
+            notifyListeners();
+            return;
+          default:
+            _fail('Unexpected clarification response: ${decision['status']}');
+            return;
+        }
+      } on AgentApiException catch (e) {
+        _fail('Clarification API error ${e.statusCode}: ${e.shortMessage}');
+        return;
+      } catch (e) {
+        _fail('Clarification failed: $e');
+        return;
+      }
+    }
   }
 
   void _upsertStep(StepEntry step, StepStatus status) {
@@ -453,14 +646,54 @@ class PipelineOrchestrator extends ChangeNotifier {
     _setPhase(PipelinePhase.failed);
   }
 
+  void _syncMicBridgeSessionContext() {
+    _micBridgeClient.updateSessionContext(sessionId: sessionId);
+  }
+
+  void _handleMicBridgeEvent(MicBridgeEvent event) {
+    switch (event.type) {
+      case MicBridgeEventType.serviceReady:
+        _log('Mic bridge ready in armed-idle mode.');
+        return;
+      case MicBridgeEventType.ttsStarted:
+        _log('Clarification prompt started.');
+        return;
+      case MicBridgeEventType.ttsFinished:
+        _log('Clarification prompt finished.');
+        return;
+      case MicBridgeEventType.listeningStarted:
+        _log('Listening for one clarification reply...');
+        return;
+      case MicBridgeEventType.partialTranscript:
+        final transcript = (event.transcript ?? '').trim();
+        if (transcript.isNotEmpty) {
+          _log('Heard reply: "$transcript"');
+        }
+        return;
+      case MicBridgeEventType.finalTranscript:
+        if ((event.transcript ?? '').trim().isNotEmpty) {
+          _log('Captured final clarification reply.', level: LogLevel.success);
+        }
+        return;
+      case MicBridgeEventType.error:
+        final message = event.message?.trim() ?? 'Mic bridge error.';
+        _log('Mic bridge: $message', level: LogLevel.warning);
+        return;
+      case MicBridgeEventType.unknown:
+        return;
+    }
+  }
+
   void _reset() {
     phase = PipelinePhase.idle;
     sessionId = null;
+    _syncMicBridgeSessionContext();
     parsedIntent = null;
     steps = [];
     currentStepIndex = -1;
     currentReasoning = '';
     pendingConfirmation = null;
+    pendingUserInput = null;
     errorMessage = null;
     log.clear();
     _supportedPackages = const [];
@@ -477,5 +710,15 @@ class PipelineOrchestrator extends ChangeNotifier {
       default:
         return provider;
     }
+  }
+
+  @override
+  void dispose() {
+    _runner?.cancel();
+    _micBridgeEventsSubscription?.cancel();
+    if (_ownsMicBridgeClient) {
+      unawaited(_micBridgeClient.dispose());
+    }
+    super.dispose();
   }
 }

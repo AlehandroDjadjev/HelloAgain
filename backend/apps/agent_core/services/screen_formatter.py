@@ -107,32 +107,89 @@ def summarize_step_history(
         return "(no steps yet)"
 
     budget = token_budget or int(getattr(settings, "LLM_TOKEN_BUDGET_HISTORY", 2000))
-    recent_limit = max(1, min(max_steps, _RECENT_HISTORY_WINDOW))
+    recent_limit = max(1, min(max_steps, len(step_history)))
     recent = list(step_history[-recent_limit:])
     older = list(step_history[:-recent_limit])
 
-    older_line = _summarize_older_steps(older)
+    detailed_lines = [_format_recent_step(step, include_reasoning=True) for step in step_history]
+    text = "\n".join(line for line in detailed_lines if line)
+    if _estimate_tokens(text) <= budget:
+        return text
+
+    older_line = _summarize_older_steps(older, include_screen_summary=True)
     recent_lines = [_format_recent_step(step, include_reasoning=True) for step in recent]
     text = "\n".join([line for line in [older_line, *recent_lines] if line])
     if _estimate_tokens(text) <= budget:
         return text
 
+    concise_lines = [_format_recent_step(step, include_reasoning=False) for step in step_history]
+    text = "\n".join(line for line in concise_lines if line)
+    if _estimate_tokens(text) <= budget:
+        return text
+
+    older_line = _summarize_older_steps(older, include_screen_summary=False)
     recent_lines = [_format_recent_step(step, include_reasoning=False) for step in recent]
     text = "\n".join([line for line in [older_line, *recent_lines] if line])
     if _estimate_tokens(text) <= budget:
         return text
 
-    trimmed_recent = recent[-max(1, recent_limit - 2):]
+    compact = _summarize_older_steps(step_history, include_screen_summary=False)
+    if compact and _estimate_tokens(compact) <= budget:
+        return compact
+
+    trimmed_recent = recent[-max(1, min(6, recent_limit)):]
     text = "\n".join(
-        [line for line in [_summarize_older_steps(older + recent[:-len(trimmed_recent)]),
-                           *[_format_recent_step(step, include_reasoning=False) for step in trimmed_recent]]
-         if line]
+        line
+        for line in [
+            _summarize_older_steps(
+                older + recent[:-len(trimmed_recent)],
+                include_screen_summary=False,
+            ),
+            *[
+                _format_recent_step(step, include_reasoning=False)
+                for step in trimmed_recent
+            ],
+        ]
+        if line
     )
     if _estimate_tokens(text) <= budget:
         return text
 
-    compact = _summarize_older_steps(step_history)
     return compact or "(history omitted)"
+
+
+def summarize_screen_for_history(
+    screen_state: dict | None,
+    *,
+    max_visible_items: int = 4,
+    max_length: int = 220,
+) -> str:
+    if not isinstance(screen_state, dict) or not screen_state:
+        return ""
+
+    foreground = _truncate_inline(str(screen_state.get("foreground_package") or "unknown"), 32)
+    window = _truncate_inline(str(screen_state.get("window_title") or "(untitled)"), 40)
+    screen_hash = _truncate_inline(str(screen_state.get("screen_hash") or ""), 24)
+    focused = _truncate_inline(str(screen_state.get("focused_element_ref") or "none"), 24)
+
+    visible_items: list[str] = []
+    for node in (screen_state.get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        label = _history_node_label(node)
+        if not label or label in visible_items:
+            continue
+        visible_items.append(label)
+        if len(visible_items) >= max_visible_items:
+            break
+
+    summary = (
+        f"Foreground={foreground} | Window={window} | "
+        f"Hash={screen_hash or '?'} | Focus={focused}"
+    )
+    if visible_items:
+        summary += f" | Visible={', '.join(visible_items)}"
+    return _truncate_inline(summary, max_length)
 
 
 def _build_header(screen_state: dict) -> str:
@@ -496,25 +553,26 @@ def _looks_like_section_header(value: str) -> bool:
     return bool(letters) and letters.isupper() and 3 <= len(letters) <= 24
 
 
-def _summarize_older_steps(steps: list[dict]) -> str:
+def _summarize_older_steps(steps: list[dict], *, include_screen_summary: bool) -> str:
     if not steps:
         return ""
-    phrases = [_history_phrase(step) for step in steps[-4:]]
+    phrases = [
+        _history_phrase(step, include_screen_summary=include_screen_summary)
+        for step in steps
+    ]
     if not phrases:
         return f"Earlier steps: {len(steps)} step(s)."
     prefix = "Earlier steps: "
-    suffix = ""
-    omitted = len(steps) - len(phrases)
-    if omitted > 0:
-        suffix = f", plus {omitted} earlier step(s)"
-    return prefix + ", ".join(phrases) + suffix + "."
+    return prefix + " | ".join(phrases) + "."
 
 
-def _history_phrase(step: dict) -> str:
+def _history_phrase(step: dict, *, include_screen_summary: bool) -> str:
+    index = step.get("step_index", "?")
     action_type = str(step.get("action_type") or "UNKNOWN")
     params = step.get("params") or {}
     success = bool(step.get("result_success"))
     result_code = str(step.get("result_code") or "")
+    screen_summary = _truncate_inline(str(step.get("screen_summary_after") or ""), 110)
 
     if action_type == "OPEN_APP":
         package_name = (
@@ -535,9 +593,12 @@ def _history_phrase(step: dict) -> str:
     else:
         phrase = action_type.lower().replace("_", " ")
 
+    prefix = f"#{index} "
     if not success:
-        return f"{phrase} (failed: {result_code or 'UNKNOWN'})"
-    return phrase
+        phrase = f"{phrase} (failed: {result_code or 'UNKNOWN'})"
+    if include_screen_summary and screen_summary:
+        phrase += f" -> {screen_summary}"
+    return prefix + phrase
 
 
 def _format_recent_step(step: dict, include_reasoning: bool) -> str:
@@ -549,6 +610,9 @@ def _format_recent_step(step: dict, include_reasoning: bool) -> str:
     detail = _summarize_params(params)
     status = "SUCCESS" if success else f"FAILED ({result_code})"
     line = f"Step {index}: {action_type} {detail} -> {status}"
+    screen_summary = _truncate_inline(str(step.get("screen_summary_after") or ""), 140)
+    if screen_summary:
+        line += f" | screen: {screen_summary}"
     reasoning = _truncate_inline(str(step.get("reasoning") or ""), 100)
     if include_reasoning and reasoning:
         line += f" | reasoning: {reasoning}"
@@ -677,3 +741,26 @@ def _truncate_inline(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[: limit - 3] + "..."
+
+
+def _history_node_label(node: dict) -> str:
+    if _is_true(node, "editable"):
+        content_desc = _truncate_inline(_text_value(node, "content_desc"), 28)
+        view_id = _truncate_inline(_text_value(node, "view_id"), 24)
+        class_name = _short_class_name(_text_value(node, "class_name") or "Input")
+        if content_desc:
+            return f"{class_name}:{content_desc}"
+        if view_id:
+            return f"{class_name}:{view_id}"
+        return class_name
+
+    text = _truncate_inline(_text_value(node, "text"), 28)
+    if text:
+        return text
+    content_desc = _truncate_inline(_text_value(node, "content_desc"), 28)
+    if content_desc:
+        return content_desc
+    view_id = _truncate_inline(_text_value(node, "view_id"), 24)
+    if view_id and _is_true(node, "clickable"):
+        return view_id
+    return ""

@@ -31,7 +31,7 @@ class BrawlStarsSupportTests(SimpleTestCase):
             "generic_v1",
         )
 
-    def test_parse_intent_falls_back_when_llm_returns_blank_target_app(self):
+    def test_parse_intent_infers_app_when_llm_returns_blank_target_app(self):
         client = Mock()
         client.generate.return_value = {
             "goal": "Search Jeffrey Epstein on Chrome",
@@ -49,7 +49,28 @@ class BrawlStarsSupportTests(SimpleTestCase):
 
         self.assertEqual(result.app_package, "com.android.chrome")
         self.assertEqual(result.goal_type, "search")
-        self.assertIn("keyword detection fallback", " ".join(result.ambiguity_flags))
+        self.assertIn("inferred", " ".join(result.ambiguity_flags))
+
+    def test_parse_intent_infers_messaging_app_when_user_does_not_name_app(self):
+        client = Mock()
+        client.generate.return_value = {
+            "goal": "Send a message to Alex",
+            "goal_type": "send_message",
+            "target_app": "",
+            "entities": {"recipient": "Alex", "message": "hello"},
+            "risk_level": "high",
+            "confidence": 0.84,
+            "ambiguity_flags": ["target_app_inferred"],
+        }
+
+        result = IntentService(client=client).parse_intent(
+            "Tell Alex hello",
+            supported_packages=["com.viber.voip", "com.android.chrome"],
+        )
+
+        self.assertEqual(result.app_package, "com.viber.voip")
+        self.assertEqual(result.goal_type, "send_message")
+        self.assertEqual(result.entities["recipient"], "Alex")
 
     def test_parse_intent_accepts_dynamic_supported_package(self):
         client = Mock()

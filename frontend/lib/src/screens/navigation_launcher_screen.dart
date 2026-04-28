@@ -3,12 +3,16 @@ import 'dart:convert';
 
 import 'package:android_control_plugin/android_control_plugin.dart';
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../api/agent_client.dart';
+import '../api/voice_gateway_client.dart';
 import '../config/backend_base_url.dart';
+import '../native/mic_bridge_client.dart';
 import '../pipeline/orchestrator.dart';
 import '../pipeline/pipeline_state.dart';
 import '../services/navigation_overlay_service.dart';
+import '../voice/agent_voice_controller.dart';
 
 class NavigationLauncherScreen extends StatefulWidget {
   const NavigationLauncherScreen({
@@ -31,9 +35,12 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
 
   late final TextEditingController _promptController;
   late final PipelineOrchestrator _orch;
+  late final AgentVoiceController _voiceController;
+  late final MicBridgeClient _micBridgeClient;
   final _overlayService = const NavigationOverlayService();
   bool _showDebug = false;
   bool _accessibilityPermissionMissing = false;
+  bool _microphonePermissionMissing = false;
   bool _overlayPermissionMissing = false;
   bool _awaitingAccessibilityPermissionReturn = false;
   bool _awaitingOverlayPermissionReturn = false;
@@ -52,9 +59,19 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
           ? widget.initialPrompt!.trim()
           : '',
     );
+    _micBridgeClient = MicBridgeClient(
+      baseUrl: resolveBackendBaseUrl(),
+      language: 'bg-BG',
+    );
     _orch = PipelineOrchestrator(
       client: AgentClient(baseUrl: resolveBackendBaseUrl()),
+      micBridgeClient: _micBridgeClient,
     )..addListener(_onOrchestratorChanged);
+    _voiceController = AgentVoiceController(
+      client: VoiceGatewayClient(baseUrl: resolveBackendBaseUrl()),
+      onTranscript: (_) async {},
+      language: 'bg-BG',
+    );
     unawaited(_refreshPermissionState());
 
     if (widget.autoRunOnOpen) {
@@ -69,13 +86,17 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _orch.removeListener(_onOrchestratorChanged);
+    unawaited(_orch.stopMicBridgeService());
+    unawaited(_micBridgeClient.dispose());
     unawaited(_overlayService.hide());
+    _voiceController.dispose();
     _promptController.dispose();
     super.dispose();
   }
 
   void _onOrchestratorChanged() {
     if (!mounted) return;
+    _syncVoiceSessionContext();
     if (_orch.phase != _lastObservedPhase) {
       _lastObservedPhase = _orch.phase;
       unawaited(_syncNavigationOverlay());
@@ -85,6 +106,16 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       }
     }
     setState(() {});
+  }
+
+  void _syncVoiceSessionContext() {
+    final sessionId = (_orch.sessionId ?? '').trim();
+    _voiceController.updateSessionContext(
+      sessionId: sessionId.isNotEmpty ? sessionId : null,
+    );
+    _micBridgeClient.updateSessionContext(
+      sessionId: sessionId.isNotEmpty ? sessionId : null,
+    );
   }
 
   @override
@@ -113,6 +144,23 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
 
     FocusScope.of(context).unfocus();
     await _refreshPermissionState();
+    final micReady = await _ensureMicrophonePermission();
+    if (!micReady) {
+      if (!mounted) return;
+      setState(() {
+        _microphonePermissionMissing = true;
+      });
+      return;
+    }
+    try {
+      await _orch.ensureMicBridgeReady();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _microphonePermissionMissing = true;
+      });
+      return;
+    }
     await _showStartupOverlayIfPossible(prompt);
     await _runCommandFlow(prompt);
   }
@@ -133,6 +181,9 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     if (_accessibilityPermissionMissing && !_orch.phase.isRunning) {
       return 'Enable Accessibility Control so Hello Again can operate the phone directly.';
     }
+    if (_microphonePermissionMissing && !_orch.phase.isRunning) {
+      return 'Microphone permission is required so Hello Again can ask and hear clarification answers during phone control.';
+    }
     if (_overlayPermissionMissing && !_orch.phase.isRunning) {
       return 'The phone flow can still run, but the floating navigator bubble needs "Display over other apps" to appear outside the app.';
     }
@@ -145,6 +196,8 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
         return 'Starting the phone flow...';
       case PipelinePhase.awaitingConfirmation:
         return 'Waiting for confirmation on the device...';
+      case PipelinePhase.awaitingUserInput:
+        return 'Waiting for clarification on the device...';
       case PipelinePhase.completed:
         return 'Phone flow completed.';
       case PipelinePhase.failed:
@@ -164,6 +217,7 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     final permissionStatus = await PermissionChecker.getPermissionStatus();
     final accessibilityMissing =
         permissionStatus['accessibilityService'] != true;
+    final microphoneMissing = !await Permission.microphone.isGranted;
 
     var overlayMissing = false;
     if (_overlayService.isSupported) {
@@ -174,8 +228,18 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     if (!mounted) return;
     setState(() {
       _accessibilityPermissionMissing = accessibilityMissing;
+      _microphonePermissionMissing = microphoneMissing;
       _overlayPermissionMissing = overlayMissing;
     });
+  }
+
+  Future<bool> _ensureMicrophonePermission() async {
+    final status = await Permission.microphone.status;
+    if (status.isGranted) {
+      return true;
+    }
+    final next = await Permission.microphone.request();
+    return next.isGranted;
   }
 
   Future<void> _handleAccessibilityPermissionReturn() async {
@@ -278,6 +342,7 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       case PipelinePhase.executing:
         return 'Phone control in progress';
       case PipelinePhase.awaitingConfirmation:
+      case PipelinePhase.awaitingUserInput:
         return 'Waiting on the phone';
       case PipelinePhase.idle:
       case PipelinePhase.completed:
@@ -297,6 +362,8 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
         return 'Hello Again is currently working through the phone. Please do not tap, swipe, type, or switch apps until it finishes.';
       case PipelinePhase.awaitingConfirmation:
         return 'The model is waiting at a phone confirmation step. Avoid touching the phone unless you intentionally want to approve the action.';
+      case PipelinePhase.awaitingUserInput:
+        return 'The model needs clarification before it can continue safely. Avoid interacting with the phone unless you are answering the clarification request.';
       case PipelinePhase.idle:
       case PipelinePhase.completed:
       case PipelinePhase.failed:
@@ -472,6 +539,24 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                   label: const Text(
                                     'Enable Accessibility Control',
                                   ),
+                                ),
+                              ),
+                            ],
+                            if (_microphonePermissionMissing) ...[
+                              const SizedBox(height: 10),
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: TextButton.icon(
+                                  onPressed: () async {
+                                    final granted =
+                                        await _ensureMicrophonePermission();
+                                    if (!mounted) return;
+                                    setState(() {
+                                      _microphonePermissionMissing = !granted;
+                                    });
+                                  },
+                                  icon: const Icon(Icons.mic_none_rounded),
+                                  label: const Text('Enable Microphone'),
                                 ),
                               ),
                             ],

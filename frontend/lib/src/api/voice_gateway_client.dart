@@ -10,6 +10,7 @@ class VoiceGatewayClient {
           : baseUrl;
 
   final String _base;
+  String get baseUrl => _base;
 
   Future<VoiceGatewayHealth> getHealth() async {
     final data = await _get('/api/voice/health/');
@@ -124,12 +125,36 @@ class VoiceGatewayClient {
     String userId = 'flutter-voice-lab',
     String sessionId = 'voice-lab-session',
   }) async {
-    final data = await _post('/api/voice/speak/', {
-      'user_id': userId,
-      'session_id': sessionId,
-      'text': text,
-    });
+    final response = await http
+        .post(
+          Uri.parse('$_base/api/voice/speak/'),
+          headers: const {
+            'Content-Type': 'application/json',
+            'Accept': 'audio/*',
+          },
+          body: jsonEncode({
+            'user_id': userId,
+            'session_id': sessionId,
+            'text': text,
+            'response_format': 'audio',
+          }),
+        )
+        .timeout(const Duration(seconds: 30));
 
+    final contentType = (response.headers['content-type'] ?? '').toLowerCase();
+    if (response.statusCode >= 200 &&
+        response.statusCode < 300 &&
+        contentType.contains('audio/')) {
+      return SpeechResponse(
+        text: text,
+        audioBytes: response.bodyBytes,
+        mimeType: response.headers['content-type'] ?? 'audio/wav',
+        provider: response.headers['x-voice-provider'] ?? 'unknown',
+        warnings: const [],
+      );
+    }
+
+    final data = _decode(response);
     final audioBase64 = (data['audio_base64'] ?? '').toString();
     if (audioBase64.isEmpty) {
       throw const VoiceGatewayException('Voice gateway returned no audio.');

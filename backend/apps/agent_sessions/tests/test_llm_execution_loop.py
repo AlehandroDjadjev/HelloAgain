@@ -7,6 +7,7 @@ from django.test import TestCase, override_settings
 from apps.agent_core.llm_client import LLMError
 from apps.agent_core.services.step_reasoning import ReasonedStep
 from apps.agent_core.services.vision_reasoning import VisionTapTarget
+from apps.agent_sessions.clarification_service import ClarificationService
 from apps.agent_sessions.confirmation_service import ConfirmationService
 from apps.agent_sessions.execution_service import (
     CIRCUIT_BREAKER_THRESHOLD,
@@ -142,6 +143,32 @@ class LLMExecutionLoopTests(TestCase):
         SessionService.transition(session, SessionStatus.EXECUTING)
         return session
 
+    def _set_pending_query(
+        self,
+        session,
+        *,
+        question: str,
+        required_fields: list[str],
+        candidates: list[str] | None = None,
+        reason: str,
+        attempt_count: int = 1,
+        max_attempts: int = 3,
+    ) -> None:
+        session.status = SessionStatus.AWAITING_USER_INPUT
+        session.pending_user_input = {
+            "query_id": "query_123",
+            "status": "pending" if attempt_count == 1 else "retryable",
+            "question": question,
+            "followup_question": question,
+            "attempt_count": attempt_count,
+            "max_attempts": max_attempts,
+            "required_fields": required_fields,
+            "candidates": candidates or [],
+            "reason": reason,
+            "ui_context": {"candidates": candidates or []},
+        }
+        session.save(update_fields=["status", "pending_user_input", "updated_at"])
+
     def test_get_next_action_returns_complete_for_completed_session(self):
         session = self._make_session("Open Chrome", "com.android.chrome")
         SessionService.transition(session, SessionStatus.COMPLETED)
@@ -174,6 +201,50 @@ class LLMExecutionLoopTests(TestCase):
 
         self.assertEqual(decision.status, "complete")
         self.assertEqual(decision.reason, "Session is already complete.")
+
+    @patch("apps.agent_sessions.execution_service.StepReasoningService.reason_next_step")
+    def test_llm_session_without_target_app_lets_model_choose_open_app(
+        self,
+        mock_reason_next_step,
+    ):
+        mock_reason_next_step.return_value = ReasonedStep(
+            action_type="OPEN_APP",
+            params={"package_name": "com.viber.voip"},
+            reasoning="The user asked to message someone, so Viber is the best available messaging app.",
+            confidence=0.88,
+            is_goal_complete=False,
+            requires_confirmation=False,
+            sensitivity="low",
+        )
+        session = SessionService.create(
+            user_id="test_user",
+            device_id="test_device",
+            transcript="Tell Alex hello",
+            input_mode="text",
+            supported_packages=["com.viber.voip", "com.android.chrome"],
+        )
+        session.store_intent_data(
+            goal="Send a message to Alex",
+            target_app="",
+            entities={"recipient": "Alex", "message": "hello"},
+        )
+        SessionService.transition(session, SessionStatus.EXECUTING)
+
+        response = ExecutionService.get_next_action(
+            session,
+            plan=None,
+            screen_state=_screen("com.android.launcher", "Home", "home", []),
+        )
+
+        self.assertEqual(response.status, "execute")
+        self.assertEqual(response.next_action["type"], "OPEN_APP")
+        self.assertEqual(
+            response.next_action["params"]["package_name"],
+            "com.viber.voip",
+        )
+        self.assertEqual(response.executor_hint, "com.viber.voip")
+        session.refresh_from_db()
+        self.assertEqual(session.target_app, "com.viber.voip")
 
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
     def test_chrome_search_e2e(self, mock_from_reasoning_provider):
@@ -564,14 +635,262 @@ class LLMExecutionLoopTests(TestCase):
         self.assertEqual(resumed.status, "complete")
 
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_reasoner_can_pause_for_user_input(self, mock_from_reasoning_provider):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "REQUEST_USER_INPUT",
+            "params": {
+                "question": "Which Alex should I message? I see Alex Chen and Alex Johnson.",
+                "required_fields": ["recipient"],
+                "candidates": ["Alex Chen", "Alex Johnson"],
+                "reason": "multiple_visible_matches",
+                "max_attempts": 3,
+            },
+            "reasoning": "Two visible contacts match the requested recipient, so clarification is required.",
+            "confidence": 0.95,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_reasoning_provider.return_value = mock_client
+
+        session = self._make_session("Message Alex on WhatsApp", "com.whatsapp")
+        chooser_screen = _screen(
+            "com.whatsapp",
+            "New chat",
+            "chooser",
+            [
+                _node("alex_1", "android.widget.TextView", text="Alex Chen", clickable=True),
+                _node("alex_2", "android.widget.TextView", text="Alex Johnson", clickable=True),
+            ],
+        )
+
+        response = ExecutionService.get_next_action(session, plan=None, screen_state=chooser_screen)
+
+        self.assertEqual(response.status, "needs_user_input")
+        self.assertEqual(response.next_action["type"], "REQUEST_USER_INPUT")
+        self.assertEqual(response.next_action["params"]["attempt"], 1)
+        session.refresh_from_db()
+        self.assertEqual(session.status, SessionStatus.AWAITING_USER_INPUT)
+        self.assertEqual(session.pending_user_input["required_fields"], ["recipient"])
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_missing_slot_returns_needs_user_input_and_persists_pending_query(self, mock_from_reasoning_provider):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "REQUEST_USER_INPUT",
+            "params": {
+                "question": "Where should I navigate?",
+                "required_fields": ["destination"],
+                "reason": "missing_required_data",
+                "max_attempts": 3,
+            },
+            "reasoning": "The destination is missing, so the system cannot continue safely.",
+            "confidence": 0.94,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_reasoning_provider.return_value = mock_client
+
+        session = self._make_session("Navigate somewhere", "com.google.android.apps.maps")
+        maps_screen = _screen(
+            "com.google.android.apps.maps",
+            "Maps",
+            "search",
+            [_node("search", "android.widget.TextView", text="Search here", clickable=True)],
+        )
+
+        response = ExecutionService.get_next_action(session, plan=None, screen_state=maps_screen)
+
+        self.assertEqual(response.status, "needs_user_input")
+        self.assertEqual(response.next_action["params"]["required_fields"], ["destination"])
+        session.refresh_from_db()
+        self.assertEqual(session.status, SessionStatus.AWAITING_USER_INPUT)
+        self.assertEqual(session.pending_user_input["reason"], "missing_required_data")
+
+    def test_pending_user_input_gates_execution(self):
+        session = self._make_session("Message Alex on WhatsApp", "com.whatsapp")
+        self._set_pending_query(
+            session,
+            question="Which Alex should I message? Please choose Alex Chen or Alex Johnson.",
+            required_fields=["recipient"],
+            candidates=["Alex Chen", "Alex Johnson"],
+            reason="multiple_visible_matches",
+            attempt_count=2,
+        )
+
+        response = ExecutionService.get_next_action(
+            session,
+            plan=None,
+            screen_state=_screen("com.whatsapp", "New chat", "chooser", []),
+        )
+
+        self.assertEqual(response.status, "needs_user_input")
+        self.assertEqual(response.next_action["id"], "query_123")
+        self.assertEqual(response.next_action["params"]["attempt"], 2)
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_resolved_reply_updates_entities_and_resumes_next_step(self, mock_from_reasoning_provider):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "TAP_ELEMENT",
+            "params": {"selector": {"element_ref": "alex_johnson_row"}},
+            "reasoning": "The chosen contact is now known, so the visible row can be tapped.",
+            "confidence": 0.9,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_reasoning_provider.return_value = mock_client
+
+        session = self._make_session("Message Alex on WhatsApp", "com.whatsapp")
+        self._set_pending_query(
+            session,
+            question="Which Alex should I message?",
+            required_fields=["recipient"],
+            candidates=["Alex Chen", "Alex Johnson"],
+            reason="multiple_visible_matches",
+        )
+
+        result = ClarificationService.submit_reply(
+            session=session,
+            query_id="query_123",
+            transcript="Alex Johnson",
+        )
+
+        self.assertEqual(result["status"], "resolved")
+        session.refresh_from_db()
+        self.assertEqual(session.entities["recipient"], "Alex Johnson")
+        self.assertEqual(session.status, SessionStatus.EXECUTING)
+
+        chooser_screen = _screen(
+            "com.whatsapp",
+            "New chat",
+            "chooser",
+            [_node("alex_johnson_row", "android.widget.TextView", text="Alex Johnson", clickable=True)],
+        )
+        resumed = ExecutionService.get_next_action(session, plan=None, screen_state=chooser_screen)
+        self.assertEqual(resumed.status, "execute")
+        self.assertEqual(resumed.next_action["type"], "TAP_ELEMENT")
+
+    def test_ambiguous_reply_returns_followup_and_increments_attempt_count(self):
+        session = self._make_session("Message Alex on WhatsApp", "com.whatsapp")
+        self._set_pending_query(
+            session,
+            question="Which Alex should I message?",
+            required_fields=["recipient"],
+            candidates=["Alex Chen", "Alex Johnson"],
+            reason="multiple_visible_matches",
+        )
+
+        result = ClarificationService.submit_reply(
+            session=session,
+            query_id="query_123",
+            transcript="Alex",
+        )
+
+        self.assertEqual(result["status"], "needs_user_input")
+        self.assertEqual(result["attempt"], 2)
+        self.assertEqual(result["reason_unresolved"], "multiple_matches")
+        session.refresh_from_db()
+        self.assertEqual(session.pending_user_input["attempt_count"], 2)
+        self.assertIn("Please choose exactly one", session.pending_user_input["followup_question"])
+
+        gated = ExecutionService.get_next_action(
+            session,
+            plan=None,
+            screen_state=_screen("com.whatsapp", "New chat", "chooser", []),
+        )
+        self.assertEqual(gated.status, "needs_user_input")
+        self.assertEqual(gated.next_action["params"]["attempt"], 2)
+
+    def test_third_unresolved_reply_falls_back_safely(self):
+        session = self._make_session("Message Alex on WhatsApp", "com.whatsapp")
+        self._set_pending_query(
+            session,
+            question="Which Alex should I message?",
+            required_fields=["recipient"],
+            candidates=["Alex Chen", "Alex Johnson"],
+            reason="multiple_visible_matches",
+            attempt_count=3,
+        )
+
+        result = ClarificationService.submit_reply(
+            session=session,
+            query_id="query_123",
+            transcript="[silence]",
+        )
+
+        self.assertEqual(result["status"], "manual_takeover")
+        self.assertTrue(result["should_fallback"])
+        session.refresh_from_db()
+        self.assertEqual(session.pending_user_input["status"], "fallback")
+
+        gated = ExecutionService.get_next_action(
+            session,
+            plan=None,
+            screen_state=_screen("com.whatsapp", "New chat", "chooser", []),
+        )
+        self.assertEqual(gated.status, "manual_takeover")
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_clarification_resolution_does_not_break_later_confirmation(self, mock_from_reasoning_provider):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "REQUEST_CONFIRMATION",
+            "params": {
+                "prompt": "Send 'Running late' to Alex Johnson?",
+                "action_summary": "Tap Send in WhatsApp",
+            },
+            "reasoning": "The recipient is resolved and sending still requires explicit approval.",
+            "confidence": 0.98,
+            "is_goal_complete": False,
+            "requires_confirmation": True,
+            "sensitivity": "high",
+        }
+        mock_from_reasoning_provider.return_value = mock_client
+
+        session = self._make_session("Send Alex a WhatsApp message", "com.whatsapp")
+        self._set_pending_query(
+            session,
+            question="Which Alex should I message?",
+            required_fields=["recipient"],
+            candidates=["Alex Chen", "Alex Johnson"],
+            reason="multiple_visible_matches",
+        )
+
+        ClarificationService.submit_reply(
+            session=session,
+            query_id="query_123",
+            transcript="Alex Johnson",
+        )
+
+        compose_screen = _screen(
+            "com.whatsapp",
+            "Alex Johnson",
+            "compose",
+            [
+                _node("message_box", "android.widget.EditText", text="Running late", editable=True, focused=True),
+                _node("send_btn", "android.widget.ImageButton", cdesc="Send", clickable=True),
+            ],
+            focused="message_box",
+        )
+        response = ExecutionService.get_next_action(session, plan=None, screen_state=compose_screen)
+
+        self.assertEqual(response.status, "confirm")
+        pending = ConfirmationRecord.objects.get(session=session, status=ConfirmationRecord.Status.PENDING)
+        self.assertIn("Tap Send", pending.action_summary)
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
     def test_open_chat_session_exits_when_destination_screen_is_already_reached(self, mock_from_reasoning_provider):
         mock_client = MagicMock()
         mock_client.generate.return_value = {
             "action_type": "TAP_ELEMENT",
             "params": {"selector": {"element_ref": "send_btn"}},
-            "reasoning": "The requested chat is visible, so tap inside it.",
+            "reasoning": "The requested conversation interface is already open.",
             "confidence": 0.62,
-            "is_goal_complete": False,
+            "is_goal_complete": True,
             "requires_confirmation": False,
             "sensitivity": "low",
         }
@@ -671,6 +990,43 @@ class LLMExecutionLoopTests(TestCase):
             decision.reason,
             "ELEMENT_NOT_CLICKABLE: Search bar exists but is not clickable",
         )
+
+    def test_decide_after_result_records_resulting_screen_summary(self):
+        session = self._make_session("Open Chrome", "com.android.chrome")
+        screen_after = _screen(
+            "com.android.chrome",
+            "Chrome",
+            "newtab",
+            [
+                _node(
+                    "url_bar",
+                    "android.widget.EditText",
+                    cdesc="Search or type web address",
+                    clickable=True,
+                    editable=True,
+                ),
+                _node("tabs", "android.widget.ImageButton", cdesc="Tab switcher", clickable=True),
+            ],
+        )
+
+        ExecutionService.decide_after_result(
+            session,
+            plan=None,
+            action_id="llm_open_app",
+            result_success=True,
+            result_code="OK",
+            action_type="OPEN_APP",
+            params={"package_name": "com.android.chrome"},
+            reasoning="Chrome is not open yet.",
+            screen_hash_before="home",
+            screen_hash_after="newtab",
+            screen_state_after=screen_after,
+        )
+
+        session.refresh_from_db()
+        self.assertEqual(session.step_history[-1]["screen_hash_after"], "newtab")
+        self.assertIn("Foreground=com.android.chrome", session.step_history[-1]["screen_summary_after"])
+        self.assertIn("Search or type web address", session.step_history[-1]["screen_summary_after"])
 
     def test_stale_tap_is_recorded_as_soft_failure(self):
         session = self._make_session("Tap a button on Chrome", "com.android.chrome")
