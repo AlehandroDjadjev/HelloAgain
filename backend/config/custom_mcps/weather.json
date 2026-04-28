@@ -1,0 +1,20 @@
+{
+  "id": "weather",
+  "protocol": "at_home_mcp",
+  "kind": "backend_integrated_toolset",
+  "description": "Fetches a clean current weather snapshot for the user's current or saved location and returns a popup-friendly result.",
+  "invoke_url": "/api/agent/mcps/weather/invoke/",
+  "tools": [
+    {
+      "name": "get_current_weather",
+      "method": "POST",
+      "path": "/api/weather/current/",
+      "description": "Use this when the user asks directly about the weather at their location or nearby.",
+      "body_schema": {
+        "prompt": "string",
+        "location": "object",
+        "timezone": "string"
+      }
+    }
+  ]
+}

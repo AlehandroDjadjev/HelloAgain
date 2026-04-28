@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "voice_gateway",
     "meetup",
+    "weather",
     "apps.accounts",
     "apps.agent_core",
     "apps.agent_sessions",
@@ -78,6 +79,7 @@ INSTALLED_APPS = [
     # Platform
     'controller',
     'meetup',
+    'weather',
     "apps.accounts",
     # Agent apps
     'apps.agent_core',
@@ -150,7 +152,7 @@ else:
             "USER": os.environ.get("POSTGRES_USER", "app_user"),
             "PASSWORD": os.environ.get("POSTGRES_PASSWORD", "set_in_env"),
             "HOST": os.environ.get("POSTGRES_HOST", "localhost"),
-            "PORT": int(os.environ.get("POSTGRES_PORT", "5432")),
+            "PORT": int(os.environ.get("POSTGRES_PORT", "5433")),
             "CONN_MAX_AGE": int(os.environ.get("POSTGRES_CONN_MAX_AGE", "60")),
         }
     }
@@ -237,12 +239,15 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # LLM configuration
 #
-# Default provider: transformers.
+# Default provider: OpenAI.
 # Switch provider by setting LLM_PROVIDER env var with no code changes.
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "transformers")
-LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen3-14B")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
+LLM_MODEL = os.environ.get("LLM_MODEL", os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"))
+LLM_API_KEY = os.environ.get(
+    "LLM_API_KEY",
+    os.environ.get("OPENAI_LLM_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
+)
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", os.environ.get("OPENAI_LLM_BASE_URL", ""))
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
 
 LOCAL_LLM_PROVIDER = os.environ.get("LOCAL_LLM_PROVIDER", "transformers")
@@ -251,7 +256,7 @@ LOCAL_LLM_API_KEY = os.environ.get("LOCAL_LLM_API_KEY", "")
 LOCAL_LLM_BASE_URL = os.environ.get("LOCAL_LLM_BASE_URL", "")
 LOCAL_LLM_TIMEOUT = int(os.environ.get("LOCAL_LLM_TIMEOUT", str(LLM_TIMEOUT)))
 
-OPENAI_LLM_MODEL = os.environ.get("OPENAI_LLM_MODEL", "gpt-5-mini")
+OPENAI_LLM_MODEL = os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini")
 OPENAI_LLM_API_KEY = os.environ.get(
     "OPENAI_LLM_API_KEY",
     os.environ.get("OPENAI_API_KEY", os.environ.get("LLM_API_KEY", "")),
@@ -274,10 +279,13 @@ LLM_MAX_CONTEXT = int(os.environ.get("LLM_MAX_CONTEXT", "12000"))
 # ── Logging ───────────────────────────────────────────────────────────────────
 CORS_ALLOW_ALL_ORIGINS = True
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "transformers")
-LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-14B-Instruct")
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
+LLM_MODEL = os.environ.get("LLM_MODEL", os.environ.get("OPENAI_LLM_MODEL", "gpt-4o-mini"))
+LLM_API_KEY = os.environ.get(
+    "LLM_API_KEY",
+    os.environ.get("OPENAI_LLM_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
+)
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", os.environ.get("OPENAI_LLM_BASE_URL", ""))
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
 
 LOGGING = {

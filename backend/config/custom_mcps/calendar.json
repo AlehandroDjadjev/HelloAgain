@@ -1,0 +1,25 @@
+{
+  "id": "calendar",
+  "protocol": "at_home_mcp",
+  "kind": "backend_integrated_toolset",
+  "description": "Creates a Google Calendar reminder or calendar event for an accepted meetup or an explicit reminder request.",
+  "invoke_url": "/api/agent/mcps/calendar/invoke/",
+  "tools": [
+    {
+      "name": "create_meetup_reminder",
+      "method": "POST",
+      "path": "/api/agent/mcps/calendar/invoke/",
+      "description": "Use this for accepted meetups with full details, or for explicit reminder and add to calendar requests. Google Calendar is the default target.",
+      "body_schema": {
+        "prompt": "string",
+        "user_id": "string",
+        "title": "string",
+        "start_time": "string",
+        "end_time": "string",
+        "location": "string",
+        "description": "string",
+        "reminder_minutes": "integer"
+      }
+    }
+  ]
+}

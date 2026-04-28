@@ -34,22 +34,7 @@ _DEBUG_NODE_LIMIT = 14
 
 _VALID_ACTION_TYPES: frozenset[str] = frozenset(a.value for a in ActionType)
 _VALID_SENSITIVITIES = frozenset(a.value for a in ActionSensitivity)
-_VALID_SCROLL_DIRS = frozenset({"up", "down", "left", "right"})
-_VALID_USER_INPUT_REASONS = frozenset({
-    "missing_required_data",
-    "missing_required_fields",
-    "multiple_visible_matches",
-    "underdetermined_next_step",
-    "conflicting_context",
-})
-_DISALLOWED_USER_INPUT_PROMPT_PHRASES = frozenset({
-    "what should i do",
-    "what do you want",
-    "anything else",
-    "tell me more",
-    "can you clarify",
-    "please clarify",
-})
+_VALID_SCROLL_DIRS = frozenset({"up", "down"})
 
 _REQUIRED_PARAMS: dict[str, list[str]] = {
     "OPEN_APP": ["package_name"],
@@ -66,7 +51,6 @@ _REQUIRED_PARAMS: dict[str, list[str]] = {
     "WAIT_FOR_ELEMENT": ["selector"],
     "FIND_ELEMENT": ["selector"],
     "REQUEST_CONFIRMATION": ["action_summary"],
-    "REQUEST_USER_INPUT": ["question", "required_fields", "reason", "max_attempts"],
     "ABORT": ["reason"],
     "ASSERT_SCREEN": ["screen_hint"],
     "ASSERT_ELEMENT": ["selector"],
@@ -80,6 +64,50 @@ _SELECTOR_ACTIONS = frozenset({
     "FIND_ELEMENT",
     "WAIT_FOR_ELEMENT",
     "ASSERT_ELEMENT",
+})
+
+_APP_CONTEXT_HINTS: dict[str, str] = {
+    "com.whatsapp": (
+        "Common elements: search button (contentDesc often contains 'Search'), "
+        "chat items (usually clickable layouts with contact names), and a send "
+        "button with contentDesc 'Send' inside chat threads."
+    ),
+    "com.android.chrome": (
+        "Common elements: the address/search bar with contentDesc like "
+        "'Search or type web address', page content below it, and toolbar actions "
+        "such as tab switcher or menu buttons."
+    ),
+    "com.google.android.apps.maps": (
+        "Common elements: a search field near the top, place result cards, and "
+        "route actions such as Directions or Start."
+    ),
+    "com.google.android.gm": (
+        "Common elements: the Compose button, search, inbox thread rows, and "
+        "subject/body fields in compose mode."
+    ),
+    "com.supercell.brawlstars": (
+        "Common elements: game home screen buttons, event cards, play buttons, "
+        "and modal dialogs. Prefer OPEN_APP first, then act only on clearly visible UI."
+    ),
+}
+
+_COMPLETION_BLOCKING_TERMS = frozenset({
+    "send",
+    "submit",
+    "confirm",
+    "delete",
+    "pay",
+    "purchase",
+    "call",
+    "dial",
+    "post",
+    "publish",
+    "upload",
+    "share",
+    "reply",
+    "text ",
+    "message ",
+    "email ",
 })
 
 @dataclass
@@ -170,8 +198,8 @@ class StepReasoningService:
         )
         failure_context = _build_failure_context(step_history)
         goal_progress = _estimate_goal_progress(goal, target_app, screen_state, step_history)
+        app_context = _build_app_context(target_app, screen_state)
         live_refs = _extract_refs(screen_state)
-        available_apps = list(constraints.get("available_apps") or [])
 
         user_prompt = build_step_reasoning_user_prompt(
             goal=goal,
@@ -183,7 +211,7 @@ class StepReasoningService:
             screen_tree=screen_tree,
             failure_context=failure_context,
             goal_progress=goal_progress,
-            available_apps=available_apps,
+            app_context=app_context,
         )
 
         attempts = 1
@@ -207,7 +235,7 @@ class StepReasoningService:
                 validation_error=error,
                 failure_context=failure_context,
                 goal_progress=goal_progress,
-                available_apps=available_apps,
+                app_context=app_context,
             )
             raw, error = self._call_and_validate(
                 user_prompt=retry_prompt,
@@ -253,6 +281,14 @@ class StepReasoningService:
             screen_state=screen_state,
             entities=entities,
             goal=goal,
+        )
+        step = _apply_completion_override(
+            step=step,
+            goal=goal,
+            target_app=target_app,
+            entities=entities,
+            screen_state=screen_state,
+            step_history=step_history,
         )
         aligned_selector = step.params.get("selector") or {}
         if original_selector != aligned_selector:
@@ -638,75 +674,6 @@ def _validate_response(
                 errors.append(
                     f"SCROLL requires params.direction in {sorted(_VALID_SCROLL_DIRS)}, got {direction!r}."
                 )
-
-        if action_type == "REQUEST_USER_INPUT" and not errors:
-            question = str(params.get("question") or "").strip()
-            if not question:
-                errors.append("REQUEST_USER_INPUT requires a non-empty params.question string.")
-            else:
-                normalized_question = " ".join(question.lower().split())
-                if len(question) > 220:
-                    errors.append("REQUEST_USER_INPUT params.question must be concise (220 chars max).")
-                if any(phrase in normalized_question for phrase in _DISALLOWED_USER_INPUT_PROMPT_PHRASES):
-                    errors.append(
-                        "REQUEST_USER_INPUT params.question is too open-ended. Ask only for the specific missing detail."
-                    )
-                if (
-                    "yes or no" in normalized_question
-                    or normalized_question.startswith("should i ")
-                    or normalized_question.startswith("do you want me to ")
-                    or normalized_question.startswith("may i ")
-                    or normalized_question.startswith("can i ")
-                ):
-                    errors.append(
-                        "REQUEST_USER_INPUT cannot ask for approval or yes/no consent. Use REQUEST_CONFIRMATION for approval gates."
-                    )
-
-            required_fields = params.get("required_fields")
-            if not isinstance(required_fields, list) or not required_fields:
-                errors.append("REQUEST_USER_INPUT requires a non-empty params.required_fields list.")
-            elif not all(isinstance(item, str) and item.strip() for item in required_fields):
-                errors.append("REQUEST_USER_INPUT params.required_fields must contain non-empty strings only.")
-            else:
-                normalized_required_fields = [str(item).strip() for item in required_fields]
-                if len(normalized_required_fields) > 3:
-                    errors.append("REQUEST_USER_INPUT params.required_fields must contain at most 3 items.")
-                if len(set(normalized_required_fields)) != len(normalized_required_fields):
-                    errors.append("REQUEST_USER_INPUT params.required_fields must not contain duplicates.")
-
-            candidates = params.get("candidates")
-            if candidates is not None:
-                if not isinstance(candidates, list):
-                    errors.append("REQUEST_USER_INPUT params.candidates must be a list when provided.")
-                elif not all(isinstance(item, str) and item.strip() for item in candidates):
-                    errors.append("REQUEST_USER_INPUT params.candidates must contain non-empty strings only.")
-                else:
-                    normalized_candidates = [str(item).strip() for item in candidates]
-                    if len(normalized_candidates) == 1:
-                        errors.append("REQUEST_USER_INPUT params.candidates should not contain only one option.")
-                    if len(normalized_candidates) > 5:
-                        errors.append("REQUEST_USER_INPUT params.candidates must contain at most 5 items.")
-                    if len(set(normalized_candidates)) != len(normalized_candidates):
-                        errors.append("REQUEST_USER_INPUT params.candidates must not contain duplicates.")
-
-            reason = str(params.get("reason") or "").strip()
-            if not reason:
-                errors.append("REQUEST_USER_INPUT requires a non-empty params.reason string.")
-            elif reason not in _VALID_USER_INPUT_REASONS:
-                errors.append(
-                    f"REQUEST_USER_INPUT params.reason must be one of: {', '.join(sorted(_VALID_USER_INPUT_REASONS))}."
-                )
-
-            max_attempts = params.get("max_attempts")
-            try:
-                parsed_attempts = int(max_attempts)
-                if parsed_attempts < 1 or parsed_attempts > 3:
-                    errors.append("REQUEST_USER_INPUT params.max_attempts must be between 1 and 3.")
-            except (TypeError, ValueError):
-                errors.append("REQUEST_USER_INPUT params.max_attempts must be an integer.")
-
-            if raw.get("requires_confirmation") is True:
-                errors.append("REQUEST_USER_INPUT must not set requires_confirmation=true.")
 
     sensitivity = raw.get("sensitivity")
     if sensitivity is not None and sensitivity not in _VALID_SENSITIVITIES:
@@ -1388,6 +1355,216 @@ def _estimate_goal_progress(
         f"{step_count} successful step(s) have been executed with {failures} failure(s). "
         f"The task appears to be in the {phase}."
     )
+
+
+def _build_app_context(target_app: str, screen_state: dict) -> str:
+    executor = get_executor(target_app)
+    if executor is None:
+        return ""
+
+    try:
+        screen_hint = executor.infer_screen_hint(screen_state or {})
+    except Exception:
+        logger.exception("Executor screen hint failed for '%s'", target_app)
+        screen_hint = "unknown"
+
+    common_elements = _APP_CONTEXT_HINTS.get(target_app, "")
+    if common_elements:
+        return (
+            f"{executor.__class__.__name__} classifies this screen as '{screen_hint}'. "
+            f"{common_elements}"
+        )
+    return f"{executor.__class__.__name__} classifies this screen as '{screen_hint}'."
+
+
+def _apply_completion_override(
+    *,
+    step: ReasonedStep,
+    goal: str,
+    target_app: str,
+    entities: dict,
+    screen_state: dict,
+    step_history: list[dict],
+) -> ReasonedStep:
+    if step.is_goal_complete:
+        return step
+    if step.requires_confirmation or step.action_type == ActionType.REQUEST_CONFIRMATION.value:
+        return step
+
+    completion_reason = _infer_goal_completion_reason(
+        goal=goal,
+        target_app=target_app,
+        entities=entities,
+        screen_state=screen_state,
+        step_history=step_history,
+    )
+    if not completion_reason:
+        return step
+
+    reasoning = str(step.reasoning or "").strip()
+    if completion_reason not in reasoning:
+        reasoning = f"{reasoning} {completion_reason}".strip() if reasoning else completion_reason
+
+    return ReasonedStep(
+        action_type=step.action_type,
+        params=step.params,
+        reasoning=reasoning,
+        confidence=max(step.confidence, 0.86),
+        is_goal_complete=True,
+        requires_confirmation=False,
+        sensitivity=step.sensitivity,
+        raw_llm_response=step.raw_llm_response,
+        validation_attempts=step.validation_attempts,
+        source=step.source,
+        fallback_mode=step.fallback_mode,
+        llm_failure_reason=step.llm_failure_reason,
+    )
+
+
+def _infer_goal_completion_reason(
+    *,
+    goal: str,
+    target_app: str,
+    entities: dict,
+    screen_state: dict,
+    step_history: list[dict],
+) -> str:
+    foreground_package = str(screen_state.get("foreground_package") or "").strip()
+    if not target_app or foreground_package != target_app:
+        return ""
+
+    goal_text = _normalize_free_text(goal)
+    if _goal_contains_blocking_action(goal_text):
+        return ""
+
+    screen_hint = _infer_executor_screen_hint(target_app, screen_state)
+    target_terms = _extract_target_terms(entities or {}, goal)
+    mentions_target = not target_terms or _screen_mentions_target(screen_state, target_terms)
+
+    if _goal_requests_navigation_destination(goal_text):
+        if screen_hint in {"route_preview", "navigation_active"} or _looks_like_maps_destination_ready(screen_state):
+            return "The requested navigation destination is already open on the current screen, so the goal can complete now."
+
+    if _goal_requests_compose_interface(goal_text):
+        if screen_hint == "compose_open" or _looks_like_compose_interface(screen_state):
+            return "The requested compose interface is already open to an acceptable degree, so the goal can complete now."
+
+    if _goal_requests_chat_interface(goal_text):
+        if (screen_hint == "chat_thread" or _looks_like_chat_interface(screen_state)) and mentions_target:
+            return "The requested chat or conversation interface is already open to an acceptable degree, so the goal can complete now."
+
+    if _goal_requests_app_open_only(goal_text):
+        if step_history or target_app == foreground_package:
+            return "The requested app destination is already open in the foreground, so no further phone actions are needed."
+
+    return ""
+
+
+def _infer_executor_screen_hint(target_app: str, screen_state: dict) -> str:
+    executor = get_executor(target_app)
+    if executor is None:
+        return ""
+    try:
+        return str(executor.infer_screen_hint(screen_state or {}) or "").strip().lower()
+    except Exception:
+        logger.exception("Executor screen hint failed for '%s' during completion inference", target_app)
+        return ""
+
+
+def _goal_contains_blocking_action(goal_text: str) -> bool:
+    return any(term in goal_text for term in _COMPLETION_BLOCKING_TERMS)
+
+
+def _goal_requests_navigation_destination(goal_text: str) -> bool:
+    return any(term in goal_text for term in ("navigate", "directions", "route", "drive to", "go to "))
+
+
+def _goal_requests_compose_interface(goal_text: str) -> bool:
+    return any(term in goal_text for term in ("compose", "draft", "write email", "new email"))
+
+
+def _goal_requests_chat_interface(goal_text: str) -> bool:
+    return any(term in goal_text for term in ("open chat", "chat", "conversation", "thread", "contact"))
+
+
+def _goal_requests_app_open_only(goal_text: str) -> bool:
+    if not any(term in goal_text for term in ("open", "launch", "start", "bring up")):
+        return False
+    if any(
+        term in goal_text for term in (
+            "take",
+            "photo",
+            "record",
+            "scan",
+            "tap",
+            "click",
+            "select",
+            "choose",
+            "type",
+            "play",
+            "watch",
+            "listen",
+            "upload",
+            "download",
+        )
+    ):
+        return False
+    if _goal_requests_navigation_destination(goal_text):
+        return False
+    if _goal_requests_compose_interface(goal_text):
+        return False
+    if _goal_requests_chat_interface(goal_text):
+        return False
+    if "search" in goal_text or "find " in goal_text or "look up" in goal_text:
+        return False
+    return True
+
+
+def _screen_mentions_target(screen_state: dict, target_terms: list[str]) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    return any(_normalize_free_text(term) in screen_text for term in target_terms if term.strip())
+
+
+def _looks_like_chat_interface(screen_state: dict) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    nodes = screen_state.get("nodes") or []
+    has_editable = any(bool(node.get("editable")) for node in nodes if isinstance(node, dict))
+    has_send = "send" in screen_text
+    has_message = "message" in screen_text or "type a message" in screen_text
+    return has_editable and (has_send or has_message)
+
+
+def _looks_like_compose_interface(screen_state: dict) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    nodes = [node for node in (screen_state.get("nodes") or []) if isinstance(node, dict)]
+    editable_count = sum(1 for node in nodes if bool(node.get("editable")))
+    return editable_count >= 2 or any(term in screen_text for term in ("compose", "subject", "\nto\n", " to "))
+
+
+def _looks_like_maps_destination_ready(screen_state: dict) -> bool:
+    screen_text = _normalize_free_text(_screen_text_blob(screen_state))
+    if "end route" in screen_text or "exit navigation" in screen_text or "overview" in screen_text:
+        return True
+    return "start" in screen_text and "directions" in screen_text
+
+
+def _screen_text_blob(screen_state: dict) -> str:
+    parts: list[str] = [str(screen_state.get("window_title") or "")]
+    for node in screen_state.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        parts.extend([
+            str(node.get("text") or ""),
+            str(node.get("content_desc") or ""),
+            str(node.get("view_id") or ""),
+        ])
+    return "\n".join(part for part in parts if part)
+
+
+def _normalize_free_text(value: str) -> str:
+    lowered = str(value or "").casefold()
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in lowered)
+    return " ".join(cleaned.split())
 
 
 def _normalize_recovery_action(recovery: Optional[dict]) -> Optional[dict]:

@@ -50,12 +50,14 @@ class AgentClient {
     String inputMode = 'text',
     String reasoningProvider = 'openai',
     List<String> supportedPackages = const [],
+    Map<String, dynamic> context = const {},
   }) => _post('/api/agent/phone-command/', {
     'prompt': prompt,
     'device_id': deviceId,
     'input_mode': inputMode,
     'reasoning_provider': reasoningProvider,
     'supported_packages': supportedPackages,
+    'context': context,
   });
 
   Future<Map<String, dynamic>> prepareNavigation({
@@ -76,6 +78,34 @@ class AgentClient {
 
   Future<Map<String, dynamic>> cancelSession(String sessionId) =>
       _post('/api/agent/sessions/$sessionId/cancel/', {});
+
+  Future<Map<String, dynamic>> getTerminalResponse(
+    String sessionId, {
+    required String phase,
+    String errorMessage = '',
+    String currentReasoning = '',
+  }) => _post('/api/agent/sessions/$sessionId/terminal-response/', {
+    'phase': phase,
+    'error_message': errorMessage,
+    'current_reasoning': currentReasoning,
+  });
+
+  Future<Map<String, dynamic>> decidePostTaskAction(
+    String sessionId, {
+    required String transcript,
+    required String phase,
+    String currentAppPackage = '',
+    String currentAppName = '',
+    String currentWindowTitle = '',
+    String lastAssistantMessage = '',
+  }) => _post('/api/agent/sessions/$sessionId/post-task-decision/', {
+    'transcript': transcript,
+    'phase': phase,
+    'current_app_package': currentAppPackage,
+    'current_app_name': currentAppName,
+    'current_window_title': currentWindowTitle,
+    'last_assistant_message': lastAssistantMessage,
+  });
 
   Future<Map<String, dynamic>> getSession(String sessionId) =>
       _get('/api/agent/sessions/$sessionId/');

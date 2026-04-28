@@ -1,4 +1,5 @@
 import json
+import os
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,9 +15,11 @@ from .models import (
     AccountProfile,
     ConnectionThread,
     FriendRequest,
+    GoogleCalendarConnection,
     OnboardingDraft,
     RecommendationActivity,
 )
+from .onboarding_service import OnboardingService
 from .services import issue_token, recommend_profiles_for_viewer
 
 
@@ -194,6 +197,8 @@ class AccountApiTests(TestCase):
                     "phone_permission_granted": True,
                     "microphone_permission_granted": True,
                     "contacts_permission_granted": True,
+                    "home_lat": 42.6977,
+                    "home_lng": 23.3219,
                     "onboarding_answers": {
                         "preferred_company": "One-to-one company feels best.",
                         "conversation_style": "Thoughtful and a good listener.",
@@ -292,6 +297,30 @@ class AccountApiTests(TestCase):
         self.assertIn("шах", payload["draft"]["dynamic_profile_summary"].lower())
         self.assertEqual(payload["mode"], "collecting")
         self.assertIn("phone_number", payload["missing_fields"])
+
+    def test_onboarding_ignores_stale_model_follow_up_after_progress(self):
+        draft = OnboardingDraft.objects.create(
+            session_id="stale-follow-up",
+            display_name="Ivan",
+            dynamic_profile_summary="Enjoys calm walks and thoughtful talks.",
+        )
+        service = OnboardingService()
+
+        with patch.object(
+            service,
+            "_extract",
+            return_value={
+                "display_name": "",
+                "phone_number": "+359 888 123 999",
+                "profile_summary": "",
+                "assistant_reply": "Please tell me your phone number.",
+            },
+        ):
+            payload = service.process_turn(draft.session_id, "My phone is +359 888 123 999")
+
+        self.assertEqual(payload["mode"], "ready_to_register")
+        self.assertEqual(payload["missing_fields"], [])
+        self.assertNotEqual(payload["assistant_reply"], "Please tell me your phone number.")
 
     def test_onboarding_turn_with_existing_phone_switches_to_login_confirmation(self):
         existing = self._create_profile(
@@ -404,7 +433,13 @@ class AccountApiTests(TestCase):
 
         response = self.client.post(
             "/api/accounts/onboarding/complete/",
-            data=json.dumps({"session_id": session_id}),
+            data=json.dumps(
+                {
+                    "session_id": session_id,
+                    "home_lat": 42.6977,
+                    "home_lng": 23.3219,
+                }
+            ),
             content_type="application/json",
         )
 
@@ -416,6 +451,141 @@ class AccountApiTests(TestCase):
         self.assertEqual(payload["mode"], "completed")
         mock_sync.assert_called_once()
         mock_seed.assert_called_once()
+
+    def test_google_calendar_status_defaults_to_disconnected(self):
+        profile = self._create_profile(
+            username="calendar-status-user",
+            email="calendar-status@example.com",
+            phone_number="+359888110001",
+            display_name="Calendar Status User",
+        )
+
+        response = self.client.get(
+            "/api/accounts/integrations/google/calendar/status/",
+            **self._auth_headers(profile.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["connected"])
+        self.assertEqual(payload["google_email"], "")
+
+    @patch.dict(
+        os.environ,
+        {
+            "GOOGLE_OAUTH_CLIENT_ID": "client-id",
+            "GOOGLE_OAUTH_CLIENT_SECRET": "client-secret",
+            "GOOGLE_OAUTH_REDIRECT_URI": "http://localhost:8000/api/accounts/integrations/google/calendar/callback/",
+        },
+        clear=False,
+    )
+    def test_google_calendar_connect_returns_auth_url(self):
+        profile = self._create_profile(
+            username="calendar-connect-user",
+            email="calendar-connect@example.com",
+            phone_number="+359888110002",
+            display_name="Calendar Connect User",
+        )
+
+        response = self.client.post(
+            "/api/accounts/integrations/google/calendar/connect/",
+            data=json.dumps({}),
+            content_type="application/json",
+            **self._auth_headers(profile.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("auth_url", payload)
+        self.assertIn("accounts.google.com", payload["auth_url"])
+        connection = GoogleCalendarConnection.objects.get(profile=profile)
+        self.assertTrue(connection.oauth_state)
+        self.assertFalse(connection.is_active)
+
+    @patch.dict(
+        os.environ,
+        {
+            "GOOGLE_OAUTH_CLIENT_ID": "client-id",
+            "GOOGLE_OAUTH_CLIENT_SECRET": "client-secret",
+            "GOOGLE_OAUTH_REDIRECT_URI": "http://localhost:8000/api/accounts/integrations/google/calendar/callback/",
+            "GOOGLE_TOKEN_ENCRYPTION_KEY": "test-google-token-secret",
+        },
+        clear=False,
+    )
+    @patch("apps.accounts.google_calendar_oauth_service.requests.get")
+    @patch("apps.accounts.google_calendar_oauth_service.requests.post")
+    def test_google_calendar_callback_persists_connection(
+        self,
+        mock_post,
+        mock_get,
+    ):
+        profile = self._create_profile(
+            username="calendar-callback-user",
+            email="calendar-callback@example.com",
+            phone_number="+359888110003",
+            display_name="Calendar Callback User",
+        )
+        connection = GoogleCalendarConnection.objects.create(
+            profile=profile,
+            oauth_state="state123",
+            is_active=False,
+        )
+
+        mock_post.return_value = SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "access_token": "access123",
+                "refresh_token": "refresh123",
+                "expires_in": 3600,
+                "scope": "openid email profile https://www.googleapis.com/auth/calendar.events",
+            },
+            text="{}",
+        )
+        mock_get.return_value = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"email": "user@gmail.com"},
+            text="{}",
+        )
+
+        response = self.client.get(
+            "/api/accounts/integrations/google/calendar/callback/?state=state123&code=code123"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        connection.refresh_from_db()
+        self.assertEqual(connection.google_email, "user@gmail.com")
+        self.assertTrue(connection.is_active)
+        self.assertEqual(connection.oauth_state, "")
+        self.assertTrue(connection.access_token.startswith("enc:"))
+        self.assertTrue(connection.refresh_token.startswith("enc:"))
+
+    def test_google_calendar_disconnect_clears_connection(self):
+        profile = self._create_profile(
+            username="calendar-disconnect-user",
+            email="calendar-disconnect@example.com",
+            phone_number="+359888110004",
+            display_name="Calendar Disconnect User",
+        )
+        GoogleCalendarConnection.objects.create(
+            profile=profile,
+            google_email="user@gmail.com",
+            access_token="enc:test",
+            refresh_token="enc:test2",
+            is_active=True,
+        )
+
+        response = self.client.post(
+            "/api/accounts/integrations/google/calendar/disconnect/",
+            data=json.dumps({}),
+            content_type="application/json",
+            **self._auth_headers(profile.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        connection = GoogleCalendarConnection.objects.get(profile=profile)
+        self.assertFalse(connection.is_active)
+        self.assertEqual(connection.access_token, "")
+        self.assertEqual(connection.refresh_token, "")
 
     @patch("apps.accounts.views.refresh_social_edge_for_friendship")
     def test_accepting_friend_request_unlocks_contact_details(self, mock_refresh_edge):

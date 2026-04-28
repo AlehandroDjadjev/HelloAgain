@@ -80,6 +80,7 @@ class AgentCommandSubmitSerializer(serializers.Serializer):
         required=False,
         default=list,
     )
+    context = serializers.JSONField(required=False, default=dict)
 
 
 class NavigationPrepareSerializer(serializers.Serializer):
@@ -260,6 +261,37 @@ class NavigationPrepareResponseSerializer(serializers.Serializer):
     intent = serializers.DictField()
     execution_ready = serializers.BooleanField()
     debug = serializers.DictField(required=False)
+
+
+class SessionTerminalResponseRequestSerializer(serializers.Serializer):
+    phase = serializers.ChoiceField(choices=["completed", "failed", "cancelled"])
+    error_message = serializers.CharField(required=False, allow_blank=True, default="")
+    current_reasoning = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class SessionTerminalResponseSerializer(serializers.Serializer):
+    phase = serializers.CharField()
+    message = serializers.CharField()
+    status_line = serializers.CharField()
+    allow_follow_up = serializers.BooleanField(default=True)
+    allow_return_to_app = serializers.BooleanField(default=True)
+
+
+class SessionPostTaskDecisionRequestSerializer(serializers.Serializer):
+    transcript = serializers.CharField(min_length=1)
+    phase = serializers.ChoiceField(choices=["completed", "failed", "cancelled"])
+    current_app_package = serializers.CharField(required=False, allow_blank=True, default="")
+    current_app_name = serializers.CharField(required=False, allow_blank=True, default="")
+    current_window_title = serializers.CharField(required=False, allow_blank=True, default="")
+    last_assistant_message = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class SessionPostTaskDecisionSerializer(serializers.Serializer):
+    decision = serializers.ChoiceField(
+        choices=["return_to_app", "continue_session", "ask_for_clarification"],
+    )
+    reply_message = serializers.CharField()
+    next_instruction = serializers.CharField(required=False, allow_blank=True, default="")
 
 
 # ---------------------------------------------------------------------------

@@ -360,6 +360,20 @@ class ValidationTests(SimpleTestCase):
         error = _validate_response(raw, _extract_refs(screen_state), screen_state)
         self.assertIn("element_ref", error or "")
 
+    def test_validate_response_rejects_horizontal_scroll_direction(self):
+        screen_state = _screen([_node("n1", "androidx.recyclerview.widget.RecyclerView", scrollable=True)])
+        raw = {
+            "action_type": "SCROLL",
+            "params": {"direction": "left"},
+            "reasoning": "Move left.",
+            "confidence": 0.7,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        error = _validate_response(raw, _extract_refs(screen_state), screen_state)
+        self.assertIn("params.direction", error or "")
+
     def test_validate_response_malformed_json(self):
         screen_state = _screen([_node("n1", "android.widget.Button", text="Go", clickable=True)])
         error = _validate_response("not-json", _extract_refs(screen_state), screen_state)

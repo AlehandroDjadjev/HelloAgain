@@ -5,8 +5,11 @@ from unittest.mock import patch
 from django.db import OperationalError
 from django.test import TestCase
 
+from apps.agent_core.llm_client import LLMError
 from apps.agent_plans.services.intent_service import IntentResult
 from apps.agent_sessions.models import SessionStatus
+from apps.agent_sessions.post_task_decision_service import PostTaskDecisionService
+from apps.agent_sessions.post_task_response_service import PostTaskResponseService
 from apps.agent_sessions.services import SessionService
 from apps.agent_sessions.views import _get_session
 
@@ -116,6 +119,52 @@ class AgentCommandViewTests(TestCase):
         self.assertEqual(session.reasoning_provider, "openai")
         self.assertEqual(session.status, SessionStatus.EXECUTING)
 
+    @patch("apps.agent_sessions.views.IntentService.parse_intent")
+    def test_phone_command_endpoint_keeps_vague_prompt_in_clarification_state(
+        self,
+        mock_parse_intent,
+    ):
+        mock_parse_intent.return_value = IntentResult(
+            goal="Send a message",
+            goal_type="send_message",
+            app_package="com.whatsapp",
+            target_app="WhatsApp",
+            entities={},
+            risk_level="high",
+            confidence=0.72,
+            ambiguity_flags=[],
+            needs_clarification=True,
+            missing_fields=["recipient", "message"],
+            clarification_question="Who should I message, and what should I say?",
+        )
+
+        response = self.client.post(
+            "/api/agent/phone-command/",
+            data={
+                "prompt": "Send a WhatsApp message",
+                "device_id": "pixel-1",
+                "input_mode": "text",
+                "reasoning_provider": "openai",
+                "supported_packages": ["com.whatsapp"],
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.json()
+        self.assertEqual(payload["session_status"], SessionStatus.PLANNING)
+        self.assertFalse(payload["execution_ready"])
+        self.assertTrue(payload["intent"]["needs_clarification"])
+        self.assertEqual(
+            payload["intent"]["clarification_question"],
+            "Who should I message, and what should I say?",
+        )
+
+        session = SessionService.get(payload["session_id"])
+        self.assertEqual(session.status, SessionStatus.PLANNING)
+        self.assertEqual(session.goal, "")
+        self.assertEqual(session.target_app, "")
+
     def test_navigation_prepare_endpoint_uses_deterministic_maps_flow(self):
         response = self.client.post(
             "/api/agent/navigation/prepare/",
@@ -145,149 +194,223 @@ class AgentCommandViewTests(TestCase):
         session = SessionService.get(payload["session_id"])
         self.assertEqual(session.reasoning_provider, "openai")
 
-
-class SessionUserInputViewTests(TestCase):
-    def _make_session_with_pending_query(self):
+    @patch("apps.agent_sessions.views.PostTaskResponseService.build_response")
+    def test_terminal_response_endpoint_returns_generated_message(
+        self,
+        mock_build_response,
+    ):
         session = SessionService.create(
-            user_id="clarification-test",
-            device_id="device-1",
-            transcript="Message Alex on WhatsApp",
+            user_id="view-test",
+            device_id="pixel-1",
+            transcript="Open Chrome",
             input_mode="text",
-            supported_packages=["com.whatsapp"],
+            reasoning_provider="openai",
+            supported_packages=["com.android.chrome"],
         )
         session.store_intent_data(
-            goal="Message Alex on WhatsApp",
-            target_app="com.whatsapp",
+            goal="Open Chrome",
+            target_app="com.android.chrome",
             entities={},
+            risk_level="low",
         )
-        session.status = SessionStatus.AWAITING_USER_INPUT
-        session.pending_user_input = {
-            "query_id": "query_abc",
-            "status": "pending",
-            "question": "Which Alex should I message? I see Alex Chen and Alex Johnson.",
-            "followup_question": "Which Alex should I message? I see Alex Chen and Alex Johnson.",
-            "attempt_count": 1,
-            "max_attempts": 3,
-            "required_fields": ["recipient"],
-            "candidates": ["Alex Chen", "Alex Johnson"],
-            "ui_context": {"candidates": ["Alex Chen", "Alex Johnson"]},
-            "reason": "multiple_visible_matches",
-            "last_user_reply": "",
-            "why_unresolved": "",
-            "fallback_mode": "",
-            "entity_updates": {},
+
+        mock_build_response.return_value = {
+            "phase": "completed",
+            "message": "Отворих Chrome. Можете да кажете нова команда или върни се.",
+            "status_line": "Отворих Chrome. Кажете нова команда или върни се.",
+            "allow_follow_up": True,
+            "allow_return_to_app": True,
         }
-        session.save(update_fields=["status", "pending_user_input", "updated_at"])
-        return session.id
-
-    def test_user_input_endpoint_resolves_and_merges_entities(self):
-        session_id = self._make_session_with_pending_query()
 
         response = self.client.post(
-            f"/api/agent/sessions/{session_id}/user-input/",
+            f"/api/agent/sessions/{session.id}/terminal-response/",
             data={
-                "query_id": "query_abc",
-                "transcript": "Alex Johnson",
+                "phase": "completed",
+                "error_message": "",
+                "current_reasoning": "Chrome is open.",
             },
             content_type="application/json",
         )
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["status"], "resolved")
-        self.assertTrue(payload["resolved"])
-        self.assertEqual(payload["entity_updates"]["recipient"], "Alex Johnson")
-        self.assertEqual(payload["resolved_values"]["recipient"], "Alex Johnson")
-        self.assertEqual(payload["missing_fields"], [])
-        self.assertEqual(payload["matched_candidate_id"], "candidate_2")
-        self.assertFalse(payload["should_fallback"])
+        self.assertEqual(payload["phase"], "completed")
+        self.assertIn("нова команда", payload["message"])
+        self.assertTrue(payload["allow_follow_up"])
+        self.assertTrue(payload["allow_return_to_app"])
+        mock_build_response.assert_called_once()
 
-        session = SessionService.get(session_id)
-        self.assertEqual(session.status, SessionStatus.EXECUTING)
-        self.assertEqual(session.entities["recipient"], "Alex Johnson")
-        self.assertEqual(session.pending_user_input, {})
-
-    def test_user_input_endpoint_returns_409_for_stale_query_id(self):
-        session_id = self._make_session_with_pending_query()
-
-        response = self.client.post(
-            f"/api/agent/sessions/{session_id}/user-input/",
-            data={
-                "query_id": "wrong_query",
-                "transcript": "Alex Johnson",
-            },
-            content_type="application/json",
+    @patch("apps.agent_sessions.views.PostTaskDecisionService.decide")
+    def test_post_task_decision_endpoint_returns_model_decision(
+        self,
+        mock_decide,
+    ):
+        session = SessionService.create(
+            user_id="view-test",
+            device_id="pixel-1",
+            transcript="Open Chrome",
+            input_mode="text",
+            reasoning_provider="openai",
+            supported_packages=["com.android.chrome"],
+        )
+        session.store_intent_data(
+            goal="Open Chrome",
+            target_app="com.android.chrome",
+            entities={},
+            risk_level="low",
         )
 
-        self.assertEqual(response.status_code, 409)
-
-    def test_user_input_endpoint_returns_409_when_session_is_not_awaiting_input(self):
-        session_id = self._make_session_with_pending_query()
-        session = SessionService.get(session_id)
-        session.status = SessionStatus.EXECUTING
-        session.save(update_fields=["status", "updated_at"])
+        mock_decide.return_value = {
+            "decision": "return_to_app",
+            "reply_message": "Разбрах. Връщам ви към основната страница на приложението.",
+            "next_instruction": "",
+        }
 
         response = self.client.post(
-            f"/api/agent/sessions/{session_id}/user-input/",
+            f"/api/agent/sessions/{session.id}/post-task-decision/",
             data={
-                "query_id": "query_abc",
-                "transcript": "Alex Johnson",
-            },
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, 409)
-
-    def test_user_input_endpoint_returns_retryable_followup(self):
-        session_id = self._make_session_with_pending_query()
-
-        response = self.client.post(
-            f"/api/agent/sessions/{session_id}/user-input/",
-            data={
-                "query_id": "query_abc",
-                "transcript": "Alex",
+                "transcript": "Готово, върни ме в приложението",
+                "phase": "completed",
+                "current_app_package": "com.android.chrome",
             },
             content_type="application/json",
         )
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
-        self.assertEqual(payload["status"], "needs_user_input")
-        self.assertFalse(payload["resolved"])
-        self.assertEqual(payload["attempt"], 2)
-        self.assertEqual(payload["missing_fields"], ["recipient"])
-        self.assertEqual(payload["reason_unresolved"], "multiple_matches")
-        self.assertFalse(payload["should_fallback"])
-        self.assertIn("Please choose exactly one", payload["followup_question"])
+        self.assertEqual(payload["decision"], "return_to_app")
+        self.assertIn("приложението", payload["reply_message"])
+        mock_decide.assert_called_once()
 
-        session = SessionService.get(session_id)
-        self.assertEqual(session.status, SessionStatus.AWAITING_USER_INPUT)
-        self.assertEqual(session.pending_user_input["attempt_count"], 2)
-        self.assertEqual(session.pending_user_input["followup_question"], payload["followup_question"])
 
-    def test_user_input_endpoint_falls_back_after_final_unresolved_attempt(self):
-        session_id = self._make_session_with_pending_query()
-        session = SessionService.get(session_id)
-        session.pending_user_input["attempt_count"] = 3
-        session.save(update_fields=["pending_user_input", "updated_at"])
+class PostTaskResponseServiceTests(TestCase):
+    def test_service_uses_openai_output_when_available(self):
+        class FakeClient:
+            def generate(self, **kwargs):
+                return {
+                    "phase": "failed",
+                    "message": "Не успях да изпратя съобщението до Иван. Можете да дадете нова команда или да кажете върни се.",
+                    "status_line": "Не успях да изпратя съобщението. Кажете нова команда или върни се.",
+                }
 
-        response = self.client.post(
-            f"/api/agent/sessions/{session_id}/user-input/",
-            data={
-                "query_id": "query_abc",
-                "transcript": "[silence]",
-            },
-            content_type="application/json",
+        session = SessionService.create(
+            user_id="service-test",
+            device_id="pixel-1",
+            transcript="Send Ivan a message",
+            input_mode="text",
+            reasoning_provider="openai",
+            supported_packages=["com.viber.voip"],
+        )
+        session.store_intent_data(
+            goal="Send Ivan a message",
+            target_app="com.viber.voip",
+            entities={"recipient": "Ivan"},
+            risk_level="high",
         )
 
-        self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        self.assertEqual(payload["status"], "manual_takeover")
-        self.assertFalse(payload["resolved"])
-        self.assertEqual(payload["reason_unresolved"], "empty_reply")
-        self.assertTrue(payload["should_fallback"])
-        self.assertEqual(payload["missing_fields"], ["recipient"])
+        payload = PostTaskResponseService(client=FakeClient()).build_response(
+            session=session,
+            phase="failed",
+            error_message="Target chat was not found",
+            current_reasoning="The user Ivan was not visible.",
+        )
 
-        session.refresh_from_db()
-        self.assertEqual(session.pending_user_input["status"], "fallback")
-        self.assertEqual(session.pending_user_input["reason_unresolved"], "empty_reply")
+        self.assertEqual(payload["phase"], "failed")
+        self.assertIn("Иван", payload["message"])
+        self.assertTrue(payload["allow_return_to_app"])
+
+    def test_service_falls_back_dynamically_when_openai_fails(self):
+        class FailingClient:
+            def generate(self, **kwargs):
+                raise LLMError("quota exceeded")
+
+        session = SessionService.create(
+            user_id="service-test",
+            device_id="pixel-1",
+            transcript="Open Viber",
+            input_mode="text",
+            reasoning_provider="openai",
+            supported_packages=["com.viber.voip"],
+        )
+        session.store_intent_data(
+            goal="Open Viber",
+            target_app="com.viber.voip",
+            entities={},
+            risk_level="low",
+        )
+
+        payload = PostTaskResponseService(client=FailingClient()).build_response(
+            session=session,
+            phase="completed",
+        )
+
+        self.assertEqual(payload["phase"], "completed")
+        self.assertIn("нова инструкция", payload["message"])
+        self.assertIn("основното приложение", payload["message"])
+
+
+class PostTaskDecisionServiceTests(TestCase):
+    def test_service_uses_openai_decision_when_available(self):
+        class FakeClient:
+            def generate(self, **kwargs):
+                return {
+                    "decision": "continue_session",
+                    "reply_message": "Разбрах. Продължавам с новата задача на телефона.",
+                    "next_instruction": "Превърти надолу и отвори първия резултат",
+                }
+
+        session = SessionService.create(
+            user_id="service-test",
+            device_id="pixel-1",
+            transcript="Search in Chrome",
+            input_mode="text",
+            reasoning_provider="openai",
+            supported_packages=["com.android.chrome"],
+        )
+        session.store_intent_data(
+            goal="Search in Chrome",
+            target_app="com.android.chrome",
+            entities={"query": "weather"},
+            risk_level="low",
+        )
+
+        payload = PostTaskDecisionService(client=FakeClient()).decide(
+            session=session,
+            transcript="Scroll and open the first result",
+            phase="completed",
+            current_app_package="com.android.chrome",
+            current_window_title="Search results",
+        )
+
+        self.assertEqual(payload["decision"], "continue_session")
+        self.assertIn("Продължавам", payload["reply_message"])
+        self.assertIn("Превърти", payload["next_instruction"])
+
+    def test_service_falls_back_to_clarification_when_openai_fails(self):
+        class FailingClient:
+            def generate(self, **kwargs):
+                raise LLMError("quota exceeded")
+
+        session = SessionService.create(
+            user_id="service-test",
+            device_id="pixel-1",
+            transcript="Open Viber",
+            input_mode="text",
+            reasoning_provider="openai",
+            supported_packages=["com.viber.voip"],
+        )
+        session.store_intent_data(
+            goal="Open Viber",
+            target_app="com.viber.voip",
+            entities={},
+            risk_level="low",
+        )
+
+        payload = PostTaskDecisionService(client=FailingClient()).decide(
+            session=session,
+            transcript="Take me back now",
+            phase="completed",
+        )
+
+        self.assertEqual(payload["decision"], "ask_for_clarification")
+        self.assertTrue(payload["reply_message"])

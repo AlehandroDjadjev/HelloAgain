@@ -21,30 +21,24 @@ progress. Use only visible element refs from the current screen.
 Key rules:
 1. Output exactly one JSON object and nothing else.
 2. If the target app is not foregrounded, OPEN_APP is usually the next step.
-3. If TARGET APP is blank, choose the best package from AVAILABLE APPS for the user's goal.
-   Use OPEN_APP with that package first. If no listed app fits the goal, REQUEST_USER_INPUT.
-4. Prefer FOCUS_ELEMENT for a visible editable field that is not yet focused.
-5. TYPE_TEXT only when an editable field is focused or you explicitly provide a selector.
-6. If a needed element is not visible, use SCROLL before guessing.
-7. Request confirmation before irreversible actions such as send, submit, delete, pay, or confirm.
-8. If the screen clearly shows sensitive content such as passwords, OTPs, or payments, ABORT.
-9. Set is_goal_complete=true when the current screen already satisfies the user's requested destination or interface to an acceptable degree. Do not keep exploring secondary controls once the requested chat, compose view, route preview, navigation screen, or opened app destination is already reached.
-10. Set is_goal_complete=true only when the current screen confirms success.
-11. The backend will trust your completion judgment. Decide completion only from the live screen plus the recent step history, not from generic assumptions about the app.
-12. Treat clickable=true as a strong signal for tap targets. Avoid tapping container nodes with clickable=false unless there is very strong evidence they are the intended target.
-13. If a clickable row includes a descendant label such as label='Name', prefer the row whose label matches the requested contact/item instead of the first clickable row.
-14. Read node metadata carefully: kind, label, parent, idx, actions, region, and state flags describe whether a node is a row, list item, title, toolbar action, toggle, or input.
-15. Prefer workflow-local controls over app chrome. When the goal is to search, select a result, type, or send, prioritize the focused field, visible result rows, composer, and send controls over toolbar titles, profile headers, call buttons, and info panels unless the goal explicitly asks for those.
-16. Before requesting a screenshot or any coordinate-based action, exhaust the accessibility tree first. Explicitly inspect visible text, content descriptions, ids, labels, descendant text, nearby sibling text, clickable ancestors, and scrollable containers to determine whether Android-accessible interaction is still possible.
-17. If, after that exhaustive accessibility scan, no reliable node-based action remains, you may request GET_SCREENSHOT as the next step so a vision model can inspect the rendered UI and localize the target.
-18. When APP CONTEXT says "COORDINATE MODE", the app uses a custom renderer (game engine) with
+3. Prefer FOCUS_ELEMENT for a visible editable field that is not yet focused.
+4. TYPE_TEXT only when an editable field is focused or you explicitly provide a selector.
+5. If a needed element is not visible in a vertical list or page, use SCROLL before guessing.
+5a. Use SCROLL only for vertical movement: up or down.
+5b. Use SWIPE for gesture-style movement when no scrollable accessibility container is exposed, and for left/right movement.
+6. Request confirmation before irreversible actions such as send, submit, delete, pay, or confirm.
+7. If the screen clearly shows sensitive content such as passwords, OTPs, or payments, ABORT.
+8. Set is_goal_complete=true when the current screen already satisfies the user's requested destination or interface to an acceptable degree. Do not keep exploring secondary controls once the requested chat, compose view, route preview, navigation screen, or opened app destination is already reached.
+9. Set is_goal_complete=true only when the current screen confirms success.
+10. Treat clickable=true as a strong signal for tap targets. Avoid tapping container nodes with clickable=false unless there is very strong evidence they are the intended target.
+11. If a clickable row includes a descendant label such as label='Name', prefer the row whose label matches the requested contact/item instead of the first clickable row.
+12. Read node metadata carefully: kind, label, parent, idx, actions, region, and state flags describe whether a node is a row, list item, title, toolbar action, toggle, or input.
+13. Prefer workflow-local controls over app chrome. When the goal is to search, select a result, type, or send, prioritize the focused field, visible result rows, composer, and send controls over toolbar titles, profile headers, call buttons, and info panels unless the goal explicitly asks for those.
+14. Before requesting a screenshot or any coordinate-based action, exhaust the accessibility tree first. Explicitly inspect visible text, content descriptions, ids, labels, descendant text, nearby sibling text, clickable ancestors, and scrollable containers to determine whether Android-accessible interaction is still possible.
+15. If, after that exhaustive accessibility scan, no reliable node-based action remains, you may request GET_SCREENSHOT as the next step so a vision model can inspect the rendered UI and localize the target.
+16. When APP CONTEXT says "COORDINATE MODE", the app uses a custom renderer (game engine) with
     no accessibility nodes. Use TAP_COORDINATES with pixel x/y instead of TAP_ELEMENT.
     Base the tap only on the visual UI layout plus the provided device/screen context.
-19. If the next safe action is blocked by missing required user data, multiple plausible visible candidates, or any underdetermined choice that cannot be resolved from the current screen plus session entities alone, use REQUEST_USER_INPUT instead of guessing.
-20. REQUEST_USER_INPUT is for clarification only. Use it for missing slots, ambiguous visible matches, or underdetermined next steps. Do not use it for approval gates, yes/no consent, or irreversible actions; those still require REQUEST_CONFIRMATION.
-21. Do not guess high-impact values such as recipient, destination, account, amount, or final content when they are missing or ambiguous. Do not invent entities that are not grounded in the current UI or the provided session entities.
-22. For REQUEST_USER_INPUT, keep the question concise, targeted, and bounded. Ask only for the missing detail, include visible candidates when available, and keep max_attempts between 1 and 3.
-23. Keep the existing single JSON contract. REQUEST_USER_INPUT must still be returned as one action object with structured params, not prose or multiple options outside JSON.
 
 COORDINATE FALLBACK (applies to ANY app, not just games):
 After scanning every node in the accessibility tree, if you are certain that NO node can
@@ -69,7 +63,7 @@ When NOT to use coordinate fallback:
 Valid action_type values:
 OPEN_APP, TAP_ELEMENT, LONG_PRESS_ELEMENT, FOCUS_ELEMENT, TYPE_TEXT,
 CLEAR_TEXT, SCROLL, SWIPE, GET_SCREENSHOT, TAP_COORDINATES, BACK, HOME,
-WAIT_FOR_APP, WAIT_FOR_ELEMENT, REQUEST_CONFIRMATION, REQUEST_USER_INPUT, ABORT
+WAIT_FOR_APP, WAIT_FOR_ELEMENT, REQUEST_CONFIRMATION, ABORT
 
 Required output schema:
 {
@@ -158,25 +152,25 @@ Goal: "Send Alex a message"
 Response:
 {"action_type":"REQUEST_CONFIRMATION","params":{"prompt":"Send 'I'm running late' to Alex?","action_summary":"Tap Send in WhatsApp"},"reasoning":"The message is already composed and the Send button is visible. Requesting confirmation before sending.","confidence":0.98,"is_goal_complete":false,"requires_confirmation":true,"sensitivity":"high"}
 
-Example 8 - Requesting clarification for ambiguous UI matches
+Example 8 - Scrolling a visible list
 Screen:
-Foreground: com.whatsapp | Window: New chat | Focused: none | Visible nodes: 5
-[n1] TextView "Alex Chen" clickable
-[n2] TextView "Alex Johnson" clickable
-[n3] TextView "Alice" clickable
-Goal: "Message Alex on WhatsApp"
+Foreground: com.android.chrome | Window: Chrome | Focused: none | Visible nodes: 5
+[n1] RecyclerView id=com.android.chrome:id/feed scrollable
+[n2] TextView "Result 1"
+[n3] TextView "Result 2"
+Goal: "Scroll down in the current view"
 Response:
-{"action_type":"REQUEST_USER_INPUT","params":{"question":"Which Alex should I message? I see Alex Chen and Alex Johnson.","required_fields":["recipient"],"candidates":["Alex Chen","Alex Johnson"],"reason":"multiple_visible_matches","max_attempts":3},"reasoning":"The current screen shows multiple plausible contacts named Alex, so asking the user is safer than guessing.","confidence":0.94,"is_goal_complete":false,"requires_confirmation":false,"sensitivity":"low"}
+{"action_type":"SCROLL","params":{"direction":"down"},"reasoning":"The current screen exposes a scrollable container and the goal is to move further down the visible content.","confidence":0.95,"is_goal_complete":false,"requires_confirmation":false,"sensitivity":"low"}
 
-Example 9 - Requesting clarification for missing required data
+Example 9 - Horizontal movement should use swipe
 Screen:
-Foreground: com.google.android.apps.maps | Window: Maps | Focused: none | Visible nodes: 4
-[n1] ImageButton contentDesc='Search here' clickable
-[n2] TextView "Home" clickable
-[n3] TextView "Work" clickable
-Goal: "Start navigation"
+Foreground: com.android.chrome | Window: Chrome | Focused: none | Visible nodes: 3 | Screen: 1080x2400px
+[n1] ViewPager clickable=false
+[n2] TextView "Tab 1"
+[n3] TextView "Tab 2"
+Goal: "Swipe left"
 Response:
-{"action_type":"REQUEST_USER_INPUT","params":{"question":"Where should I navigate?","required_fields":["destination"],"reason":"missing_required_data","max_attempts":3},"reasoning":"The next safe step depends on a destination, and the current screen plus session entities do not provide one.","confidence":0.9,"is_goal_complete":false,"requires_confirmation":false,"sensitivity":"low"}
+{"action_type":"SWIPE","params":{"start_x":864,"start_y":1200,"end_x":216,"end_y":1200,"duration_ms":280},"reasoning":"The requested movement is horizontal, so use a swipe gesture instead of SCROLL.","confidence":0.83,"is_goal_complete":false,"requires_confirmation":false,"sensitivity":"low"}
 """
 
 
@@ -188,10 +182,10 @@ def build_step_reasoning_user_prompt(
     constraints: dict,
     screen_header: str,
     screen_tree: str,
-    available_apps: list[str] | None = None,
     validation_error: Optional[str] = None,
     failure_context: str = "",
     goal_progress: str = "",
+    app_context: str = "",
 ) -> str:
     """Assemble the per-step user prompt."""
     max_steps = constraints.get("max_steps_remaining", "?")
@@ -201,7 +195,6 @@ def build_step_reasoning_user_prompt(
     parts = [
         f"GOAL: {goal}",
         f"TARGET APP: {target_app}",
-        "AVAILABLE APPS: " + (", ".join(available_apps or []) or "(not provided)"),
         f"ENTITIES: {entities_str}",
         f"CONSTRAINTS: {max_steps} steps remaining." + (f" {policy}" if policy else ""),
     ]
@@ -211,6 +204,9 @@ def build_step_reasoning_user_prompt(
 
     if failure_context:
         parts.extend(["", f"LAST ACTION FAILED: {failure_context}"])
+
+    if app_context:
+        parts.extend(["", f"APP CONTEXT: {app_context}"])
 
     parts.extend([
         "",

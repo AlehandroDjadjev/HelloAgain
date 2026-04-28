@@ -117,6 +117,17 @@ DEMO_USERS = [
     },
 ]
 
+SOFIA_TEST_LOCATIONS = [
+    (42.6977, 23.3219),
+    (42.7049, 23.3547),
+    (42.6816, 23.2994),
+    (42.6652, 23.2805),
+    (42.7111, 23.2475),
+    (42.6464, 23.3958),
+    (42.6935, 23.3338),
+    (42.6769, 23.3642),
+]
+
 
 class Command(BaseCommand):
     help = "Seeds the account system with 20 hardcoded example users for matching demos."
@@ -126,9 +137,12 @@ class Command(BaseCommand):
         created = 0
         updated = 0
 
-        for entry in DEMO_USERS:
+        seeded_accounts = []
+
+        for index, entry in enumerate(DEMO_USERS):
             phone_number = entry["phone"]
             normalized_phone = normalize_phone_number(phone_number)
+            home_lat, home_lng = SOFIA_TEST_LOCATIONS[index % len(SOFIA_TEST_LOCATIONS)]
             profile = (
                 AccountProfile.objects.select_related("user")
                 .filter(normalized_phone_number=normalized_phone)
@@ -155,6 +169,8 @@ class Command(BaseCommand):
                     contacts_permission_granted=True,
                     share_phone_with_friends=True,
                     share_email_with_friends=False,
+                    home_lat=home_lat,
+                    home_lng=home_lng,
                 )
                 created += 1
             else:
@@ -169,6 +185,8 @@ class Command(BaseCommand):
                 profile.contacts_permission_granted = True
                 profile.share_phone_with_friends = True
                 profile.share_email_with_friends = False
+                profile.home_lat = home_lat
+                profile.home_lng = home_lng
                 profile.save(
                     update_fields=[
                         "display_name",
@@ -182,11 +200,14 @@ class Command(BaseCommand):
                         "contacts_permission_granted",
                         "share_phone_with_friends",
                         "share_email_with_friends",
+                        "home_lat",
+                        "home_lng",
                     ]
                 )
                 updated += 1
 
             sync_profile_to_recommendations(profile, preserve_adaptation=False)
+            seeded_accounts.append((entry["name"], phone_number, entry["description"]))
 
         for profile in AccountProfile.objects.select_related("user", "elder_profile").all():
             sync_profile_to_recommendations(profile, preserve_adaptation=True)
@@ -197,3 +218,5 @@ class Command(BaseCommand):
                 f"Seeded demo users successfully. Created: {created}. Updated: {updated}."
             )
         )
+        for name, phone_number, description in seeded_accounts:
+            self.stdout.write(f"{name} | {phone_number} | {description}")

@@ -9,7 +9,7 @@
       "name": "update_profile",
       "method": "POST", 
       "path": "/api/accounts/agent/profile/update/",
-      "description": "Use this when the user reveals durable facts or preferences about themselves and their social profile should be updated before future matching. Not emotion related jsut flat facts",
+      "description": "Use this when the user reveals durable facts or preferences about themselves and their social profile should be updated before future matching. This is for flat profile facts, not emotions.",
       "body_schema": {
         "user_id": "string",
         "prompt": "string",

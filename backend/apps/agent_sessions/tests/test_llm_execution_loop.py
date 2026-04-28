@@ -49,6 +49,7 @@ def _node(
     clickable: bool = False,
     editable: bool = False,
     focused: bool = False,
+    scrollable: bool = False,
 ) -> dict:
     return {
         "ref": ref,
@@ -58,6 +59,7 @@ def _node(
         "clickable": clickable,
         "editable": editable,
         "focused": focused,
+        "scrollable": scrollable,
         "enabled": True,
         "bounds": {"left": 0, "top": 0, "right": 100, "bottom": 50},
         "children": [],
@@ -181,6 +183,50 @@ class LLMExecutionLoopTests(TestCase):
 
         self.assertEqual(response.status, "complete")
         self.assertEqual(response.reason, "Session is already complete.")
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_explicit_scroll_goal_dispatches_scroll_without_llm(self, mock_from_reasoning_provider):
+        session = self._make_session("Scroll down in the current view", "com.android.chrome")
+        session.entities = {"direction": "down"}
+        session.save(update_fields=["entities", "updated_at"])
+
+        response = ExecutionService.get_next_action(
+            session,
+            plan=None,
+            screen_state=_screen(
+                "com.android.chrome",
+                "Chrome",
+                "results",
+                [_node("list", "androidx.recyclerview.widget.RecyclerView", scrollable=True)],
+            ),
+        )
+
+        self.assertEqual(response.status, "execute")
+        self.assertEqual(response.next_action["type"], "SCROLL")
+        self.assertEqual(response.next_action["params"]["direction"], "down")
+        mock_from_reasoning_provider.assert_not_called()
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_reasoning_provider")
+    def test_explicit_horizontal_scroll_goal_dispatches_swipe_without_llm(self, mock_from_reasoning_provider):
+        session = self._make_session("Swipe left", "com.android.chrome")
+        session.entities = {"direction": "left"}
+        session.save(update_fields=["entities", "updated_at"])
+
+        response = ExecutionService.get_next_action(
+            session,
+            plan=None,
+            screen_state=_screen(
+                "com.android.chrome",
+                "Chrome",
+                "gallery",
+                [_node("pager", "androidx.viewpager.widget.ViewPager")],
+            ),
+        )
+
+        self.assertEqual(response.status, "execute")
+        self.assertEqual(response.next_action["type"], "SWIPE")
+        self.assertGreater(response.next_action["params"]["start_x"], response.next_action["params"]["end_x"])
+        mock_from_reasoning_provider.assert_not_called()
 
     def test_decide_after_result_returns_complete_for_completed_session(self):
         session = self._make_session("Open Chrome", "com.android.chrome")

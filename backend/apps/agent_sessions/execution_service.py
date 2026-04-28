@@ -45,7 +45,6 @@ from apps.agent_core.enums import ActionErrorCode, ActionResultStatus, ActionSen
 from apps.audit_log.models import AuditActor, AuditEventType
 from apps.audit_log.services import AuditService
 
-from apps.agent_core.services.screen_formatter import summarize_screen_for_history
 from apps.agent_core.services.step_reasoning import StepReasoningService
 from apps.agent_core.services.vision_reasoning import VisionReasoningService, VisionTapTarget
 from apps.agent_policy.models import UserAutomationPolicy
@@ -53,7 +52,6 @@ from apps.agent_policy.services import PolicyEnforcer
 from apps.agent_plans.services import PlanService
 from apps.device_bridge.services import pop_screenshot
 
-from .clarification_service import ClarificationService
 from .models import AgentSession, ConfirmationRecord, SessionStatus
 from .services import SessionService
 
@@ -142,7 +140,6 @@ class NextActionResponse:
     status:
       "execute"         → run next_action on device now
       "confirm"         → show confirmation dialog
-      "needs_user_input"→ pause and ask a clarification question
       "retry"           → wait and call get_next_action again
       "complete"        → goal achieved; session finished
       "abort"           → fatal error; stop and report
@@ -301,29 +298,6 @@ class ExecutionService:
                 reason=f"Pending confirmation for step '{pending_conf.step_id}'.",
             )
 
-        # ── Pending clarification gate ─────────────────────────────────────────
-        pending_user_input = dict(session.pending_user_input or {})
-        if pending_user_input.get("query_id"):
-            if pending_user_input.get("status") == "fallback":
-                return NextActionResponse(
-                    None,
-                    "manual_takeover",
-                    "",
-                    (
-                        f"Clarification fallback: "
-                        f"{pending_user_input.get('why_unresolved') or 'manual takeover required'}."
-                    ),
-                )
-            return NextActionResponse(
-                next_action=_build_user_input_action(
-                    query_id=str(pending_user_input.get("query_id") or ""),
-                    pending_query=pending_user_input,
-                ),
-                status="needs_user_input",
-                executor_hint="",
-                reason=f"Pending user input for query '{pending_user_input.get('query_id', '')}'.",
-            )
-
         # ── Sensitive screen (always abort regardless of mode) ─────────────────
         if (
             screen_state
@@ -360,7 +334,6 @@ class ExecutionService:
         reasoning: str = "",
         screen_hash_before: str = "",
         screen_hash_after: str = "",
-        screen_state_after: Optional[dict] = None,
     ) -> ExecutionDecision:
         """
         Process an action result and return the next instruction.
@@ -401,7 +374,6 @@ class ExecutionService:
                 "result_success":    result_success,
                 "screen_hash_before": screen_hash_before,
                 "screen_hash_after":  screen_hash_after,
-                "screen_summary_after": summarize_screen_for_history(screen_state_after),
             })
 
         # ── Audit log ──────────────────────────────────────────────────────────
@@ -708,13 +680,6 @@ def _dispatch_vision_step(
 
 # ── LLM-mode execution path ────────────────────────────────────────────────────
 
-def _package_from_reasoned_open_app(reasoned: "ReasonedStep") -> str:
-    if reasoned.action_type != ActionType.OPEN_APP.value:
-        return ""
-    params = reasoned.params or {}
-    return str(params.get("package_name") or params.get("package") or "").strip()
-
-
 def _get_next_action_llm(
     session: AgentSession,
     screen_state: dict,
@@ -822,23 +787,26 @@ def _get_next_action_llm(
                 ),
             )
 
-    svc = StepReasoningService(reasoning_provider=session.reasoning_provider)
+    assisted_step = _maybe_build_scroll_assist(session, screen_state)
+    if assisted_step is not None:
+        reasoned = assisted_step
+    else:
+        svc = StepReasoningService(reasoning_provider=session.reasoning_provider)
 
-    constraints = {
-        "max_steps_remaining": MAX_STEPS_PER_SESSION - session.current_step_index,
-        "policy_notes": f"risk_level={session.risk_level}",
-        "available_apps": list(session.supported_packages or []),
-    }
+        constraints = {
+            "max_steps_remaining": MAX_STEPS_PER_SESSION - session.current_step_index,
+            "policy_notes": f"risk_level={session.risk_level}",
+        }
 
-    reasoned = svc.reason_next_step(
-        goal=session.goal,
-        target_app=session.target_app,
-        entities=session.entities or {},
-        screen_state=screen_state,
-        step_history=list(session.step_history or []),
-        constraints=constraints,
-        session=session,
-    )
+        reasoned = svc.reason_next_step(
+            goal=session.goal,
+            target_app=session.target_app,
+            entities=session.entities or {},
+            screen_state=screen_state,
+            step_history=session.get_recent_steps(10),
+            constraints=constraints,
+            session=session,
+        )
     if reasoned.fallback_mode == "manual_takeover":
         AuditService.record(
             session=session,
@@ -859,13 +827,11 @@ def _get_next_action_llm(
             confidence=reasoned.confidence,
         )
 
-    inferred_target_app = _package_from_reasoned_open_app(reasoned)
-    effective_target_app = session.target_app or inferred_target_app
     user_policy = _resolve_user_policy(session)
     policy_result = PolicyEnforcer.check_step(
         step=reasoned,
         session_goal=session.goal,
-        target_package=effective_target_app,
+        target_package=session.target_app,
         user_policy=user_policy,
         step_count=session.get_step_count(),
         screen_state=screen_state,
@@ -920,23 +886,18 @@ def _get_next_action_llm(
         return NextActionResponse(
             None,
             "abort",
-            effective_target_app,
+            session.target_app,
             blocked_reason,
             reasoning=reasoned.reasoning,
             confidence=reasoned.confidence,
         )
 
     # ── LLM chose ABORT ───────────────────────────────────────────────────────
-    if inferred_target_app and not session.target_app:
-        session.target_app = inferred_target_app
-        session.save(update_fields=["target_app", "updated_at"])
-        effective_target_app = inferred_target_app
-
     if reasoned.action_type == ActionType.ABORT.value:
         reason_text = reasoned.params.get("reason", "llm_abort")
         _abort_session(session, None, "llm_abort", reason_text)
         return NextActionResponse(
-            None, "abort", effective_target_app, reason_text,
+            None, "abort", session.target_app, reason_text,
             reasoning=reasoned.reasoning,
         )
 
@@ -960,28 +921,8 @@ def _get_next_action_llm(
         return NextActionResponse(
             next_action=confirmation_action,
             status="confirm",
-            executor_hint=effective_target_app,
+            executor_hint=session.target_app,
             reason="Confirmation required before continuing.",
-            reasoning=reasoned.reasoning,
-            confidence=reasoned.confidence,
-        )
-
-    # ── LLM chose REQUEST_USER_INPUT ───────────────────────────────────────────
-    if reasoned.action_type == ActionType.REQUEST_USER_INPUT.value:
-        pending_query = ClarificationService.create_pending_query(
-            session=session,
-            params=reasoned.params,
-            screen_state=screen_state,
-            reasoning=reasoned.reasoning,
-        )
-        return NextActionResponse(
-            next_action=_build_user_input_action(
-                query_id=pending_query["query_id"],
-                pending_query=pending_query,
-            ),
-            status="needs_user_input",
-            executor_hint=effective_target_app,
-            reason="User input is required before continuing.",
             reasoning=reasoned.reasoning,
             confidence=reasoned.confidence,
         )
@@ -991,7 +932,7 @@ def _get_next_action_llm(
         reasoned,
         action_id=action_id,
         screen_state=screen_state,
-        target_app=effective_target_app or "",
+        target_app=session.target_app or "",
     )
     _log_llm_dispatch_block(
         session=session,
@@ -1020,7 +961,7 @@ def _get_next_action_llm(
     return NextActionResponse(
         next_action=next_action,
         status="execute",
-        executor_hint=effective_target_app,
+        executor_hint=session.target_app,
         reason="",
         reasoning=reasoned.reasoning,
         confidence=reasoned.confidence,
@@ -1144,6 +1085,137 @@ def _build_action_from_reasoned(
     }
 
 
+def _maybe_build_scroll_assist(
+    session: AgentSession,
+    screen_state: dict,
+) -> "Optional[ReasonedStep]":
+    from apps.agent_core.services.step_reasoning import ReasonedStep
+
+    entities = session.entities or {}
+    direction = str(entities.get("direction") or "").strip().lower()
+    if direction not in {"up", "down", "left", "right"}:
+        return None
+    if session.current_step_index > 0:
+        return None
+    if not _looks_like_scroll_request(session):
+        return None
+
+    foreground_package = str(screen_state.get("foreground_package") or "").strip()
+    if session.target_app and foreground_package and foreground_package != session.target_app:
+        return None
+
+    if direction in {"up", "down"} and _screen_has_scrollable_node(screen_state):
+        return ReasonedStep(
+            action_type=ActionType.SCROLL.value,
+            params={"direction": direction},
+            reasoning=(
+                "The goal is an explicit vertical scroll and the current screen "
+                "already exposes a scrollable container, so dispatch SCROLL directly."
+            ),
+            confidence=0.97,
+            is_goal_complete=False,
+            requires_confirmation=False,
+            sensitivity=ActionSensitivity.LOW.value,
+            source="scroll_assist",
+        )
+
+    return ReasonedStep(
+        action_type=ActionType.SWIPE.value,
+        params=_swipe_params_for_direction(screen_state, direction),
+        reasoning=(
+            "The goal is an explicit scroll/swipe request, but no matching vertical "
+            "SCROLL action is available for this screen shape, so use a direct swipe gesture."
+        ),
+        confidence=0.9,
+        is_goal_complete=False,
+        requires_confirmation=False,
+        sensitivity=ActionSensitivity.LOW.value,
+        source="scroll_assist",
+    )
+
+
+def _looks_like_scroll_request(session: AgentSession) -> bool:
+    haystacks = [
+        str(session.goal or "").casefold(),
+        str(session.transcript or "").casefold(),
+    ]
+    markers = (
+        "scroll",
+        "swipe",
+        "current view",
+        "превърти",
+        "скрол",
+        "надолу",
+        "нагоре",
+        "наляво",
+        "надясно",
+    )
+    return any(marker in text for text in haystacks for marker in markers)
+
+
+def _screen_has_scrollable_node(screen_state: dict) -> bool:
+    return any(
+        isinstance(node, dict) and bool(node.get("scrollable"))
+        for node in (screen_state.get("nodes") or [])
+    )
+
+
+def _swipe_params_for_direction(screen_state: dict, direction: str) -> dict:
+    width, height = _screen_dimensions(screen_state)
+    center_x = width // 2
+    center_y = height // 2
+    left = max(1, int(width * 0.2))
+    right = max(left + 1, int(width * 0.8))
+    upper = max(1, int(height * 0.3))
+    lower = max(upper + 1, int(height * 0.75))
+
+    if direction == "up":
+        return {
+            "start_x": center_x,
+            "start_y": upper,
+            "end_x": center_x,
+            "end_y": lower,
+            "duration_ms": 280,
+        }
+    if direction == "left":
+        return {
+            "start_x": right,
+            "start_y": center_y,
+            "end_x": left,
+            "end_y": center_y,
+            "duration_ms": 280,
+        }
+    if direction == "right":
+        return {
+            "start_x": left,
+            "start_y": center_y,
+            "end_x": right,
+            "end_y": center_y,
+            "duration_ms": 280,
+        }
+    return {
+        "start_x": center_x,
+        "start_y": lower,
+        "end_x": center_x,
+        "end_y": upper,
+        "duration_ms": 280,
+    }
+
+
+def _screen_dimensions(screen_state: dict) -> tuple[int, int]:
+    max_right = 0
+    max_bottom = 0
+    for node in (screen_state.get("nodes") or []):
+        if not isinstance(node, dict):
+            continue
+        bounds = node.get("bounds") or {}
+        if not isinstance(bounds, dict):
+            continue
+        max_right = max(max_right, int(bounds.get("right", 0) or 0))
+        max_bottom = max(max_bottom, int(bounds.get("bottom", 0) or 0))
+    return (max(max_right, 1080), max(max_bottom, 1920))
+
+
 def _create_llm_confirmation(
     session: AgentSession,
     step_id: str,
@@ -1179,27 +1251,6 @@ def _build_confirmation_action(action_id: str, reasoned: "ReasonedStep") -> dict
         "params": params,
         "sensitivity": reasoned.sensitivity,
         "requires_confirmation": True,
-        "timeout_ms": 0,
-        "retry_policy": {"max_attempts": 1, "backoff_ms": 0},
-    }
-
-
-def _build_user_input_action(*, query_id: str, pending_query: dict) -> dict:
-    return {
-        "id": query_id,
-        "type": ActionType.REQUEST_USER_INPUT.value,
-        "params": {
-            "query_id": query_id,
-            "question": pending_query.get("followup_question") or pending_query.get("question", ""),
-            "required_fields": pending_query.get("required_fields") or [],
-            "candidates": pending_query.get("candidates") or [],
-            "reason": pending_query.get("reason") or "",
-            "max_attempts": int(pending_query.get("max_attempts") or 3),
-            "attempt": int(pending_query.get("attempt_count") or 1),
-            "why_unresolved": pending_query.get("why_unresolved") or "",
-        },
-        "sensitivity": ActionSensitivity.LOW.value,
-        "requires_confirmation": False,
         "timeout_ms": 0,
         "retry_policy": {"max_attempts": 1, "backoff_ms": 0},
     }

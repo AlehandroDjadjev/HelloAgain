@@ -3,12 +3,10 @@ import 'dart:convert';
 
 import 'package:android_control_plugin/android_control_plugin.dart';
 import 'package:flutter/material.dart';
-import 'package:permission_handler/permission_handler.dart';
 
 import '../api/agent_client.dart';
 import '../api/voice_gateway_client.dart';
 import '../config/backend_base_url.dart';
-import '../native/mic_bridge_client.dart';
 import '../pipeline/orchestrator.dart';
 import '../pipeline/pipeline_state.dart';
 import '../services/navigation_overlay_service.dart';
@@ -32,22 +30,31 @@ class NavigationLauncherScreen extends StatefulWidget {
 class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     with WidgetsBindingObserver {
   static const _reasoningProvider = 'openai';
+  static const _voiceLanguage = 'bg-BG';
 
   late final TextEditingController _promptController;
   late final PipelineOrchestrator _orch;
   late final AgentVoiceController _voiceController;
-  late final MicBridgeClient _micBridgeClient;
   final _overlayService = const NavigationOverlayService();
+  final _deviceGateway = const DeviceControlChannel();
   bool _showDebug = false;
   bool _accessibilityPermissionMissing = false;
-  bool _microphonePermissionMissing = false;
   bool _overlayPermissionMissing = false;
   bool _awaitingAccessibilityPermissionReturn = false;
   bool _awaitingOverlayPermissionReturn = false;
+  bool _voiceStarting = false;
   bool _overlayVisible = false;
   bool _completionHandled = false;
   bool _bringingAppToFront = false;
-  bool _pendingReturnToHome = false;
+  bool _awaitingClarificationResponse = false;
+  bool _awaitingPostCompletionInstruction = false;
+  String? _pendingClarificationPrompt;
+  String? _pendingClarificationQuestion;
+  PipelinePhase? _postTaskPhase;
+  String? _postTaskStatusMessage;
+  String? _lastTerminalMessage;
+  String _lastSubmittedPrompt = '';
+  String? _voiceError;
   PipelinePhase _lastObservedPhase = PipelinePhase.idle;
 
   @override
@@ -59,20 +66,19 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
           ? widget.initialPrompt!.trim()
           : '',
     );
-    _micBridgeClient = MicBridgeClient(
-      baseUrl: resolveBackendBaseUrl(),
-      language: 'bg-BG',
-    );
     _orch = PipelineOrchestrator(
       client: AgentClient(baseUrl: resolveBackendBaseUrl()),
-      micBridgeClient: _micBridgeClient,
     )..addListener(_onOrchestratorChanged);
     _voiceController = AgentVoiceController(
       client: VoiceGatewayClient(baseUrl: resolveBackendBaseUrl()),
-      onTranscript: (_) async {},
-      language: 'bg-BG',
-    );
+      onTranscript: _handleVoiceTranscript,
+      language: _voiceLanguage,
+    )..addListener(_onVoiceControllerChanged);
     unawaited(_refreshPermissionState());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(_ensureHandsFreeVoiceReady());
+    });
 
     if (widget.autoRunOnOpen) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -86,36 +92,37 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _orch.removeListener(_onOrchestratorChanged);
-    unawaited(_orch.stopMicBridgeService());
-    unawaited(_micBridgeClient.dispose());
-    unawaited(_overlayService.hide());
+    _voiceController.removeListener(_onVoiceControllerChanged);
+    unawaited(_voiceController.stop());
     _voiceController.dispose();
+    unawaited(_overlayService.hide());
     _promptController.dispose();
     super.dispose();
   }
 
   void _onOrchestratorChanged() {
     if (!mounted) return;
-    _syncVoiceSessionContext();
     if (_orch.phase != _lastObservedPhase) {
       _lastObservedPhase = _orch.phase;
       unawaited(_syncNavigationOverlay());
-      if (_orch.phase == PipelinePhase.completed && !_completionHandled) {
-        _pendingReturnToHome = true;
-        unawaited(_finishCompletedFlow());
+      if (_isTerminalPhase(_orch.phase) && !_completionHandled) {
+        _completionHandled = true;
+        unawaited(_enterPostCompletionConversation(_orch.phase));
+      } else if (!_isTerminalPhase(_orch.phase)) {
+        _completionHandled = false;
       }
     }
     setState(() {});
   }
 
-  void _syncVoiceSessionContext() {
-    final sessionId = (_orch.sessionId ?? '').trim();
-    _voiceController.updateSessionContext(
-      sessionId: sessionId.isNotEmpty ? sessionId : null,
-    );
-    _micBridgeClient.updateSessionContext(
-      sessionId: sessionId.isNotEmpty ? sessionId : null,
-    );
+  void _onVoiceControllerChanged() {
+    if (!mounted) return;
+    final nextError = _voiceController.error?.trim();
+    if ((_voiceError ?? '') != (nextError ?? '')) {
+      _voiceError = nextError?.isEmpty == true ? null : nextError;
+      unawaited(_syncNavigationOverlay());
+    }
+    setState(() {});
   }
 
   @override
@@ -131,58 +138,61 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       _awaitingOverlayPermissionReturn = false;
       unawaited(_handleOverlayPermissionReturn());
     }
-    if (_pendingReturnToHome) {
-      unawaited(_finishCompletedFlow());
-    }
   }
 
-  Future<void> _startCommand() async {
-    final prompt = _promptController.text.trim();
+  Future<void> _startCommand({
+    String? promptOverride,
+    Map<String, dynamic> contextOverride = const {},
+  }) async {
+    final prompt = (promptOverride ?? _promptController.text).trim();
     if (prompt.isEmpty || _orch.phase.isRunning) {
       return;
     }
 
+    _lastSubmittedPrompt = prompt;
+    _resetConversationWaitState();
     FocusScope.of(context).unfocus();
     await _refreshPermissionState();
-    final micReady = await _ensureMicrophonePermission();
-    if (!micReady) {
-      if (!mounted) return;
-      setState(() {
-        _microphonePermissionMissing = true;
-      });
-      return;
-    }
-    try {
-      await _orch.ensureMicBridgeReady();
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _microphonePermissionMissing = true;
-      });
-      return;
-    }
     await _showStartupOverlayIfPossible(prompt);
-    await _runCommandFlow(prompt);
+    await _runCommandFlow(prompt, context: contextOverride);
   }
 
-  Future<void> _runCommandFlow(String prompt) async {
+  Future<void> _runCommandFlow(
+    String prompt, {
+    Map<String, dynamic> context = const {},
+  }) async {
     await _orch.preparePhoneCommand(
       prompt,
       reasoningProvider: _reasoningProvider,
+      context: context,
     );
     if (!mounted) return;
     if (!_orch.hasPreparedCommand || _orch.errorMessage != null) {
+      return;
+    }
+    final clarificationQuestion = _preparedClarificationQuestion();
+    if (clarificationQuestion != null) {
+      await _orch.discardPrepared();
+      if (!mounted) return;
+      await _beginClarification(prompt, clarificationQuestion);
       return;
     }
     await _orch.executePrepared();
   }
 
   String _statusText() {
+    if (_awaitingPostCompletionInstruction && _postTaskStatusMessage != null) {
+      return _postTaskStatusMessage!;
+    }
+    if (_awaitingClarificationResponse) {
+      return _pendingClarificationQuestion ??
+          'Трябва ми още една подробност, преди да продължа.';
+    }
+    if (_awaitingPostCompletionInstruction) {
+      return 'Задачата е изпълнена. Кажете следваща команда или кажете готово, за да се върна.';
+    }
     if (_accessibilityPermissionMissing && !_orch.phase.isRunning) {
       return 'Enable Accessibility Control so Hello Again can operate the phone directly.';
-    }
-    if (_microphonePermissionMissing && !_orch.phase.isRunning) {
-      return 'Microphone permission is required so Hello Again can ask and hear clarification answers during phone control.';
     }
     if (_overlayPermissionMissing && !_orch.phase.isRunning) {
       return 'The phone flow can still run, but the floating navigator bubble needs "Display over other apps" to appear outside the app.';
@@ -196,12 +206,10 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
         return 'Starting the phone flow...';
       case PipelinePhase.awaitingConfirmation:
         return 'Waiting for confirmation on the device...';
-      case PipelinePhase.awaitingUserInput:
-        return 'Waiting for clarification on the device...';
       case PipelinePhase.completed:
         return 'Phone flow completed.';
       case PipelinePhase.failed:
-        return _orch.errorMessage ?? 'The command could not be started.';
+        return _orch.errorMessage ?? 'Командата не можа да бъде стартирана.';
       case PipelinePhase.cancelled:
         return 'The command was cancelled.';
       case PipelinePhase.idle:
@@ -217,7 +225,6 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     final permissionStatus = await PermissionChecker.getPermissionStatus();
     final accessibilityMissing =
         permissionStatus['accessibilityService'] != true;
-    final microphoneMissing = !await Permission.microphone.isGranted;
 
     var overlayMissing = false;
     if (_overlayService.isSupported) {
@@ -228,18 +235,8 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     if (!mounted) return;
     setState(() {
       _accessibilityPermissionMissing = accessibilityMissing;
-      _microphonePermissionMissing = microphoneMissing;
       _overlayPermissionMissing = overlayMissing;
     });
-  }
-
-  Future<bool> _ensureMicrophonePermission() async {
-    final status = await Permission.microphone.status;
-    if (status.isGranted) {
-      return true;
-    }
-    final next = await Permission.microphone.request();
-    return next.isGranted;
   }
 
   Future<void> _handleAccessibilityPermissionReturn() async {
@@ -248,38 +245,41 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
 
   Future<void> _handleOverlayPermissionReturn() async {
     await _refreshPermissionState();
-    if (!mounted || _overlayPermissionMissing || !_orch.phase.isRunning) {
+    if (!mounted ||
+        _overlayPermissionMissing ||
+        !(_orch.phase.isRunning ||
+            _awaitingClarificationResponse ||
+            _awaitingPostCompletionInstruction)) {
       return;
     }
     await _syncNavigationOverlay();
   }
 
-  Future<void> _finishCompletedFlow() async {
-    if (!mounted || _completionHandled || _orch.phase != PipelinePhase.completed) {
+  Future<void> _returnToAppAfterConversation() async {
+    if (!mounted) {
       return;
     }
 
     await _overlayService.hide();
     _overlayVisible = false;
-
-    final lifecycleState = WidgetsBinding.instance.lifecycleState;
-    if (lifecycleState != AppLifecycleState.resumed) {
-      if (!_bringingAppToFront) {
-        _bringingAppToFront = true;
-        await _overlayService.bringToFront();
-        _bringingAppToFront = false;
-      }
-      return;
-    }
-
-    _completionHandled = true;
-    _pendingReturnToHome = false;
+    await _orch.endConversationLoop();
+    _resetConversationWaitState();
 
     if (!mounted) {
       return;
     }
 
-    Navigator.of(context, rootNavigator: true).popUntil((route) => route.isFirst);
+    final navigator = Navigator.of(context, rootNavigator: true);
+    if (navigator.canPop()) {
+      navigator.popUntil((route) => route.isFirst);
+    }
+
+    final lifecycleState = WidgetsBinding.instance.lifecycleState;
+    if (lifecycleState != AppLifecycleState.resumed && !_bringingAppToFront) {
+      _bringingAppToFront = true;
+      await _overlayService.bringToFront();
+      _bringingAppToFront = false;
+    }
   }
 
   Future<void> _syncNavigationOverlay() async {
@@ -287,15 +287,17 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       return;
     }
 
-    if (_orch.phase.isRunning) {
+    if (_orch.phase.isRunning ||
+        _awaitingClarificationResponse ||
+        _awaitingPostCompletionInstruction) {
       final hasPermission = await _overlayService.hasPermission();
       if (!hasPermission) {
         _overlayVisible = false;
         return;
       }
       await _overlayService.show(
-        title: _guardTitle(),
-        message: _guardBody().isNotEmpty ? _guardBody() : _statusText(),
+        title: _overlayTitle(),
+        message: _overlayMessage(),
       );
       _overlayVisible = true;
       return;
@@ -332,6 +334,25 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     return app;
   }
 
+  String _overlayTitle() {
+    if (_awaitingClarificationResponse) {
+      return 'Need one more detail';
+    }
+    if (_awaitingPostCompletionInstruction) {
+      return _postTaskPhase == PipelinePhase.completed
+          ? 'Phone task complete'
+          : 'Phone task update';
+    }
+    return _guardTitle();
+  }
+
+  String _overlayMessage() {
+    if (_awaitingClarificationResponse || _awaitingPostCompletionInstruction) {
+      return _statusText();
+    }
+    return _guardBody().isNotEmpty ? _guardBody() : _statusText();
+  }
+
   bool get _showPhoneGuard => _orch.phase.isRunning;
 
   String _guardTitle() {
@@ -342,7 +363,6 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
       case PipelinePhase.executing:
         return 'Phone control in progress';
       case PipelinePhase.awaitingConfirmation:
-      case PipelinePhase.awaitingUserInput:
         return 'Waiting on the phone';
       case PipelinePhase.idle:
       case PipelinePhase.completed:
@@ -362,14 +382,527 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
         return 'Hello Again is currently working through the phone. Please do not tap, swipe, type, or switch apps until it finishes.';
       case PipelinePhase.awaitingConfirmation:
         return 'The model is waiting at a phone confirmation step. Avoid touching the phone unless you intentionally want to approve the action.';
-      case PipelinePhase.awaitingUserInput:
-        return 'The model needs clarification before it can continue safely. Avoid interacting with the phone unless you are answering the clarification request.';
       case PipelinePhase.idle:
       case PipelinePhase.completed:
       case PipelinePhase.failed:
       case PipelinePhase.cancelled:
         return '';
     }
+  }
+
+  Future<void> _ensureHandsFreeVoiceReady() async {
+    if (_voiceController.enabled || _voiceStarting) {
+      return;
+    }
+    _voiceStarting = true;
+    try {
+      await _voiceController.start();
+      _voiceError = null;
+    } catch (error) {
+      _voiceError = error.toString();
+    } finally {
+      _voiceStarting = false;
+      if (mounted) {
+        setState(() {});
+      }
+      unawaited(_syncNavigationOverlay());
+    }
+  }
+
+  Future<void> _toggleHandsFreeVoice() async {
+    if (_voiceController.enabled) {
+      await _voiceController.stop();
+      return;
+    }
+    await _ensureHandsFreeVoiceReady();
+  }
+
+  Future<void> _handleVoiceTranscript(String transcript) async {
+    final spokenText = transcript.trim();
+    if (spokenText.isEmpty) {
+      return;
+    }
+
+    if (_awaitingClarificationResponse) {
+      await _handleClarificationTranscript(spokenText);
+      return;
+    }
+
+    if (_awaitingPostCompletionInstruction) {
+      await _handlePostCompletionTranscript(spokenText);
+      return;
+    }
+
+    if (_orch.phase == PipelinePhase.awaitingConfirmation &&
+        _orch.pendingConfirmation != null) {
+      await _handleVoiceConfirmation(spokenText);
+      return;
+    }
+
+    if (_orch.phase.isRunning) {
+      await _handleRunningVoiceInterrupt(spokenText);
+      return;
+    }
+
+    _promptController.value = TextEditingValue(
+      text: spokenText,
+      selection: TextSelection.collapsed(offset: spokenText.length),
+    );
+    await _startCommand(promptOverride: spokenText);
+  }
+
+  Future<void> _beginClarification(String prompt, String question) async {
+    setState(() {
+      _awaitingClarificationResponse = true;
+      _pendingClarificationPrompt = prompt;
+      _pendingClarificationQuestion = question;
+    });
+    await _syncNavigationOverlay();
+
+    if (_voiceController.enabled) {
+      await _voiceController.speakText(question, resumeWhenDone: true);
+      return;
+    }
+
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      await _overlayService.bringToFront();
+    }
+  }
+
+  Future<void> _handleClarificationTranscript(String transcript) async {
+    final basePrompt = (_pendingClarificationPrompt ?? _lastSubmittedPrompt)
+        .trim();
+    final mergedPrompt = _mergePromptWithClarification(basePrompt, transcript);
+    _resetConversationWaitState();
+    _promptController.value = TextEditingValue(
+      text: mergedPrompt,
+      selection: TextSelection.collapsed(offset: mergedPrompt.length),
+    );
+    await _voiceController.pauseForTask(
+      status: 'Обновявам командата с вашия отговор...',
+    );
+    await _startCommand(promptOverride: mergedPrompt);
+  }
+
+  Future<void> _enterPostCompletionConversation(PipelinePhase phase) async {
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _awaitingPostCompletionInstruction = true;
+      _postTaskPhase = phase;
+      _postTaskStatusMessage = 'Подготвям следващия отговор...';
+    });
+    await _syncNavigationOverlay();
+
+    if (_voiceController.enabled) {
+      await _voiceController.pauseForTask(
+        status: 'Подготвям следващия отговор...',
+      );
+    }
+
+    final terminalResponse = await _fetchTerminalResponse(phase);
+    if (!mounted || !_awaitingPostCompletionInstruction) {
+      return;
+    }
+
+    final terminalPrompt = (terminalResponse['message'] ?? '')
+        .toString()
+        .trim();
+    final statusLine = (terminalResponse['status_line'] ?? terminalPrompt)
+        .toString()
+        .trim();
+    final spokenPrompt = terminalPrompt.isNotEmpty
+        ? terminalPrompt
+        : statusLine;
+
+    setState(() {
+      _lastTerminalMessage = spokenPrompt;
+      _postTaskStatusMessage = statusLine.isNotEmpty
+          ? statusLine
+          : spokenPrompt;
+    });
+    await _syncNavigationOverlay();
+    if (_voiceController.enabled) {
+      await _voiceController.speakText(spokenPrompt, resumeWhenDone: true);
+      return;
+    }
+
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      await _overlayService.bringToFront();
+    }
+  }
+
+  Future<void> _handlePostCompletionTranscript(String transcript) async {
+    final followUpContext = await _buildFollowUpContext();
+    final decision = await _decidePostTaskAction(
+      transcript,
+      context: followUpContext,
+    );
+    final action = (decision['decision'] ?? '').toString().trim();
+    final replyMessage = (decision['reply_message'] ?? '').toString().trim();
+
+    if (action == 'return_to_app') {
+      if (replyMessage.isNotEmpty) {
+        await _voiceController.speakText(replyMessage);
+      }
+      await _returnToAppAfterConversation();
+      return;
+    }
+
+    if (action == 'ask_for_clarification') {
+      if (replyMessage.isNotEmpty) {
+        await _voiceController.speakText(replyMessage, resumeWhenDone: true);
+      } else {
+        await _voiceController.resumeListening();
+      }
+      return;
+    }
+
+    final nextInstruction = (decision['next_instruction'] ?? transcript)
+        .toString()
+        .trim();
+    _resetConversationWaitState();
+    _promptController.value = TextEditingValue(
+      text: nextInstruction,
+      selection: TextSelection.collapsed(offset: nextInstruction.length),
+    );
+    await _voiceController.pauseForTask(
+      status: replyMessage.isNotEmpty
+          ? replyMessage
+          : 'Подготвям следващата задача на телефона...',
+    );
+    await _startCommand(
+      promptOverride: nextInstruction,
+      contextOverride: followUpContext,
+    );
+  }
+
+  Future<Map<String, dynamic>> _buildFollowUpContext() async {
+    final intent = _orch.parsedIntent ?? const <String, dynamic>{};
+    final entities =
+        (intent['entities'] as Map?)?.cast<String, dynamic>() ??
+        const <String, dynamic>{};
+    final context = <String, dynamic>{
+      'follow_up_mode': true,
+      'previous_goal': (intent['goal'] ?? '').toString().trim(),
+      'previous_app_package': (intent['app_package'] ?? '').toString().trim(),
+      'previous_app_name': (intent['target_app'] ?? '').toString().trim(),
+      'previous_entities': Map<String, dynamic>.from(entities),
+    };
+
+    try {
+      final screenState = await _deviceGateway.getScreenState();
+      final currentPackage = (screenState.foregroundPackage ?? '').trim();
+      final currentTitle = (screenState.windowTitle ?? '').trim();
+      if (currentPackage.isNotEmpty) {
+        context['current_app_package'] = currentPackage;
+      }
+      if (currentTitle.isNotEmpty) {
+        context['current_window_title'] = currentTitle;
+      }
+    } catch (_) {}
+
+    if ((context['current_app_package'] ?? '').toString().trim().isEmpty) {
+      final previousPackage = (context['previous_app_package'] ?? '')
+          .toString()
+          .trim();
+      if (previousPackage.isNotEmpty) {
+        context['current_app_package'] = previousPackage;
+      }
+    }
+
+    if ((context['current_app_name'] ?? '').toString().trim().isEmpty) {
+      final previousName = (context['previous_app_name'] ?? '')
+          .toString()
+          .trim();
+      if (previousName.isNotEmpty) {
+        context['current_app_name'] = previousName;
+      }
+    }
+
+    return context;
+  }
+
+  Future<Map<String, dynamic>> _decidePostTaskAction(
+    String transcript, {
+    required Map<String, dynamic> context,
+  }) async {
+    final sessionId = _orch.sessionId;
+    if (sessionId == null || sessionId.isEmpty) {
+      return {
+        'decision': 'ask_for_clarification',
+        'reply_message':
+            'Не успях да обработя отговора ви. Кажете отново дали да продължим на телефона или да се върнем в приложението.',
+        'next_instruction': '',
+      };
+    }
+
+    try {
+      final response = await _orch.client.decidePostTaskAction(
+        sessionId,
+        transcript: transcript,
+        phase: _terminalPhaseName(_postTaskPhase ?? _orch.phase),
+        currentAppPackage: (context['current_app_package'] ?? '')
+            .toString()
+            .trim(),
+        currentAppName: (context['current_app_name'] ?? '').toString().trim(),
+        currentWindowTitle: (context['current_window_title'] ?? '')
+            .toString()
+            .trim(),
+        lastAssistantMessage:
+            (_lastTerminalMessage ?? _postTaskStatusMessage ?? '').trim(),
+      );
+      final decision = (response['decision'] ?? '').toString().trim();
+      if (decision.isNotEmpty) {
+        return response;
+      }
+    } catch (_) {}
+
+    return {
+      'decision': 'ask_for_clarification',
+      'reply_message':
+          'Не успях да обработя отговора ви. Кажете отново дали да продължим на телефона или да се върнем в приложението.',
+      'next_instruction': '',
+    };
+  }
+
+  Future<void> _handleVoiceConfirmation(String transcript) async {
+    final decision = _parseVoiceDecision(transcript);
+    switch (decision) {
+      case _VoiceDecision.approve:
+        await _voiceController.pauseForTask(
+          status: 'Продължавам със стъпката за потвърждение...',
+        );
+        await _voiceController.speakText('Продължавам.');
+        await _orch.approveConfirmation();
+        return;
+      case _VoiceDecision.reject:
+        await _voiceController.pauseForTask(
+          status: 'Спирам тази стъпка за потвърждение...',
+        );
+        await _orch.rejectConfirmation();
+        return;
+      case _VoiceDecision.unknown:
+        await _voiceController.speakText(
+          'Кажете да, за да продължа, или не, за да спра.',
+          resumeWhenDone: true,
+        );
+        return;
+    }
+  }
+
+  Future<void> _handleRunningVoiceInterrupt(String transcript) async {
+    final normalized = _normalizeVoiceText(transcript);
+    if (_matchesAny(normalized, const [
+      'cancel',
+      'stop',
+      'never mind',
+      'pause',
+      'hold on',
+      'wait',
+      'откажи',
+      'спри',
+      'пауза',
+      'изчакай',
+    ])) {
+      await _voiceController.speakText(
+        normalized.contains('pause') ||
+                normalized.contains('hold on') ||
+                normalized.contains('wait')
+            ? 'Поставям текущата задача на пауза.'
+            : 'Отменям текущата задача на телефона.',
+      );
+      if (normalized.contains('pause') ||
+          normalized.contains('hold on') ||
+          normalized.contains('wait')) {
+        await _orch.pause();
+      } else {
+        await _orch.cancel();
+      }
+      return;
+    }
+    if (_matchesAny(normalized, const [
+      'status',
+      'what are you doing',
+      'progress',
+      'статус',
+      'какво правиш',
+      'докъде стигна',
+    ])) {
+      final status = _orch.currentReasoning.trim();
+      await _voiceController.speakText(
+        status.isEmpty ? 'Все още работя по задачата на телефона.' : status,
+      );
+    }
+  }
+
+  String? _preparedClarificationQuestion() {
+    final intent = _orch.parsedIntent ?? const <String, dynamic>{};
+    final explicitNeeds = _readBool(intent['needs_clarification']);
+    final explicitQuestion = (intent['clarification_question'] ?? '')
+        .toString()
+        .trim();
+    if (!explicitNeeds) {
+      return null;
+    }
+    if (explicitQuestion.isNotEmpty) {
+      return explicitQuestion;
+    }
+    return 'Трябва ми още една подробност, за да продължа.';
+  }
+
+  String _mergePromptWithClarification(String basePrompt, String answer) {
+    final cleanBase = basePrompt.trim();
+    final cleanAnswer = answer.trim();
+    if (cleanBase.isEmpty) {
+      return cleanAnswer;
+    }
+    if (cleanAnswer.isEmpty) {
+      return cleanBase;
+    }
+    return '$cleanBase. $cleanAnswer';
+  }
+
+  Future<Map<String, dynamic>> _fetchTerminalResponse(
+    PipelinePhase phase,
+  ) async {
+    final sessionId = _orch.sessionId;
+    if (sessionId == null || sessionId.isEmpty) {
+      return _genericTerminalResponseFallback(phase);
+    }
+
+    try {
+      final response = await _orch.client.getTerminalResponse(
+        sessionId,
+        phase: _terminalPhaseName(phase),
+        errorMessage: _orch.errorMessage ?? '',
+        currentReasoning: _orch.currentReasoning,
+      );
+      final message = (response['message'] ?? '').toString().trim();
+      final statusLine = (response['status_line'] ?? '').toString().trim();
+      if (message.isEmpty && statusLine.isEmpty) {
+        return _genericTerminalResponseFallback(phase);
+      }
+      return response;
+    } catch (_) {
+      return _genericTerminalResponseFallback(phase);
+    }
+  }
+
+  Map<String, dynamic> _genericTerminalResponseFallback(PipelinePhase phase) {
+    const message =
+        'Задачата приключи. Можете да дадете нова инструкция за телефона или да поискате връщане към основното приложение.';
+    return {
+      'phase': _terminalPhaseName(phase),
+      'message': message,
+      'status_line': message,
+    };
+  }
+
+  void _resetConversationWaitState() {
+    if (!mounted) {
+      _awaitingClarificationResponse = false;
+      _awaitingPostCompletionInstruction = false;
+      _pendingClarificationPrompt = null;
+      _pendingClarificationQuestion = null;
+      _postTaskPhase = null;
+      _postTaskStatusMessage = null;
+      _lastTerminalMessage = null;
+      return;
+    }
+    setState(() {
+      _awaitingClarificationResponse = false;
+      _awaitingPostCompletionInstruction = false;
+      _pendingClarificationPrompt = null;
+      _pendingClarificationQuestion = null;
+      _postTaskPhase = null;
+      _postTaskStatusMessage = null;
+      _lastTerminalMessage = null;
+    });
+    unawaited(_syncNavigationOverlay());
+  }
+
+  bool _isTerminalPhase(PipelinePhase phase) =>
+      phase == PipelinePhase.completed ||
+      phase == PipelinePhase.failed ||
+      phase == PipelinePhase.cancelled;
+
+  String _terminalPhaseName(PipelinePhase phase) {
+    switch (phase) {
+      case PipelinePhase.completed:
+        return 'completed';
+      case PipelinePhase.failed:
+        return 'failed';
+      case PipelinePhase.cancelled:
+        return 'cancelled';
+      case PipelinePhase.creatingSession:
+      case PipelinePhase.parsingIntent:
+      case PipelinePhase.executing:
+      case PipelinePhase.awaitingConfirmation:
+      case PipelinePhase.idle:
+        return 'completed';
+    }
+  }
+
+  _VoiceDecision _parseVoiceDecision(String transcript) {
+    final normalized = _normalizeVoiceText(transcript);
+    if (_matchesAny(normalized, const [
+      'yes',
+      'да',
+      'approve',
+      'confirm',
+      'continue',
+      'продължи',
+      'done',
+      'готово',
+      'that is all',
+      'that s all',
+      'all done',
+      'finished',
+    ])) {
+      return _VoiceDecision.approve;
+    }
+    if (_matchesAny(normalized, const [
+      'no',
+      'не',
+      'reject',
+      'cancel',
+      'stop',
+      'откажи',
+      'спри',
+      'not yet',
+    ])) {
+      return _VoiceDecision.reject;
+    }
+    return _VoiceDecision.unknown;
+  }
+
+  String _normalizeVoiceText(String value) => value
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^0-9a-zа-я\s]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+
+  bool _matchesAny(String normalized, List<String> phrases) {
+    for (final phrase in phrases) {
+      if (normalized == phrase || normalized.contains(phrase)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _readBool(Object? value) {
+    if (value is bool) {
+      return value;
+    }
+    final lowered = value?.toString().trim().toLowerCase();
+    return lowered == 'true' ||
+        lowered == '1' ||
+        lowered == 'yes' ||
+        lowered == 'да';
   }
 
   @override
@@ -483,6 +1016,53 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                 contentPadding: const EdgeInsets.all(18),
                               ),
                             ),
+                            const SizedBox(height: 16),
+                            Wrap(
+                              spacing: 10,
+                              runSpacing: 10,
+                              children: [
+                                FilledButton.icon(
+                                  onPressed: isLoading
+                                      ? null
+                                      : () => _startCommand(),
+                                  icon: isLoading
+                                      ? const SizedBox(
+                                          width: 16,
+                                          height: 16,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                          ),
+                                        )
+                                      : const Icon(Icons.play_arrow_rounded),
+                                  label: Text(
+                                    _awaitingPostCompletionInstruction
+                                        ? 'Run Next Command'
+                                        : 'Run Phone Command',
+                                  ),
+                                ),
+                                OutlinedButton.icon(
+                                  onPressed: _voiceStarting
+                                      ? null
+                                      : _toggleHandsFreeVoice,
+                                  icon: Icon(
+                                    _voiceController.enabled
+                                        ? Icons.hearing_disabled_outlined
+                                        : Icons.keyboard_voice_outlined,
+                                  ),
+                                  label: Text(
+                                    _voiceController.enabled
+                                        ? 'Stop Hands-Free Voice'
+                                        : 'Start Hands-Free Voice',
+                                  ),
+                                ),
+                                if (_awaitingPostCompletionInstruction)
+                                  TextButton.icon(
+                                    onPressed: _returnToAppAfterConversation,
+                                    icon: const Icon(Icons.reply_rounded),
+                                    label: const Text('Return To App'),
+                                  ),
+                              ],
+                            ),
                             const SizedBox(height: 20),
                             Container(
                               padding: const EdgeInsets.symmetric(
@@ -514,9 +1094,63 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                   Expanded(
                                     child: Text(
                                       _statusText(),
-                                      style: theme.textTheme.bodyMedium?.copyWith(
-                                        fontWeight: FontWeight.w600,
+                                      style: theme.textTheme.bodyMedium
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.all(16),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFFEAF1F5),
+                                borderRadius: BorderRadius.circular(20),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Icon(
+                                        _voiceController.enabled
+                                            ? Icons.record_voice_over_rounded
+                                            : Icons.mic_off_outlined,
+                                        color: scheme.primary,
                                       ),
+                                      const SizedBox(width: 10),
+                                      Expanded(
+                                        child: Text(
+                                          _voiceController.enabled
+                                              ? 'Hands-free voice is active.'
+                                              : _voiceStarting
+                                              ? 'Starting hands-free voice...'
+                                              : 'Hands-free voice is off.',
+                                          style: theme.textTheme.bodyMedium
+                                              ?.copyWith(
+                                                fontWeight: FontWeight.w700,
+                                              ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    _voiceController.enabled
+                                        ? _voiceController.status
+                                        : (_voiceError?.trim().isNotEmpty ??
+                                              false)
+                                        ? _voiceError!
+                                        : 'Turn it on so the agent can ask follow-up questions and keep listening after each phone task finishes.',
+                                    style: theme.textTheme.bodyMedium?.copyWith(
+                                      color: Colors.black.withValues(
+                                        alpha: 0.68,
+                                      ),
+                                      height: 1.4,
                                     ),
                                   ),
                                 ],
@@ -530,8 +1164,7 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                   onPressed: () async {
                                     _awaitingAccessibilityPermissionReturn =
                                         true;
-                                    await PermissionChecker
-                                        .openAccessibilitySettings();
+                                    await PermissionChecker.openAccessibilitySettings();
                                   },
                                   icon: const Icon(
                                     Icons.accessibility_new_rounded,
@@ -539,24 +1172,6 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                   label: const Text(
                                     'Enable Accessibility Control',
                                   ),
-                                ),
-                              ),
-                            ],
-                            if (_microphonePermissionMissing) ...[
-                              const SizedBox(height: 10),
-                              Align(
-                                alignment: Alignment.centerLeft,
-                                child: TextButton.icon(
-                                  onPressed: () async {
-                                    final granted =
-                                        await _ensureMicrophonePermission();
-                                    if (!mounted) return;
-                                    setState(() {
-                                      _microphonePermissionMissing = !granted;
-                                    });
-                                  },
-                                  icon: const Icon(Icons.mic_none_rounded),
-                                  label: const Text('Enable Microphone'),
                                 ),
                               ),
                             ],
@@ -591,9 +1206,10 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                     Expanded(
                                       child: Text(
                                         _intentSummaryText(),
-                                        style: theme.textTheme.titleMedium?.copyWith(
-                                          fontWeight: FontWeight.w700,
-                                        ),
+                                        style: theme.textTheme.titleMedium
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.w700,
+                                            ),
                                       ),
                                     ),
                                   ],
@@ -642,7 +1258,9 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                 if (_orch.log.isNotEmpty) ...[
                                   const SizedBox(height: 12),
                                   for (final entry in _orch.log)
-                                    Text('[${entry.timeLabel}] ${entry.message}'),
+                                    Text(
+                                      '[${entry.timeLabel}] ${entry.message}',
+                                    ),
                                 ],
                               ],
                             ),
@@ -700,9 +1318,10 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
                                   Expanded(
                                     child: Text(
                                       _guardTitle(),
-                                      style: theme.textTheme.titleLarge?.copyWith(
-                                        fontWeight: FontWeight.w800,
-                                      ),
+                                      style: theme.textTheme.titleLarge
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.w800,
+                                          ),
                                     ),
                                   ),
                                 ],
@@ -756,3 +1375,5 @@ class _NavigationLauncherScreenState extends State<NavigationLauncherScreen>
     );
   }
 }
+
+enum _VoiceDecision { approve, reject, unknown }

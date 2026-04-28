@@ -40,7 +40,9 @@ from apps.audit_log.services import AuditService
 from apps.audit_log.models import AuditEventType, AuditActor
 
 from .execution_service import ExecutionService
+from .post_task_decision_service import PostTaskDecisionService
 from .models import AgentSession, ConfirmationRecord, SessionStatus
+from .post_task_response_service import PostTaskResponseService
 from .serializers import (
     ActionResultV2Serializer,
     AgentCommandResponseSerializer,
@@ -55,13 +57,14 @@ from .serializers import (
     NavigationPrepareSerializer,
     NextStepRequestSerializer,
     PendingConfirmationResponseSerializer,
+    SessionPostTaskDecisionRequestSerializer,
+    SessionPostTaskDecisionSerializer,
+    SessionTerminalResponseRequestSerializer,
+    SessionTerminalResponseSerializer,
     SessionApproveSerializer,
     SessionCreateResponseSerializer,
-    UserInputDecisionSerializer,
-    UserInputSubmitSerializer,
 )
 from .services import SessionService
-from .clarification_service import ClarificationService
 
 
 logger = logging.getLogger(__name__)
@@ -130,6 +133,7 @@ def _user_id_from_request(request: Request) -> str:
 def _prepare_session_for_transcript(
     session: AgentSession,
     transcript: str,
+    context: dict | None = None,
 ) -> dict:
     clean_transcript = transcript.strip()
     if session.transcript != clean_transcript:
@@ -142,6 +146,7 @@ def _prepare_session_for_transcript(
     intent_result = svc.parse_intent(
         transcript=clean_transcript,
         supported_packages=list(session.supported_packages) or None,
+        context=context or {},
     )
 
     PlanService.store_intent(
@@ -154,44 +159,63 @@ def _prepare_session_for_transcript(
         ambiguity_flags=intent_result.ambiguity_flags,
     )
 
-    session.store_intent_data(
-        goal=intent_result.goal,
-        target_app=intent_result.app_package,
-        entities=intent_result.entities or {},
-        risk_level=intent_result.risk_level or "low",
-    )
-
-    if session.status not in SessionService.TERMINAL:
-        if session.status not in (
-            SessionStatus.EXECUTING,
-            SessionStatus.AWAITING_CONFIRMATION,
-                SessionStatus.AWAITING_USER_INPUT,
-        ):
-            if session.status == SessionStatus.CREATED:
-                SessionService.transition(session, SessionStatus.PLANNING)
-                session.refresh_from_db()
-            if session.status not in (
-                SessionStatus.EXECUTING,
-                SessionStatus.AWAITING_CONFIRMATION,
-                SessionStatus.AWAITING_USER_INPUT,
-            ):
-                SessionService.transition(session, SessionStatus.EXECUTING)
-                session.refresh_from_db()
-
-        if not session.started_at:
-            session.started_at = datetime.now(timezone.utc)
-            session.save(update_fields=["started_at", "updated_at"])
+    execution_ready = _apply_intent_to_session(session, intent_result)
 
     session.refresh_from_db()
     return {
         "intent": intent_result.to_dict(),
-        "execution_ready": session.status == SessionStatus.EXECUTING,
+        "execution_ready": execution_ready,
         "can_auto_compile": PlanCompiler.has_template(
             intent_result.goal_type,
             intent_result.app_package,
         ),
         "session_status": session.status,
     }
+
+
+def _apply_intent_to_session(session: AgentSession, intent_result) -> bool:
+    if intent_result.needs_clarification:
+        session.store_intent_data(
+            goal="",
+            target_app="",
+            entities=intent_result.entities or {},
+            risk_level=intent_result.risk_level or "low",
+        )
+    else:
+        session.store_intent_data(
+            goal=intent_result.goal,
+            target_app=intent_result.app_package,
+            entities=intent_result.entities or {},
+            risk_level=intent_result.risk_level or "low",
+        )
+
+    if session.status in SessionService.TERMINAL:
+        return False
+
+    if intent_result.needs_clarification:
+        if session.status != SessionStatus.PLANNING:
+            SessionService.transition(session, SessionStatus.PLANNING)
+        return False
+
+    if session.status not in (
+        SessionStatus.EXECUTING,
+        SessionStatus.AWAITING_CONFIRMATION,
+    ):
+        if session.status == SessionStatus.CREATED:
+            SessionService.transition(session, SessionStatus.PLANNING)
+            session.refresh_from_db()
+        if session.status not in (
+            SessionStatus.EXECUTING,
+            SessionStatus.AWAITING_CONFIRMATION,
+        ):
+            SessionService.transition(session, SessionStatus.EXECUTING)
+            session.refresh_from_db()
+
+    if not session.started_at:
+        session.started_at = datetime.now(timezone.utc)
+        session.save(update_fields=["started_at", "updated_at"])
+
+    return session.status == SessionStatus.EXECUTING
 
 
 def _create_prepared_command_session(
@@ -209,6 +233,7 @@ def _create_prepared_command_session(
     response_payload = _prepare_session_for_transcript(
         session,
         validated_data["prompt"],
+        validated_data.get("context") or {},
     )
     return session, response_payload
 
@@ -286,6 +311,51 @@ class SessionCancelView(APIView):
         return Response(AgentSessionDetailSerializer(session).data)
 
 
+class SessionTerminalResponseView(APIView):
+    """POST /api/agent/sessions/{id}/terminal-response/"""
+
+    def post(self, request: Request, session_id: UUID) -> Response:
+        session = _get_session(session_id)
+        ser = SessionTerminalResponseRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        payload = PostTaskResponseService().build_response(
+            session=session,
+            phase=d["phase"],
+            error_message=d.get("error_message", ""),
+            current_reasoning=d.get("current_reasoning", ""),
+        )
+        return Response(
+            SessionTerminalResponseSerializer(payload).data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class SessionPostTaskDecisionView(APIView):
+    """POST /api/agent/sessions/{id}/post-task-decision/"""
+
+    def post(self, request: Request, session_id: UUID) -> Response:
+        session = _get_session(session_id)
+        ser = SessionPostTaskDecisionRequestSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        d = ser.validated_data
+
+        payload = PostTaskDecisionService().decide(
+            session=session,
+            transcript=d["transcript"],
+            phase=d["phase"],
+            current_app_package=d.get("current_app_package", ""),
+            current_app_name=d.get("current_app_name", ""),
+            current_window_title=d.get("current_window_title", ""),
+            last_assistant_message=d.get("last_assistant_message", ""),
+        )
+        return Response(
+            SessionPostTaskDecisionSerializer(payload).data,
+            status=status.HTTP_200_OK,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Intent & planning
 # ---------------------------------------------------------------------------
@@ -341,24 +411,8 @@ class SessionIntentView(APIView):
         )
 
         # ── Auto-transition to EXECUTING (skip /plan/ and /approve/) ──────────
-        if session.status not in SessionService.TERMINAL:
-            if session.status not in (SessionStatus.EXECUTING,
-                                      SessionStatus.AWAITING_CONFIRMATION,
-                                      SessionStatus.AWAITING_USER_INPUT):
-                # CREATED → PLANNING → EXECUTING
-                if session.status == SessionStatus.CREATED:
-                    SessionService.transition(session, SessionStatus.PLANNING)
-                    session.refresh_from_db()
-                if session.status not in (SessionStatus.EXECUTING,
-                                          SessionStatus.AWAITING_CONFIRMATION,
-                                          SessionStatus.AWAITING_USER_INPUT):
-                    SessionService.transition(session, SessionStatus.EXECUTING)
-                    session.refresh_from_db()
-
-            # Record started_at on first transition
-            if not session.started_at:
-                session.started_at = datetime.now(timezone.utc)
-                session.save(update_fields=["started_at", "updated_at"])
+        # Transition and first-run started_at stamping are handled in this helper.
+        execution_ready = _apply_intent_to_session(session, intent_result)
 
         session.refresh_from_db()
         execution_ready = session.status == SessionStatus.EXECUTING
@@ -857,35 +911,9 @@ class SessionActionResultView(APIView):
             reasoning=d.get("reasoning", ""),
             screen_hash_before=d.get("screen_hash_before", ""),
             screen_hash_after=(screen_state or {}).get("screen_hash", ""),
-            screen_state_after=screen_state or {},
         )
         return Response(
             ExecutionDecisionSerializer(decision.to_dict()).data,
-            status=status.HTTP_200_OK,
-        )
-
-
-class SessionUserInputView(APIView):
-    """POST /api/agent/sessions/{id}/user-input/"""
-
-    def post(self, request: Request, session_id: UUID) -> Response:
-        session = _get_session(session_id)
-        ser = UserInputSubmitSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        data = ser.validated_data
-
-        try:
-            result = ClarificationService.submit_reply(
-                session=session,
-                query_id=data["query_id"],
-                transcript=data["transcript"],
-                source=data.get("source") or "voice",
-            )
-        except ValueError as exc:
-            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
-
-        return Response(
-            UserInputDecisionSerializer(result).data,
             status=status.HTTP_200_OK,
         )
 

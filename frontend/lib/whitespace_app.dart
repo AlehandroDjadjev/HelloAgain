@@ -6,10 +6,13 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter/services.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'browser_voice_bridge.dart';
+import 'google_calendar_connect.dart';
 import 'src/config/backend_base_url.dart';
 import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
@@ -137,7 +140,7 @@ class WhitespaceLaunchConfig {
       resolvedDisplayName != null;
 }
 
-enum HelloAgainStage { booting, intro, onboarding, board }
+enum HelloAgainStage { booting, intro, onboarding, googleCalendar, board }
 
 class StandaloneWhitespaceShell extends StatefulWidget {
   const StandaloneWhitespaceShell({
@@ -152,7 +155,8 @@ class StandaloneWhitespaceShell extends StatefulWidget {
       _StandaloneWhitespaceShellState();
 }
 
-class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
+class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell>
+    with WidgetsBindingObserver {
   static const _tokenKey = 'hello_again.account_token';
 
   late final AgentBackendClient _backendClient;
@@ -166,11 +170,18 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
   bool _isListening = false;
   bool _isWorking = false;
   bool _isConfirming = false;
+  bool _isGoogleCalendarWorking = false;
+  bool _googleCalendarConnected = false;
   int _currentStepIndex = 0;
   String _statusText = 'Preparing Hello Again...';
   String _promptText = '';
   String _transcriptPreview = '';
+  String _googleCalendarEmail = '';
+  String _googleCalendarStatusText =
+      'You can connect Google Calendar now or skip it.';
   final Map<String, String> _answers = <String, String>{};
+  Map<String, dynamic>? _registrationLocationPayload;
+  AppAccountSession? _pendingGoogleCalendarSession;
 
   static const List<_RegistrationStep> _steps = [
     _RegistrationStep(
@@ -212,6 +223,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _backendClient = AgentBackendClient();
     _voiceBridge = createBrowserVoiceBridge();
     unawaited(_bootstrap());
@@ -219,9 +231,19 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _voiceBridge.stopRecognition();
     _voiceBridge.stopAudio();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed &&
+        _stage == HelloAgainStage.googleCalendar &&
+        _pendingGoogleCalendarSession != null) {
+      unawaited(_refreshGoogleCalendarStatus());
+    }
   }
 
   Future<void> _bootstrap() async {
@@ -241,6 +263,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
         _statusText = 'A calm start is ready.';
       }
     });
+    unawaited(_ensureRegistrationLocation());
   }
 
   Future<_ResolvedWhitespaceLaunch?> _resolveLaunch(
@@ -271,7 +294,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
             widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
         displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
         welcomeText:
-            'Whitespace board launched directly. Onboarding was skipped for this entrypoint.',
+            'Дъската е готова. Входът беше пропуснат.',
       );
     }
 
@@ -304,7 +327,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
               widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
           accountToken: explicitToken,
           welcomeText:
-              'The provided token could not be verified at startup, but the whitespace board was launched directly.',
+              'Дъската е готова. Токенът не беше потвърден при стартиране.',
           session: null,
         );
       }
@@ -313,8 +336,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
     return _ResolvedWhitespaceLaunch.guest(
       userId: widget.launchConfig.resolvedUserId ?? 'whitespace_frontend_guest',
       displayName: widget.launchConfig.resolvedDisplayName ?? 'friend',
-      welcomeText:
-          'Whitespace board launched with an explicit local user identity and no login flow.',
+      welcomeText: 'Дъската е готова. Използва се локален профил.',
     );
   }
 
@@ -325,14 +347,36 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
       });
       return;
     }
+    unawaited(_prepareOnboardingLocationPermission());
+  }
+
+  Future<void> _prepareOnboardingLocationPermission() async {
+    final location = await _ensureRegistrationLocation();
+    if (!mounted) return;
     setState(() {
       _showContinue = true;
-      _statusText = 'Tap Continue and I will guide you through registration.';
+      if (location == null) {
+        _statusText =
+            'Before onboarding, please allow location so meetup planning can work well.';
+      } else {
+        _statusText = 'Tap Continue and I will guide you through registration.';
+      }
     });
   }
 
   Future<void> _startRegistration() async {
     if (_isWorking) return;
+    final location = await _ensureRegistrationLocation();
+    if (location == null) {
+      if (!mounted) return;
+      setState(() {
+        _showContinue = true;
+        _stage = HelloAgainStage.intro;
+        _statusText =
+            'Location access is needed before registration so meetup suggestions can work.';
+      });
+      return;
+    }
     setState(() {
       _showContinue = false;
       _stage = HelloAgainStage.onboarding;
@@ -340,8 +384,50 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
       _answers.clear();
       _transcriptPreview = '';
       _isConfirming = false;
+      _registrationLocationPayload = location;
     });
     await _runCurrentStep();
+  }
+
+  Future<Map<String, dynamic>?> _ensureRegistrationLocation() async {
+    if (_registrationLocationPayload != null) {
+      return _registrationLocationPayload;
+    }
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        return null;
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return null;
+      }
+      Position? position;
+      try {
+        position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.medium,
+          ),
+        );
+      } catch (_) {
+        position = await Geolocator.getLastKnownPosition();
+      }
+      if (position == null) {
+        return null;
+      }
+      _registrationLocationPayload = <String, dynamic>{
+        'lat': position.latitude,
+        'lng': position.longitude,
+        'timezone': DateTime.now().timeZoneName,
+      };
+      return _registrationLocationPayload;
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<void> _runCurrentStep() async {
@@ -613,20 +699,22 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
     };
 
     try {
+      final location = await _ensureRegistrationLocation();
+      if (location == null) {
+        throw StateError(
+          'Location access is required before registration can finish.',
+        );
+      }
       final session = await _backendClient.registerVoiceProfile(
         name: _answers['name'] ?? '',
         phoneNumber: _answers['phone_number'] ?? '',
         description: _answers['description'] ?? '',
         onboardingAnswers: onboardingAnswers,
+        homeLat: (location['lat'] as num).toDouble(),
+        homeLng: (location['lng'] as num).toDouble(),
       );
       await _prefs?.setString(_tokenKey, session.token);
-      if (!mounted) return;
-      setState(() {
-        _session = session;
-        _launch = _ResolvedWhitespaceLaunch.fromSession(session);
-        _stage = HelloAgainStage.board;
-        _isWorking = false;
-      });
+      await _enterGoogleCalendarStep(session);
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -635,6 +723,104 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
             'Registration could not finish. Tap once and I will repeat the current step. ${error.toString()}';
       });
     }
+  }
+
+  Future<void> _enterGoogleCalendarStep(AppAccountSession session) async {
+    if (!mounted) return;
+    setState(() {
+      _session = session;
+      _pendingGoogleCalendarSession = session;
+      _isWorking = false;
+      _stage = HelloAgainStage.googleCalendar;
+      _googleCalendarConnected = false;
+      _googleCalendarEmail = '';
+      _googleCalendarStatusText =
+          'Optional. Connect Google Calendar now, or skip for now.';
+    });
+    await _refreshGoogleCalendarStatus();
+  }
+
+  Future<void> _refreshGoogleCalendarStatus() async {
+    final session = _pendingGoogleCalendarSession;
+    if (session == null) return;
+    if (!mounted) return;
+    setState(() {
+      _isGoogleCalendarWorking = true;
+    });
+    try {
+      final payload = await _backendClient.fetchGoogleCalendarStatus(
+        token: session.token,
+      );
+      if (!mounted) return;
+      setState(() {
+        _googleCalendarConnected = (payload['connected'] ?? false) == true;
+        _googleCalendarEmail = (payload['google_email'] ?? '').toString().trim();
+        _googleCalendarStatusText = _googleCalendarConnected
+            ? 'Google Calendar is connected. You can continue into the app.'
+            : 'Optional. Add meetups and reminders to your phone calendar automatically.';
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _googleCalendarStatusText =
+            'Google Calendar is optional. You can try connecting now or skip for now.';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isGoogleCalendarWorking = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _startGoogleCalendarConnect() async {
+    final session = _pendingGoogleCalendarSession;
+    if (session == null || _isGoogleCalendarWorking) return;
+    setState(() {
+      _isGoogleCalendarWorking = true;
+      _googleCalendarStatusText =
+          'Opening Google sign-in. Return to HelloAgain after you finish.';
+    });
+    try {
+      final payload = await _backendClient.startGoogleCalendarConnect(
+        token: session.token,
+      );
+      final authUrl = (payload['auth_url'] ?? '').toString().trim();
+      if (authUrl.isEmpty) {
+        throw StateError('Google Calendar auth URL is missing.');
+      }
+      await launchUrl(
+        Uri.parse(authUrl),
+        mode: LaunchMode.externalApplication,
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _googleCalendarStatusText =
+            'Google Calendar could not start right now. ${error.toString()}';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isGoogleCalendarWorking = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _skipGoogleCalendarForNow() async {
+    await _continueIntoBoard();
+  }
+
+  Future<void> _continueIntoBoard() async {
+    final session = _pendingGoogleCalendarSession ?? _session;
+    if (session == null || !mounted) return;
+    setState(() {
+      _session = session;
+      _launch = _ResolvedWhitespaceLaunch.fromSession(session);
+      _stage = HelloAgainStage.board;
+    });
   }
 
   @override
@@ -663,6 +849,16 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
           stepCount: _steps.length,
           onRetry: _runCurrentStep,
         );
+      case HelloAgainStage.googleCalendar:
+        return GoogleCalendarConnectView(
+          connected: _googleCalendarConnected,
+          connectedEmail: _googleCalendarEmail,
+          isWorking: _isGoogleCalendarWorking,
+          statusText: _googleCalendarStatusText,
+          onConnect: _startGoogleCalendarConnect,
+          onSkip: _skipGoogleCalendarForNow,
+          onContinue: _continueIntoBoard,
+        );
       case HelloAgainStage.board:
         final session = _session;
         final launch = _launch;
@@ -674,7 +870,7 @@ class _StandaloneWhitespaceShellState extends State<StandaloneWhitespaceShell> {
           accountToken: session?.token ?? launch?.accountToken,
           welcomeText: session == null
               ? launch?.welcomeText
-              : 'Welcome, ${session.displayName}. Your space is ready.',
+              : 'Добре дошли, ${session.displayName}. Дъската е готова.',
         );
     }
   }
@@ -698,7 +894,7 @@ class _ResolvedWhitespaceLaunch {
       userId: session.userId.toString(),
       accountToken: session.token,
       welcomeText:
-          'Welcome back, ${session.displayName}. The whitespace board is ready.',
+          'Добре дошли отново, ${session.displayName}. Дъската е готова.',
       session: session,
     );
   }
@@ -710,8 +906,8 @@ class _ResolvedWhitespaceLaunch {
   }) {
     final cleanDisplayName = displayName.trim();
     final fallbackWelcome = cleanDisplayName.isEmpty
-        ? 'Whitespace board ready.'
-        : 'Welcome, $cleanDisplayName. The whitespace board is ready.';
+        ? 'Дъската е готова.'
+        : 'Добре дошли, $cleanDisplayName. Дъската е готова.';
     return _ResolvedWhitespaceLaunch(
       userId: userId,
       welcomeText: welcomeText.isEmpty ? fallbackWelcome : welcomeText,
@@ -990,10 +1186,10 @@ class RegistrationScreen extends StatelessWidget {
                               const SizedBox(width: 8),
                               Text(
                                 isListening
-                                    ? 'Listening'
+                                    ? 'Слушам'
                                     : isConfirming
-                                    ? 'Waiting for confirmation'
-                                    : 'Your answer',
+                                    ? 'Чакам потвърждение'
+                                    : 'Вашият отговор',
                                 style: TextStyle(
                                   fontSize: 14,
                                   fontWeight: FontWeight.w700,
@@ -1006,7 +1202,7 @@ class RegistrationScreen extends StatelessWidget {
                         const SizedBox(height: 18),
                         Text(
                           transcript.isEmpty
-                              ? 'Speak calmly. I will fill in the answer for you.'
+                              ? 'Говорете спокойно. Ще попълня отговора вместо Вас.'
                               : transcript,
                           style: const TextStyle(
                             fontSize: 24,
@@ -1050,7 +1246,7 @@ class RegistrationScreen extends StatelessWidget {
                       ),
                     ),
                     child: Text(
-                      isListening ? 'Listening...' : 'Repeat question',
+                      isListening ? 'Слушам...' : 'Повторете въпроса',
                       style: const TextStyle(
                         fontSize: 18,
                         fontWeight: FontWeight.w700,
@@ -1196,8 +1392,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   final TextEditingController _promptController = TextEditingController();
   late final String _sessionId;
   _ActiveUserPopup? _activeUserPopup;
-  String _lastSpeech =
-      'The board is ready for the whitespace conversation pipeline.';
+  Map<String, dynamic>? _cachedLocationPayload;
+  String _lastSpeech = 'Готов съм. Кажете какво искате да направя.';
   String _statusText = 'Loading saved board memory...';
   bool _isBusy = false;
   bool _isListening = false;
@@ -1207,6 +1403,92 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   bool _voiceLoopEnabled = false;
   int _voiceLoopToken = 0;
   Future<void>? _activeSpeechPlayback;
+
+  Future<void> _openAccountSheet() async {
+    final token = (widget.accountToken ?? '').trim();
+    if (token.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _statusText = 'A logged-in account is required for Google Calendar.';
+      });
+      return;
+    }
+
+    Map<String, dynamic> statusPayload = const {
+      'connected': false,
+      'google_email': '',
+    };
+    try {
+      statusPayload = await _backendClient.fetchGoogleCalendarStatus(token: token);
+    } catch (_) {}
+    if (!mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (context) {
+        final connected = (statusPayload['connected'] ?? false) == true;
+        final email = (statusPayload['google_email'] ?? '').toString().trim();
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'Google Calendar',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  connected
+                      ? 'Connected as ${email.isEmpty ? 'your Google account' : email}.'
+                      : 'Optional. Connect Google Calendar to add meetup reminders later.',
+                ),
+                const SizedBox(height: 16),
+                if (!connected)
+                  ElevatedButton(
+                    onPressed: () async {
+                      Navigator.of(context).pop();
+                      final payload = await _backendClient.startGoogleCalendarConnect(
+                        token: token,
+                      );
+                      final authUrl = (payload['auth_url'] ?? '').toString().trim();
+                      if (authUrl.isNotEmpty) {
+                        await launchUrl(
+                          Uri.parse(authUrl),
+                          mode: LaunchMode.externalApplication,
+                        );
+                        if (mounted) {
+                          setState(() {
+                            _statusText =
+                                'Google sign-in opened. Return to HelloAgain when you finish.';
+                          });
+                        }
+                      }
+                    },
+                    child: const Text('Connect Google'),
+                  ),
+                if (connected)
+                  OutlinedButton(
+                    onPressed: () async {
+                      Navigator.of(context).pop();
+                      await _backendClient.disconnectGoogleCalendar(token: token);
+                      if (mounted) {
+                        setState(() {
+                          _statusText = 'Google Calendar has been disconnected.';
+                        });
+                      }
+                    },
+                    child: const Text('Disconnect'),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
 
   @override
   void initState() {
@@ -1288,43 +1570,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       final viewer = Map<String, dynamic>.from(
         payload['viewer'] as Map? ?? const {},
       );
-      if (mounted && viewer.isNotEmpty) {
-        final widgetType = (viewer['widget_type'] ?? '').toString();
-        if (widgetType == 'user_connection') {
-          setState(() {
-            _activeUserPopup = _ActiveUserPopup(
-              objectName: object.name,
-              viewer: viewer,
-            );
-          });
-        } else if (widgetType == 'phone_command_launcher') {
-          final prompt = (viewer['prompt'] ?? '').toString().trim();
-          final rawAutoRun = viewer['auto_run_on_open'];
-          final autoRunOnOpen = rawAutoRun is bool
-              ? rawAutoRun
-              : rawAutoRun?.toString().trim().toLowerCase() != 'false';
-          if (prompt.isNotEmpty) {
-            await Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => NavigationLauncherScreen(
-                  initialPrompt: prompt,
-                  autoRunOnOpen: autoRunOnOpen,
-                ),
-              ),
-            );
-          } else {
-            await showDialog<void>(
-              context: context,
-              builder: (context) => AgentResultDialog(viewer: viewer),
-            );
-          }
-        } else {
-          await showDialog<void>(
-            context: context,
-            builder: (context) => AgentResultDialog(viewer: viewer),
-          );
-        }
-      }
+      await _presentViewer(viewer, objectName: object.name);
       if (!mounted) return;
       setState(() {
         _lastSpeech = (payload['speech_response'] ?? _lastSpeech).toString();
@@ -1472,7 +1718,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       CapturedAudioTurn capturedTurn;
       try {
         capturedTurn = await _voiceBridge
-            .captureAudioTurn(language: 'bg-BG')
+            .captureAudioTurn(
+              language: 'bg-BG',
+            )
             .timeout(
               const Duration(seconds: 22),
               onTimeout: () => throw TimeoutException(
@@ -1563,6 +1811,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     });
 
     try {
+      final location = await _maybeResolveCurrentLocationPayload(cleanMessage);
       final startPayload = await _backendClient.startAgentRun(
         prompt: cleanMessage,
         boardState: _sceneController.exportStateSnapshot(),
@@ -1570,6 +1819,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         userId: widget.userId,
         sessionId: _sessionId,
         token: widget.accountToken,
+        location: location,
       );
 
       final runId = (startPayload['run_id'] ?? '').toString();
@@ -1691,6 +1941,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       }
 
       await _applyCommands(payload['board_commands']);
+      final autoOpenViewer = Map<String, dynamic>.from(
+        payload['auto_open_viewer'] as Map? ?? const {},
+      );
       if (!mounted) return;
       setState(() {
         _whitespaceReady = true;
@@ -1698,8 +1951,140 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
             ? _readStatusText(payload)
             : 'Whitespace actions are ready. Waiting for the speech response...';
       });
+      if (autoOpenViewer.isNotEmpty) {
+        await _presentViewer(autoOpenViewer, automated: true);
+      }
       return;
     }
+  }
+
+  Future<Map<String, dynamic>?> _maybeResolveCurrentLocationPayload(
+    String prompt,
+  ) async {
+    if (!_promptNeedsPreciseLocation(prompt)) {
+      return null;
+    }
+    if (_cachedLocationPayload != null) {
+      return _cachedLocationPayload;
+    }
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        return null;
+      }
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        return null;
+      }
+      Position? position;
+      try {
+        position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.medium,
+          ),
+        );
+      } catch (_) {
+        position = await Geolocator.getLastKnownPosition();
+      }
+      if (position == null) {
+        return null;
+      }
+      _cachedLocationPayload = <String, dynamic>{
+        'lat': position.latitude,
+        'lng': position.longitude,
+        'timezone': DateTime.now().timeZoneName,
+      };
+      return _cachedLocationPayload;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  bool _promptNeedsPreciseLocation(String prompt) {
+    final lowered = prompt.toLowerCase();
+    const markers = <String>[
+      'meetup',
+      'meet up',
+      'hang out',
+      'go out with',
+      'meet with',
+      'weather',
+      'forecast',
+      'temperature',
+      'rain',
+      'sunny',
+      'cloudy',
+      'outside',
+      'outdoors',
+      'place to go',
+      'go outside',
+      'park',
+      'времето',
+      'температура',
+      'дъжд',
+      'слънчево',
+      'облачно',
+      'навън',
+      'разходка',
+      'на открито',
+      'среща',
+      'срещнем',
+      'излеза с',
+      'изляза с',
+      'искам да излеза с',
+      'искам да изляза с',
+    ];
+    return markers.any(lowered.contains);
+  }
+
+  Future<void> _presentViewer(
+    Map<String, dynamic> viewer, {
+    String? objectName,
+    bool automated = false,
+  }) async {
+    if (!mounted || viewer.isEmpty) {
+      return;
+    }
+    final widgetType = (viewer['widget_type'] ?? '').toString();
+    if (widgetType == 'user_connection' && objectName != null) {
+      setState(() {
+        _activeUserPopup = _ActiveUserPopup(
+          objectName: objectName,
+          viewer: viewer,
+        );
+      });
+      return;
+    }
+    if (widgetType == 'phone_command_launcher') {
+      final prompt = (viewer['prompt'] ?? '').toString().trim();
+      final rawAutoRun = viewer['auto_run_on_open'];
+      final autoRunOnOpen = rawAutoRun is bool
+          ? rawAutoRun
+          : rawAutoRun?.toString().trim().toLowerCase() != 'false';
+      if (prompt.isNotEmpty) {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => NavigationLauncherScreen(
+              initialPrompt: prompt,
+              autoRunOnOpen: autoRunOnOpen,
+            ),
+          ),
+        );
+        return;
+      }
+    }
+    if (!mounted) {
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: !automated,
+      builder: (context) => AgentResultDialog(viewer: viewer),
+    );
   }
 
   Future<void> _applyCommands(dynamic rawCommands) async {
@@ -1856,8 +2241,8 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     required SceneObjectData object,
     required Map<String, dynamic> viewer,
   }) {
-    const popupWidth = 360.0;
-    const popupHeight = 430.0;
+    const popupWidth = 460.0;
+    const popupHeight = 560.0;
     const gap = 18.0;
     final width = math.min(popupWidth, math.max(280.0, boardSize.width - 24.0));
     final height = math.min(
@@ -1957,6 +2342,13 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   }
 
   String _formatError(Object error) {
+    if (error is BackendClientException) {
+      final actionRequired = error.actionRequired.trim();
+      if (actionRequired.isNotEmpty) {
+        return '${error.detail} $actionRequired';
+      }
+      return error.detail;
+    }
     final text = error.toString().trim();
     if (text.isEmpty) {
       return 'Unknown error.';
@@ -2023,7 +2415,24 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                                     y,
                                   );
                                 },
-                                onDragEnded: _persistBoardStateSilently,
+                                onDragEnded: () async {
+                                  _sceneController.snapObjectToNearestValidPosition(
+                                    object.name,
+                                  );
+                                  await _persistBoardStateSilently();
+                                },
+                                onScaleChanged: (scale) {
+                                  _sceneController.setObjectScaleFromGesture(
+                                    object.name,
+                                    scale,
+                                  );
+                                },
+                                onScaleEnded: () async {
+                                  _sceneController.snapObjectToNearestValidPosition(
+                                    object.name,
+                                  );
+                                  await _persistBoardStateSilently();
+                                },
                               ),
                             ),
                           ],
@@ -2043,6 +2452,17 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
                         viewer: activePopup.viewer,
                       ),
                     ],
+                    Positioned(
+                      top: isCompact ? 14 : 20,
+                      right: horizontalPadding,
+                      child: SafeArea(
+                        child: IconButton(
+                          tooltip: 'Account',
+                          onPressed: _openAccountSheet,
+                          icon: const Icon(Icons.manage_accounts_outlined),
+                        ),
+                      ),
+                    ),
                     Positioned(
                       top: isCompact ? 68 : 78,
                       left: 0,
@@ -2104,7 +2524,7 @@ class _VoiceToggleButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final label = isActive ? 'Voice On' : 'Voice Off';
+    final label = isActive ? 'Гласът е включен' : 'Гласът е изключен';
     final icon = isActive ? Icons.graphic_eq_rounded : Icons.mic_none_rounded;
     final background = isActive ? _bloodRed : Colors.white;
     final borderColor = _bloodRed;
@@ -2275,14 +2695,17 @@ class _SpeechTrailOverlayState extends State<_SpeechTrailOverlay> {
     if (_activeSentenceIndex < 0 || _activeSentenceIndex >= _sentences.length) {
       return const SizedBox.shrink();
     }
-    final width = widget.compact ? 320.0 : 620.0;
-    final fontSize = widget.compact ? 27.0 : 32.0;
-    final lineHeight = widget.compact ? 1.08 : 1.04;
+    final width = math.min(
+      widget.availableWidth,
+      widget.compact ? 340.0 : 640.0,
+    );
+    final fontSize = widget.compact ? 22.0 : 26.0;
+    final lineHeight = widget.compact ? 1.16 : 1.12;
     final rows = _splitSubtitleRows(
       _sentences[_activeSentenceIndex],
       maxWidth: width,
       fontSize: fontSize,
-      letterSpacing: -0.5,
+      letterSpacing: 0,
     );
 
     return ClipRect(
@@ -2334,60 +2757,67 @@ class _SubtitleSentenceBlock extends StatelessWidget {
   Widget build(BuildContext context) {
     return ConstrainedBox(
       constraints: BoxConstraints(maxWidth: maxWidth),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          for (var index = 0; index < rows.length; index++)
-            Padding(
-              padding: EdgeInsets.only(bottom: index == rows.length - 1 ? 0 : 4),
-              child: ShaderMask(
-                blendMode: BlendMode.srcIn,
-                shaderCallback: (bounds) {
-                  return const LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [
-                      Color(0xFFBF4342),
-                      Color(0xFF8C1C13),
-                      Colors.black,
-                    ],
-                  ).createShader(bounds);
-                },
-                child: Text(
-                  rows[index],
-                  textAlign: TextAlign.center,
-                  maxLines: 1,
-                  overflow: TextOverflow.visible,
-                  softWrap: false,
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: fontSize,
-                    fontWeight: FontWeight.w800,
-                    letterSpacing: -0.5,
-                    height: lineHeight,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.white.withValues(alpha: 0.92),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: _dustGrey.withValues(alpha: 0.9)),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.08),
+              blurRadius: 22,
+              offset: const Offset(0, 10),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (var index = 0; index < rows.length; index++)
+                Padding(
+                  padding: EdgeInsets.only(
+                    bottom: index == rows.length - 1 ? 0 : 5,
+                  ),
+                  child: Text(
+                    rows[index],
+                    textAlign: TextAlign.center,
+                    maxLines: 1,
+                    overflow: TextOverflow.visible,
+                    softWrap: false,
+                    style: TextStyle(
+                      color: const Color(0xFF2E1B1A),
+                      fontSize: fontSize,
+                      fontWeight: FontWeight.w800,
+                      letterSpacing: 0,
+                      height: lineHeight,
+                    ),
                   ),
                 ),
-              ),
-            ),
-        ],
+            ],
+          ),
+        ),
       ),
     );
   }
 }
 
 List<Duration> _estimateSpeechSubtitleTimings(List<String> sentences) {
-  return sentences.map((sentence) {
-    final words = sentence
-        .split(RegExp(r'\s+'))
-        .where((word) => word.trim().isNotEmpty)
-        .length;
-    final milliseconds = 700 + (words * 155);
-    return Duration(milliseconds: milliseconds.clamp(900, 2400));
-  }).toList(growable: false);
+  return sentences
+      .map((sentence) {
+        final words = sentence
+            .split(RegExp(r'\s+'))
+            .where((word) => word.trim().isNotEmpty)
+            .length;
+        final milliseconds = 780 + (words * 170);
+        return Duration(milliseconds: milliseconds.clamp(1100, 2600));
+      })
+      .toList(growable: false);
 }
 
 List<String> _speechSubtitleSentences(String speech) {
-  final normalized = speech.replaceAll(RegExp(r'\s+'), ' ').trim();
+  final normalized = _bulgarianSubtitleSpeech(speech);
   if (normalized.isEmpty) {
     return const <String>[];
   }
@@ -2408,9 +2838,9 @@ List<String> _speechSubtitleSentences(String speech) {
     if (words.isEmpty) {
       continue;
     }
-    for (var index = 0; index < words.length; index += 10) {
+    for (var index = 0; index < words.length; index += 8) {
       final chunk = words
-          .sublist(index, math.min(index + 10, words.length))
+          .sublist(index, math.min(index + 8, words.length))
           .join(' ')
           .trim();
       if (chunk.isNotEmpty) {
@@ -2419,6 +2849,20 @@ List<String> _speechSubtitleSentences(String speech) {
     }
   }
   return sentences;
+}
+
+String _bulgarianSubtitleSpeech(String speech) {
+  final normalized = speech.replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (normalized.isEmpty) return '';
+  if (RegExp(r'[\u0400-\u04FF]').hasMatch(normalized)) return normalized;
+  final lower = normalized.toLowerCase();
+  if (lower.contains('board') || lower.contains('pipeline')) {
+    return 'Готов съм. Кажете какво искате да направя.';
+  }
+  if (lower.contains('speech') || lower.contains('voice')) {
+    return 'Подготвям гласовия отговор.';
+  }
+  return normalized;
 }
 
 List<String> _splitSubtitleRows(
@@ -2524,11 +2968,16 @@ class UserConnectionPopup extends StatefulWidget {
 
 class _UserConnectionPopupState extends State<UserConnectionPopup> {
   final TextEditingController _messageController = TextEditingController();
+  final BrowserVoiceBridge _voiceBridge = createBrowserVoiceBridge();
+  final AgentBackendClient _voiceClient = AgentBackendClient();
   bool _isSending = false;
+  bool _isTranscribing = false;
   String _errorText = '';
 
   @override
   void dispose() {
+    _voiceBridge.stopRecognition();
+    _voiceBridge.stopAudio();
     _messageController.dispose();
     super.dispose();
   }
@@ -2552,6 +3001,61 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
       if (mounted) {
         setState(() {
           _isSending = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _captureVoiceMessage(int threadId) async {
+    if (!_voiceBridge.isSpeechRecognitionSupported) {
+      setState(() {
+        _errorText = 'Voice input is not available on this device.';
+      });
+      return;
+    }
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _isTranscribing = true;
+      _errorText = '';
+    });
+    try {
+      await _voiceBridge.primeVoiceExperience();
+      final captured = await _voiceBridge.captureAudioTurn(language: 'bg-BG');
+      var transcript = (captured.transcript ?? '').trim();
+      if (transcript.isEmpty) {
+        final payload = await _voiceClient.transcribeSpeechTurn(
+          audioBase64: captured.audioBase64,
+          audioMimeType: captured.mimeType,
+          userId: 'chat-thread-$threadId',
+          sessionId: 'chat-thread-$threadId',
+          language: captured.language,
+        );
+        transcript = (payload['transcript'] ?? payload['message'] ?? '')
+            .toString()
+            .trim();
+      }
+      if (!mounted) return;
+      if (transcript.isEmpty) {
+        setState(() {
+          _errorText = 'No speech was captured.';
+        });
+        return;
+      }
+      setState(() {
+        _messageController.text = transcript;
+        _messageController.selection = TextSelection.collapsed(
+          offset: transcript.length,
+        );
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorText = error.toString().trim();
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTranscribing = false;
         });
       }
     }
@@ -2585,7 +3089,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
         padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.97),
-          borderRadius: BorderRadius.circular(24),
+          borderRadius: BorderRadius.circular(14),
           border: Border.all(
             color: Colors.black.withValues(alpha: 0.08),
             width: 0.9,
@@ -2671,7 +3175,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
                   color: const Color(0xFFF7F0E7),
-                  borderRadius: BorderRadius.circular(18),
+                  borderRadius: BorderRadius.circular(10),
                 ),
                 child: messages.isEmpty
                     ? Center(
@@ -2697,7 +3201,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                                 ? Alignment.centerRight
                                 : Alignment.centerLeft,
                             child: Container(
-                              constraints: const BoxConstraints(maxWidth: 230),
+                              constraints: const BoxConstraints(maxWidth: 310),
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 12,
                                 vertical: 10,
@@ -2706,7 +3210,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                                 color: isMe
                                     ? const Color(0xFFB85A40)
                                     : Colors.white,
-                                borderRadius: BorderRadius.circular(16),
+                                borderRadius: BorderRadius.circular(10),
                               ),
                               child: Text(
                                 (message['text'] ?? '').toString(),
@@ -2791,26 +3295,46 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
             Container(
               decoration: BoxDecoration(
                 color: const Color(0xFFF4E8D9),
-                borderRadius: BorderRadius.circular(18),
+                borderRadius: BorderRadius.circular(10),
               ),
-              child: TextField(
-                controller: _messageController,
-                enabled: !_isSending && threadId > 0,
-                minLines: 1,
-                maxLines: 3,
-                decoration: const InputDecoration(
-                  hintText: 'Send a message...',
-                  border: InputBorder.none,
-                  contentPadding: EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 14,
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  IconButton(
+                    tooltip: 'Voice message',
+                    onPressed: (_isSending || _isTranscribing || threadId <= 0)
+                        ? null
+                        : () => _captureVoiceMessage(threadId),
+                    icon: Icon(
+                      _isTranscribing
+                          ? Icons.hearing_rounded
+                          : Icons.mic_rounded,
+                    ),
                   ),
-                ),
-                onSubmitted: (value) {
-                  final text = value.trim();
-                  if (text.isEmpty || _isSending || threadId <= 0) return;
-                  _runAction(() => widget.onSendMessage(threadId, text));
-                },
+                  Expanded(
+                    child: TextField(
+                      controller: _messageController,
+                      enabled: !_isSending && !_isTranscribing && threadId > 0,
+                      minLines: 2,
+                      maxLines: 5,
+                      decoration: const InputDecoration(
+                        hintText: 'Send a message...',
+                        border: InputBorder.none,
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 14,
+                        ),
+                      ),
+                      onSubmitted: (value) {
+                        final text = value.trim();
+                        if (text.isEmpty || _isSending || threadId <= 0) {
+                          return;
+                        }
+                        _runAction(() => widget.onSendMessage(threadId, text));
+                      },
+                    ),
+                  ),
+                ],
               ),
             ),
             const SizedBox(height: 10),
@@ -2828,7 +3352,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                 ),
                 const SizedBox(width: 8),
                 FilledButton(
-                  onPressed: (_isSending || threadId <= 0)
+                  onPressed: (_isSending || _isTranscribing || threadId <= 0)
                       ? null
                       : () {
                           final text = _messageController.text.trim();
@@ -2845,7 +3369,7 @@ class _UserConnectionPopupState extends State<UserConnectionPopup> {
                       vertical: 13,
                     ),
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(16),
+                      borderRadius: BorderRadius.circular(10),
                     ),
                   ),
                   child: Text(_isSending ? 'Sending' : 'Send'),
@@ -2923,60 +3447,142 @@ class AgentResultDialog extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final title = (viewer['title'] ?? 'Board result').toString();
+    final title = (viewer['title'] ?? 'Резултат').toString();
     final summary = (viewer['summary'] ?? '').toString();
-    final payload = viewer['payload'];
     final widgetType = (viewer['widget_type'] ?? '').toString();
-    final jsonText = JsonEncoder.withIndent('  ').convert(payload);
+    final badge = switch (widgetType) {
+      'weather_snapshot' => 'Време',
+      'outing_suggestion' => 'Навън',
+      'meetup_invite' => 'Среща',
+      'phone_command_launcher' => 'Телефон',
+      _ => 'Резултат',
+    };
+    final body = switch (widgetType) {
+      'user_profile' when viewer['user'] is Map => AgentUserProfileView(
+        user: Map<String, dynamic>.from(viewer['user'] as Map),
+      ),
+      'meetup_invite' when viewer['invite'] is Map => AgentMeetupInviteView(
+        invite: Map<String, dynamic>.from(viewer['invite'] as Map),
+        notification: viewer['notification'] is Map
+            ? Map<String, dynamic>.from(viewer['notification'] as Map)
+            : const <String, dynamic>{},
+        friendName: (viewer['friend_name'] ?? '').toString(),
+      ),
+      'weather_snapshot' when viewer['weather'] is Map => AgentWeatherSnapshotView(
+        weather: Map<String, dynamic>.from(viewer['weather'] as Map),
+      ),
+      'outing_suggestion' => AgentOutingSuggestionView(
+        user: viewer['user'] is Map
+            ? Map<String, dynamic>.from(viewer['user'] as Map)
+            : const <String, dynamic>{},
+        outing: viewer['outing'] is Map
+            ? Map<String, dynamic>.from(viewer['outing'] as Map)
+            : const <String, dynamic>{},
+      ),
+      'phone_command_launcher' => AgentPhoneLauncherSummaryView(
+        prompt: (viewer['prompt'] ?? '').toString(),
+      ),
+      _ => AgentSummaryOnlyView(title: title, summary: summary),
+    };
 
-    return AlertDialog(
-      title: Text(title),
-      content: SizedBox(
-        width: 520,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (summary.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(bottom: 12),
-                child: Text(
-                  summary,
-                  style: TextStyle(
-                    color: Colors.black.withValues(alpha: 0.72),
-                    height: 1.24,
-                  ),
-                ),
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 22, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 420),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: _whiteSmoke,
+            borderRadius: const BorderRadius.only(
+              topLeft: Radius.circular(28),
+              topRight: Radius.circular(36),
+              bottomLeft: Radius.circular(34),
+              bottomRight: Radius.circular(24),
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0xFF5E3023).withValues(alpha: 0.18),
+                blurRadius: 32,
+                offset: const Offset(0, 16),
               ),
-            if (widgetType == 'user_profile' && viewer['user'] is Map)
-              SizedBox(
-                width: 520,
-                height: 340,
-                child: SingleChildScrollView(
-                  child: AgentUserProfileView(
-                    user: Map<String, dynamic>.from(viewer['user'] as Map),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(22, 18, 22, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 7,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _almondCream,
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: Text(
+                        badge,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w800,
+                          color: _bloodRed,
+                        ),
+                      ),
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      style: IconButton.styleFrom(
+                        backgroundColor: _dustGrey,
+                        foregroundColor: _bloodRed,
+                      ),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  title,
+                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: const Color(0xFF36211E),
                   ),
                 ),
-              )
-            else
-              SizedBox(
-                height: 320,
-                child: SingleChildScrollView(
-                  child: SelectableText(
-                    jsonText,
-                    style: const TextStyle(fontSize: 12, height: 1.25),
+                if (summary.isNotEmpty &&
+                    widgetType != 'weather_snapshot' &&
+                    widgetType != 'outing_suggestion') ...[
+                  const SizedBox(height: 8),
+                  Text(
+                    summary,
+                    style: TextStyle(
+                      color: Colors.black.withValues(alpha: 0.72),
+                      height: 1.28,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 18),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxHeight: 420),
+                  child: SingleChildScrollView(child: body),
+                ),
+                const SizedBox(height: 18),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: FilledButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: const Text('Затвори'),
                   ),
                 ),
-              ),
-          ],
+              ],
+            ),
+          ),
         ),
       ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Close'),
-        ),
-      ],
     );
   }
 }
@@ -3039,6 +3645,415 @@ class AgentUserProfileView extends StatelessWidget {
           _UserSectionLabel(text: 'Phone', value: phoneNumber),
       ],
     );
+  }
+}
+
+class AgentMeetupInviteView extends StatelessWidget {
+  const AgentMeetupInviteView({
+    super.key,
+    required this.invite,
+    required this.notification,
+    required this.friendName,
+  });
+
+  final Map<String, dynamic> invite;
+  final Map<String, dynamic> notification;
+  final String friendName;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = (invite['status'] ?? 'pending').toString();
+    final when = (invite['meeting_when_bg'] ?? '').toString();
+    final placeName = (invite['place_name'] ?? '').toString();
+    final weather = (invite['weather'] ?? '').toString();
+    final temperature = invite['temperature']?.toString() ?? '';
+    final score = invite['score']?.toString() ?? '';
+    final notificationBody = (notification['body'] ?? '').toString();
+    final visibleFriend = friendName.isNotEmpty
+        ? friendName
+        : (invite['invited_display_name'] ?? invite['requester_display_name'] ?? '')
+              .toString();
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (visibleFriend.isNotEmpty)
+          _UserSectionLabel(text: 'Човек', value: visibleFriend),
+        if (status.isNotEmpty) _UserSectionLabel(text: 'Статус', value: status),
+        if (when.isNotEmpty) _UserSectionLabel(text: 'Кога', value: when),
+        if (placeName.isNotEmpty)
+          _UserSectionLabel(text: 'Място', value: placeName),
+        if (weather.isNotEmpty || temperature.isNotEmpty)
+          _UserSectionLabel(
+            text: 'Време',
+            value: [
+              if (weather.isNotEmpty) weather,
+              if (temperature.isNotEmpty) '$temperature°C',
+            ].join(' • '),
+          ),
+        if (score.isNotEmpty)
+          _UserSectionLabel(text: 'Оценка', value: score),
+        if (notificationBody.isNotEmpty)
+          _UserSectionLabel(text: 'Съобщение', value: notificationBody),
+      ],
+    );
+  }
+}
+
+class AgentWeatherSnapshotView extends StatelessWidget {
+  const AgentWeatherSnapshotView({super.key, required this.weather});
+
+  final Map<String, dynamic> weather;
+
+  @override
+  Widget build(BuildContext context) {
+    final label = (weather['label'] ?? '').toString();
+    final summary = (weather['summary'] ?? '').toString();
+    final advice = (weather['advice'] ?? '').toString();
+    final temperature = _formatWeatherNumber(weather['temperature_c']);
+    final apparentTemperature = _formatWeatherNumber(
+      weather['apparent_temperature_c'],
+    );
+    final wind = _formatWeatherNumber(weather['wind_speed']);
+    final windUnit = (weather['wind_unit'] ?? 'km/h').toString();
+    final iconKey = (weather['icon_key'] ?? 'cloud').toString();
+    final subtitle = _weatherSubtitle(weather);
+
+    return WeatherCard(
+      icon: _weatherIcon(iconKey),
+      temperature: temperature,
+      description: label.isNotEmpty ? label : summary,
+      subtitle: subtitle,
+      supportingText: advice,
+      details: [
+        if (apparentTemperature.isNotEmpty)
+          ('Усеща се', '$apparentTemperature°C'),
+        if (wind.isNotEmpty) ('Вятър', '$wind $windUnit'),
+      ],
+    );
+  }
+}
+
+class WeatherCard extends StatelessWidget {
+  const WeatherCard({
+    super.key,
+    required this.icon,
+    required this.temperature,
+    required this.description,
+    this.subtitle = '',
+    this.supportingText = '',
+    this.details = const [],
+  });
+
+  final IconData icon;
+  final String temperature;
+  final String description;
+  final String subtitle;
+  final String supportingText;
+  final List<(String, String)> details;
+
+  @override
+  Widget build(BuildContext context) {
+    final temp = temperature.trim();
+    final desc = description.trim();
+    final sub = subtitle.trim();
+    final support = supportingText.trim();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: _dustGrey),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.06),
+            blurRadius: 22,
+            offset: const Offset(0, 12),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF3ECE6),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Icon(icon, color: _bloodRed, size: 34),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (sub.isNotEmpty)
+                      Text(
+                        sub,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.black.withValues(alpha: 0.52),
+                        ),
+                      ),
+                    Text(
+                      temp.isEmpty ? '--°C' : '$temp°C',
+                      style: const TextStyle(
+                        fontSize: 42,
+                        fontWeight: FontWeight.w900,
+                        height: 1,
+                        color: Color(0xFF2E1B1A),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (desc.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Text(
+              desc,
+              style: const TextStyle(
+                fontSize: 20,
+                height: 1.15,
+                fontWeight: FontWeight.w800,
+                color: Color(0xFF2E1B1A),
+              ),
+            ),
+          ],
+          if (support.isNotEmpty) ...[
+            const SizedBox(height: 7),
+            Text(
+              support,
+              style: TextStyle(
+                fontSize: 14.5,
+                height: 1.35,
+                fontWeight: FontWeight.w600,
+                color: Colors.black.withValues(alpha: 0.64),
+              ),
+            ),
+          ],
+          if (details.isNotEmpty) ...[
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final item in details)
+                  _WeatherDetailPill(label: item.$1, value: item.$2),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _WeatherDetailPill extends StatelessWidget {
+  const _WeatherDetailPill({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 11, vertical: 8),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF7F4F3),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _dustGrey.withValues(alpha: 0.8)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w700,
+              color: Colors.black.withValues(alpha: 0.52),
+            ),
+          ),
+          const SizedBox(width: 7),
+          Text(
+            value,
+            style: const TextStyle(
+              fontSize: 12.5,
+              fontWeight: FontWeight.w900,
+              color: Color(0xFF2E1B1A),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _formatWeatherNumber(Object? value) {
+  if (value == null) return '';
+  if (value is num) {
+    return value % 1 == 0 ? value.round().toString() : value.toStringAsFixed(1);
+  }
+  return value.toString().trim();
+}
+
+String _weatherSubtitle(Map<String, dynamic> weather) {
+  for (final key in const ['location_label', 'location', 'place_name']) {
+    final value = (weather[key] ?? '').toString().trim();
+    if (value.isNotEmpty) return value;
+  }
+  final timezone = (weather['timezone'] ?? '').toString().trim();
+  if (timezone == 'Europe/Sofia') return 'София';
+  return timezone.isEmpty ? '' : 'Текущо местоположение';
+}
+
+class AgentOutingSuggestionView extends StatelessWidget {
+  const AgentOutingSuggestionView({
+    super.key,
+    required this.user,
+    required this.outing,
+  });
+
+  final Map<String, dynamic> user;
+  final Map<String, dynamic> outing;
+
+  @override
+  Widget build(BuildContext context) {
+    final person = (user['display_name'] ?? user['name'] ?? '').toString();
+    final description = (user['description'] ?? '').toString();
+    final place = (outing['place_name'] ?? '').toString();
+    final when = (outing['recommended_when_bg'] ??
+            outing['meeting_when_bg'] ??
+            outing['recommended_time'] ??
+            '')
+        .toString();
+    final weather = (outing['weather'] ?? '').toString();
+    final score = outing['score']?.toString() ?? '';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (person.isNotEmpty)
+          _SoftInfoPanel(text: 'Подходящ човек: $person'),
+        if (description.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Text(
+            description,
+            style: TextStyle(
+              fontSize: 14.5,
+              height: 1.35,
+              color: Colors.black.withValues(alpha: 0.72),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+        const SizedBox(height: 16),
+        if (place.isNotEmpty) _UserSectionLabel(text: 'Място', value: place),
+        if (when.isNotEmpty) _UserSectionLabel(text: 'Час', value: when),
+        if (weather.isNotEmpty) _UserSectionLabel(text: 'Време', value: weather),
+        if (score.isNotEmpty) _UserSectionLabel(text: 'Оценка', value: score),
+      ],
+    );
+  }
+}
+
+class AgentPhoneLauncherSummaryView extends StatelessWidget {
+  const AgentPhoneLauncherSummaryView({
+    super.key,
+    required this.prompt,
+  });
+
+  final String prompt;
+
+  @override
+  Widget build(BuildContext context) {
+    return _SoftInfoPanel(
+      text: prompt.isNotEmpty
+          ? 'Подготвена е телефонна команда: $prompt'
+          : 'Подготвена е телефонна команда.',
+    );
+  }
+}
+
+class AgentSummaryOnlyView extends StatelessWidget {
+  const AgentSummaryOnlyView({
+    super.key,
+    required this.title,
+    required this.summary,
+  });
+
+  final String title;
+  final String summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = summary.trim().isNotEmpty
+        ? summary.trim()
+        : 'Няма нужда от допълнителна карта за този резултат.';
+    return _SoftInfoPanel(text: text);
+  }
+}
+
+class _SoftInfoPanel extends StatelessWidget {
+  const _SoftInfoPanel({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+      decoration: BoxDecoration(
+        color: _almondCream.withValues(alpha: 0.7),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Text(
+        text,
+        style: const TextStyle(
+          fontSize: 14.5,
+          height: 1.35,
+          fontWeight: FontWeight.w700,
+          color: Color(0xFF4A2A22),
+        ),
+      ),
+    );
+  }
+}
+
+IconData _weatherIcon(String iconKey) {
+  switch (iconKey) {
+    case 'sun':
+      return Icons.wb_sunny_rounded;
+    case 'moon':
+      return Icons.nightlight_round;
+    case 'cloud_sun':
+      return Icons.wb_cloudy_rounded;
+    case 'cloud_moon':
+      return Icons.cloud_outlined;
+    case 'fog':
+      return Icons.blur_on_rounded;
+    case 'rain':
+      return Icons.umbrella_rounded;
+    case 'snow':
+      return Icons.ac_unit_rounded;
+    case 'storm':
+      return Icons.thunderstorm_rounded;
+    default:
+      return Icons.cloud_rounded;
   }
 }
 
@@ -3114,6 +4129,8 @@ class AgentBackendClient {
     required String phoneNumber,
     required String description,
     required Map<String, String> onboardingAnswers,
+    required double homeLat,
+    required double homeLng,
   }) async {
     final payload = await _postJson('/api/accounts/register/', {
       'name': name,
@@ -3124,6 +4141,8 @@ class AgentBackendClient {
       'microphone_permission_granted': true,
       'voice_navigation_enabled': true,
       'onboarding_completed': true,
+      'home_lat': homeLat,
+      'home_lng': homeLng,
     });
     final profile = Map<String, dynamic>.from(
       payload['profile'] as Map? ?? const {},
@@ -3164,12 +4183,47 @@ class AgentBackendClient {
     });
   }
 
-  Future<Map<String, dynamic>> completeOnboarding({required String sessionId}) {
+  Future<Map<String, dynamic>> completeOnboarding({
+    required String sessionId,
+    required double homeLat,
+    required double homeLng,
+  }) {
     return _postJson('/api/accounts/onboarding/complete/', {
       'session_id': sessionId,
       'microphone_permission_granted': true,
       'phone_permission_granted': true,
+      'home_lat': homeLat,
+      'home_lng': homeLng,
     });
+  }
+
+  Future<Map<String, dynamic>> fetchGoogleCalendarStatus({
+    required String token,
+  }) {
+    return _getJson(
+      '/api/accounts/integrations/google/calendar/status/',
+      token: token,
+    );
+  }
+
+  Future<Map<String, dynamic>> startGoogleCalendarConnect({
+    required String token,
+  }) {
+    return _postJson(
+      '/api/accounts/integrations/google/calendar/connect/',
+      const {},
+      token: token,
+    );
+  }
+
+  Future<Map<String, dynamic>> disconnectGoogleCalendar({
+    required String token,
+  }) {
+    return _postJson(
+      '/api/accounts/integrations/google/calendar/disconnect/',
+      const {},
+      token: token,
+    );
   }
 
   Future<Map<String, dynamic>> fetchBoardMemory({
@@ -3242,6 +4296,7 @@ class AgentBackendClient {
     required String userId,
     required String sessionId,
     String? token,
+    Map<String, dynamic>? location,
   }) {
     return _postJson('/api/agent/run/start/', {
       'prompt': prompt,
@@ -3249,6 +4304,7 @@ class AgentBackendClient {
       'largest_empty_space': largestEmptySpace,
       'user_id': userId,
       'session_id': sessionId,
+      if (location != null) 'location': location,
     }, token: token);
   }
 
@@ -3311,8 +4367,10 @@ class AgentBackendClient {
       path,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-        'GET $path failed with ${response.statusCode}: ${utf8.decode(response.bodyBytes)}',
+      throw _backendError(
+        method: 'GET',
+        path: path,
+        response: response,
       );
     }
     return _decodeJson(utf8.decode(response.bodyBytes));
@@ -3333,8 +4391,10 @@ class AgentBackendClient {
       path,
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception(
-        'POST $path failed with ${response.statusCode}: ${utf8.decode(response.bodyBytes)}',
+      throw _backendError(
+        method: 'POST',
+        path: path,
+        response: response,
       );
     }
     return _decodeJson(utf8.decode(response.bodyBytes));
@@ -3345,13 +4405,44 @@ class AgentBackendClient {
     String method,
     String path,
   ) async {
+    debugPrint('AgentBackendClient $method ${_baseUri.resolve(path)}');
     try {
-      return await request().timeout(_requestTimeout);
+      final response = await request().timeout(_requestTimeout);
+      debugPrint(
+        'AgentBackendClient $method $path -> ${response.statusCode}',
+      );
+      return response;
     } on TimeoutException {
       throw Exception(
         '$method $path timed out after ${_requestTimeout.inSeconds}s while contacting ${_baseUri.origin}.',
       );
     }
+  }
+
+  BackendClientException _backendError({
+    required String method,
+    required String path,
+    required http.Response response,
+  }) {
+    final body = utf8.decode(response.bodyBytes);
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map) {
+        return BackendClientException(
+          statusCode: response.statusCode,
+          detail:
+              (decoded['detail'] ?? '$method $path failed').toString().trim(),
+          actionRequired:
+              (decoded['action_required'] ?? '').toString().trim(),
+          path: path,
+        );
+      }
+    } catch (_) {}
+    return BackendClientException(
+      statusCode: response.statusCode,
+      detail: '$method $path failed with ${response.statusCode}: $body',
+      path: path,
+    );
   }
 
   Map<String, String> _headers({String? token}) {
@@ -3371,6 +4462,29 @@ class AgentBackendClient {
       throw FormatException('Backend did not return a JSON object.');
     }
     return Map<String, dynamic>.from(decoded);
+  }
+}
+
+class BackendClientException implements Exception {
+  const BackendClientException({
+    required this.statusCode,
+    required this.detail,
+    this.actionRequired = '',
+    this.path = '',
+  });
+
+  final int statusCode;
+  final String detail;
+  final String actionRequired;
+  final String path;
+
+  @override
+  String toString() {
+    final action = actionRequired.trim();
+    if (action.isEmpty) {
+      return 'BackendClientException($statusCode): $detail';
+    }
+    return 'BackendClientException($statusCode): $detail $action';
   }
 }
 
@@ -3408,13 +4522,29 @@ class SceneController extends ChangeNotifier {
     if (current == null) return;
 
     final clampedX = x
-        .clamp(0.0, math.max(0.0, _boardSize.width - current.width))
+        .clamp(0.0, math.max(0.0, _boardSize.width - current.scaledWidth))
         .toDouble();
     final clampedY = y
-        .clamp(0.0, math.max(0.0, _boardSize.height - current.height))
+        .clamp(0.0, math.max(0.0, _boardSize.height - current.scaledHeight))
         .toDouble();
 
     _objects[name] = current.copyWith(x: clampedX, y: clampedY);
+    notifyListeners();
+  }
+
+  void setObjectScaleFromGesture(String name, double baseScale) {
+    final current = _objects[name];
+    if (current == null) return;
+    final targetScale = baseScale.clamp(0.75, 1.8).toDouble();
+    final updated = current.copyWith(baseScale: targetScale);
+    _objects[name] = _clampObjectToBoard(updated);
+    notifyListeners();
+  }
+
+  void snapObjectToNearestValidPosition(String name) {
+    final current = _objects[name];
+    if (current == null) return;
+    _objects[name] = _resolveNonOverlappingPlacement(current);
     notifyListeners();
   }
 
@@ -3562,9 +4692,6 @@ class SceneController extends ChangeNotifier {
       }
     }
 
-    x = x.clamp(0.0, math.max(0.0, _boardSize.width - width)).toDouble();
-    y = y.clamp(0.0, math.max(0.0, _boardSize.height - height)).toDouble();
-
     final object = SceneObjectData(
       name: name,
       text: json['text']?.toString() ?? name,
@@ -3589,10 +4716,10 @@ class SceneController extends ChangeNotifier {
       extraData: _readExtraData(json['extraData'] ?? json['extra_data']),
     );
 
-    _objects[name] = object;
+    _objects[name] = _resolveNonOverlappingPlacement(object);
     notifyListeners();
 
-    return {'ok': true, 'action': 'create', 'object': object.toJson()};
+    return {'ok': true, 'action': 'create', 'object': _objects[name]!.toJson()};
   }
 
   Map<String, dynamic> _moveFromJson(Map<String, dynamic> json) {
@@ -3602,16 +4729,11 @@ class SceneController extends ChangeNotifier {
       throw StateError('Object "$name" not found.');
     }
 
-    final x = _readDouble(
-      json['x'],
-      fallback: current.x,
-    ).clamp(0.0, math.max(0.0, _boardSize.width - current.width)).toDouble();
-    final y = _readDouble(
-      json['y'],
-      fallback: current.y,
-    ).clamp(0.0, math.max(0.0, _boardSize.height - current.height)).toDouble();
-
-    _objects[name] = current.copyWith(x: x, y: y);
+    final moved = current.copyWith(
+      x: _readDouble(json['x'], fallback: current.x),
+      y: _readDouble(json['y'], fallback: current.y),
+    );
+    _objects[name] = _resolveNonOverlappingPlacement(moved);
     notifyListeners();
 
     return {'ok': true, 'action': 'move', 'object': _objects[name]!.toJson()};
@@ -3633,7 +4755,9 @@ class SceneController extends ChangeNotifier {
         .clamp(0.15, 8.0)
         .toDouble();
 
-    _objects[name] = current.copyWith(baseScale: targetScale);
+    _objects[name] = _resolveNonOverlappingPlacement(
+      current.copyWith(baseScale: targetScale),
+    );
     notifyListeners();
 
     return {
@@ -3711,9 +4835,9 @@ class SceneController extends ChangeNotifier {
 
     for (final object in _objects.values.where((o) => !o.isDeleting)) {
       xs.add(object.x.clamp(0.0, width).toDouble());
-      xs.add((object.x + object.width).clamp(0.0, width).toDouble());
+      xs.add((object.x + object.scaledWidth).clamp(0.0, width).toDouble());
       ys.add(object.y.clamp(0.0, height).toDouble());
-      ys.add((object.y + object.height).clamp(0.0, height).toDouble());
+      ys.add((object.y + object.scaledHeight).clamp(0.0, height).toDouble());
     }
 
     final sortedX = xs.toList()..sort();
@@ -3750,14 +4874,82 @@ class SceneController extends ChangeNotifier {
     return bestRect;
   }
 
-  bool _overlapsAny(Rect candidate) {
-    for (final object in _objects.values.where((o) => !o.isDeleting)) {
-      final rect = Rect.fromLTWH(
-        object.x,
-        object.y,
-        object.width,
-        object.height,
+  SceneObjectData _clampObjectToBoard(SceneObjectData object) {
+    final x = object.x
+        .clamp(0.0, math.max(0.0, _boardSize.width - object.scaledWidth))
+        .toDouble();
+    final y = object.y
+        .clamp(0.0, math.max(0.0, _boardSize.height - object.scaledHeight))
+        .toDouble();
+    return object.copyWith(x: x, y: y);
+  }
+
+  SceneObjectData _resolveNonOverlappingPlacement(SceneObjectData object) {
+    final clamped = _clampObjectToBoard(object);
+    final preferredRect = _objectRect(clamped);
+    if (!_overlapsAny(preferredRect, excludingName: clamped.name)) {
+      return clamped;
+    }
+
+    final maxX = math.max(0.0, _boardSize.width - clamped.scaledWidth);
+    final maxY = math.max(0.0, _boardSize.height - clamped.scaledHeight);
+    const step = 24.0;
+
+    SceneObjectData? bestCandidate;
+    var bestDistance = double.infinity;
+
+    void consider(double x, double y) {
+      final candidate = clamped.copyWith(
+        x: x.clamp(0.0, maxX).toDouble(),
+        y: y.clamp(0.0, maxY).toDouble(),
       );
+      final rect = _objectRect(candidate);
+      if (_overlapsAny(rect, excludingName: clamped.name)) {
+        return;
+      }
+      final distance = math.pow(candidate.x - clamped.x, 2) +
+          math.pow(candidate.y - clamped.y, 2);
+      if (distance < bestDistance) {
+        bestDistance = distance.toDouble();
+        bestCandidate = candidate;
+      }
+    }
+
+    consider(clamped.x, clamped.y);
+    for (double y = 0; y <= maxY; y += step) {
+      for (double x = 0; x <= maxX; x += step) {
+        consider(x, y);
+      }
+    }
+
+    if (bestCandidate != null) {
+      return bestCandidate!;
+    }
+
+    final emptyRect = findLargestEmptyRect();
+    if (emptyRect != null &&
+        emptyRect.width >= clamped.scaledWidth &&
+        emptyRect.height >= clamped.scaledHeight) {
+      return clamped.copyWith(x: emptyRect.left, y: emptyRect.top);
+    }
+    return clamped;
+  }
+
+  Rect _objectRect(SceneObjectData object) {
+    return Rect.fromLTWH(
+      object.x,
+      object.y,
+      object.scaledWidth,
+      object.scaledHeight,
+    );
+  }
+
+  bool _overlapsAny(Rect candidate, {String? excludingName}) {
+    for (final object in _objects.values.where((o) => !o.isDeleting)) {
+      if (excludingName != null && object.name == excludingName) {
+        continue;
+      }
+      final rect = _objectRect(object);
       if (_rectanglesOverlap(candidate, rect)) {
         return true;
       }
@@ -3904,6 +5096,10 @@ class SceneObjectData {
   final List<String> tags;
   final Map<String, dynamic> extraData;
 
+  double get scaledWidth => width * baseScale;
+
+  double get scaledHeight => height * baseScale;
+
   bool get isUserObject {
     final kind = (extraData['kind'] ?? '').toString().trim().toLowerCase();
     if (kind == 'user' || kind == 'user_chat') {
@@ -3969,7 +5165,7 @@ class SceneObjectData {
       'deleteAfterClick': deleteAfterClick,
       'tags': tags,
       'extraData': extraData,
-      'bbox': {'x': x, 'y': y, 'width': width, 'height': height},
+      'bbox': {'x': x, 'y': y, 'width': scaledWidth, 'height': scaledHeight},
     };
   }
 }
@@ -3983,6 +5179,8 @@ class BoardObjectWidget extends StatefulWidget {
     required this.onDeleteComplete,
     required this.onDragPositionChanged,
     required this.onDragEnded,
+    required this.onScaleChanged,
+    required this.onScaleEnded,
   });
 
   final SceneObjectData data;
@@ -3991,6 +5189,8 @@ class BoardObjectWidget extends StatefulWidget {
   final VoidCallback onDeleteComplete;
   final void Function(double x, double y) onDragPositionChanged;
   final Future<void> Function() onDragEnded;
+  final ValueChanged<double> onScaleChanged;
+  final Future<void> Function() onScaleEnded;
 
   @override
   State<BoardObjectWidget> createState() => _BoardObjectWidgetState();
@@ -4011,6 +5211,7 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
   bool _deletionDone = false;
   bool _isDragging = false;
   Offset? _dragPointerOffset;
+  double _gestureStartScale = 1;
 
   @override
   void initState() {
@@ -4153,7 +5354,56 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
           .clamp(18.0, 26.0)
           .toDouble(),
     );
-    final canRemove = !widget.data.isUserObject;
+    final canRemove = true;
+    final kind = (widget.data.extraData['kind'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    final badgeLabel = switch (kind) {
+      'weather_snapshot' => 'Време',
+      'outing_suggestion' => 'Навън',
+      'meetup_invite' => 'Среща',
+      'phone_command' => 'Телефон',
+      'user' || 'user_chat' => 'Човек',
+      _ => 'Резултат',
+    };
+    final subtitle = () {
+      if (kind == 'weather_snapshot') {
+        return (widget.data.extraData['summary'] ?? '').toString();
+      }
+      if (kind == 'outing_suggestion') {
+        return (widget.data.extraData['place_name'] ??
+                widget.data.extraData['recommended_when_bg'] ??
+                '')
+            .toString();
+      }
+      if (kind == 'meetup_invite') {
+        return (widget.data.extraData['meeting_when_bg'] ??
+                widget.data.extraData['friend_name'] ??
+                '')
+            .toString();
+      }
+      if (kind == 'phone_command') {
+        return 'Натиснете, за да продължите';
+      }
+      if (widget.data.isUserObject) {
+        return 'Натиснете, за да отворите';
+      }
+      return '';
+    }().trim();
+    final accentColor = switch (kind) {
+      'weather_snapshot' => const Color(0xFFE9C46A),
+      'outing_suggestion' => const Color(0xFFA8C7B5),
+      'meetup_invite' => const Color(0xFFE7C4B4),
+      'phone_command' => const Color(0xFFD88B73),
+      _ => Colors.white.withValues(alpha: 0.76),
+    };
+    final panelRadius = BorderRadius.only(
+      topLeft: Radius.circular(borderRadius.topLeft.x + 6),
+      topRight: Radius.circular(borderRadius.topRight.x + 12),
+      bottomLeft: Radius.circular(borderRadius.bottomLeft.x + 12),
+      bottomRight: Radius.circular(borderRadius.bottomRight.x + 4),
+    );
 
     return Positioned(
       left: livePosition.dx,
@@ -4166,37 +5416,36 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTap: widget.onTap,
-            onPanStart: (details) {
+            onScaleStart: (details) {
               final box = context.findRenderObject() as RenderBox?;
               if (box == null) return;
-              _dragPointerOffset = box.globalToLocal(details.globalPosition);
+              _dragPointerOffset = box.globalToLocal(details.focalPoint);
+              _gestureStartScale = widget.data.baseScale;
               setState(() {
                 _isDragging = true;
               });
             },
-            onPanUpdate: (details) {
+            onScaleUpdate: (details) {
               final board = context.findAncestorRenderObjectOfType<RenderBox>();
               final dragOffset = _dragPointerOffset;
               if (board == null || dragOffset == null) return;
-              final localOnBoard = board.globalToLocal(details.globalPosition);
+              final localOnBoard = board.globalToLocal(details.focalPoint);
               widget.onDragPositionChanged(
                 localOnBoard.dx - dragOffset.dx,
                 localOnBoard.dy - dragOffset.dy,
               );
+              if (details.pointerCount > 1 ||
+                  (details.scale - 1.0).abs() > 0.015) {
+                widget.onScaleChanged(_gestureStartScale * details.scale);
+              }
             },
-            onPanEnd: (_) {
+            onScaleEnd: (_) {
               setState(() {
                 _isDragging = false;
                 _dragPointerOffset = null;
               });
               unawaited(widget.onDragEnded());
-            },
-            onPanCancel: () {
-              setState(() {
-                _isDragging = false;
-                _dragPointerOffset = null;
-              });
-              unawaited(widget.onDragEnded());
+              unawaited(widget.onScaleEnded());
             },
             child: SizedBox(
               width: widget.data.width,
@@ -4208,32 +5457,86 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                     height: widget.data.height,
                     decoration: BoxDecoration(
                       color: widget.data.color,
-                      borderRadius: borderRadius,
+                      borderRadius: panelRadius,
                       border: Border.all(
                         color: Colors.black.withValues(alpha: 0.08),
                         width: 1,
                       ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: const Color(0xFF5E3023).withValues(alpha: 0.13),
+                          blurRadius: 20,
+                          offset: const Offset(0, 10),
+                        ),
+                      ],
                     ),
-                    alignment: Alignment.center,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 14,
-                    ),
-                    child: Text(
-                      widget.data.text,
-                      textAlign: TextAlign.center,
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: _bestTextColor(widget.data.color),
-                        fontWeight: FontWeight.w700,
-                        fontSize:
-                            (math.min(widget.data.width, widget.data.height) *
-                                    0.18)
-                                .clamp(14.0, 22.0)
-                                .toDouble(),
-                        height: 1.1,
-                      ),
+                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: accentColor,
+                                borderRadius: BorderRadius.circular(16),
+                              ),
+                              child: Text(
+                                badgeLabel,
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                            ),
+                            const Spacer(),
+                            Container(
+                              width: 18,
+                              height: 8,
+                              decoration: BoxDecoration(
+                                color: Colors.white.withValues(alpha: 0.3),
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const Spacer(),
+                        Text(
+                          widget.data.text,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: _bestTextColor(widget.data.color),
+                            fontWeight: FontWeight.w800,
+                            fontSize:
+                                (math.min(widget.data.width, widget.data.height) *
+                                        0.16)
+                                    .clamp(16.0, 24.0)
+                                    .toDouble(),
+                            height: 1.08,
+                          ),
+                        ),
+                        if (subtitle.isNotEmpty) ...[
+                          const SizedBox(height: 8),
+                          Text(
+                            subtitle,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: _bestTextColor(
+                                widget.data.color,
+                              ).withValues(alpha: 0.82),
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.w600,
+                              height: 1.2,
+                            ),
+                          ),
+                        ],
+                      ],
                     ),
                   ),
                   if (canRemove)
@@ -4244,18 +5547,18 @@ class _BoardObjectWidgetState extends State<BoardObjectWidget>
                         behavior: HitTestBehavior.opaque,
                         onTap: widget.onRemovePressed,
                         child: Container(
-                          width: 24,
-                          height: 24,
+                          width: 28,
+                          height: 28,
                           alignment: Alignment.center,
                           decoration: BoxDecoration(
-                            color: Colors.black.withValues(alpha: 0.12),
+                            color: Colors.black.withValues(alpha: 0.10),
                             shape: BoxShape.circle,
                           ),
                           child: Text(
-                            'x',
+                            '×',
                             style: TextStyle(
                               color: _bestTextColor(widget.data.color),
-                              fontSize: 12,
+                              fontSize: 15,
                               fontWeight: FontWeight.w700,
                               height: 1,
                             ),
