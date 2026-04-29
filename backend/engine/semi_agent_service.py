@@ -798,6 +798,11 @@ class SemiAgentService:
         auto_open_viewer: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         normalized_board_state = self.board_memory.normalize_board_state(board_state)
+        logger.info(
+            "semi-agent whitespace route=%s auto_open_viewer=%s",
+            route_decision.route,
+            bool(auto_open_viewer),
+        )
         return {
             "ok": True,
             "status": "completed",
@@ -865,6 +870,13 @@ class SemiAgentService:
                 location_payload=normalized_location,
                 user_id=self._clean_text(user_context.get("resolved_user_id")) or None,
             )
+            logger.info(
+                "weather whitespace input prompt=%r route_location=%r received_location=%s effective_location=%s",
+                self._clean_text(prompt),
+                self._clean_text(route_decision.location),
+                normalized_location,
+                effective_location,
+            )
             try:
                 payload = self._fetch_live_tool_payload(
                     tool_name="weather",
@@ -882,8 +894,26 @@ class SemiAgentService:
                         "surface_preference": "popup_only",
                         "weather": weather,
                     }
-            except Exception:
-                viewer = {}
+                    logger.info(
+                        "weather whitespace viewer created summary=%r",
+                        viewer.get("summary"),
+                    )
+                else:
+                    logger.warning(
+                        "weather whitespace payload had no weather object: %s",
+                        payload,
+                    )
+                    viewer = self._weather_failure_viewer(
+                        "Не успях да подготвя картата за времето."
+                    )
+            except Exception as exc:
+                logger.warning("weather whitespace failed: %s", exc, exc_info=True)
+                message = (
+                    "Трябва ми местоположение, за да покажа времето."
+                    if "Location is required" in str(exc)
+                    else "Не успях да заредя времето. Опитайте отново след малко."
+                )
+                viewer = self._weather_failure_viewer(message)
         return self._build_routed_whitespace_payload(
             prompt=prompt,
             board_state=board_state,
@@ -891,6 +921,15 @@ class SemiAgentService:
             reasoning_provider=reasoning_provider,
             auto_open_viewer=viewer,
         )
+
+    def _weather_failure_viewer(self, message: str) -> Dict[str, Any]:
+        clean_message = self._clean_text(message) or "Не успях да заредя времето."
+        return {
+            "widget_type": "summary_only",
+            "title": "Времето",
+            "summary": clean_message,
+            "surface_preference": "popup_only",
+        }
 
     def _build_speech_payload_from_text(
         self,
@@ -1056,20 +1095,33 @@ class SemiAgentService:
         user_id: str | None,
     ) -> Dict[str, Any]:
         if tool_name == "weather":
+            logger.info(
+                "weather tool input prompt=%r location_hint=%r location_payload=%s user_id=%s",
+                self._clean_text(prompt),
+                self._clean_text(location),
+                location_payload,
+                user_id,
+            )
             if not self._clean_text(location):
-                return self.weather_agent_service.get_current_weather_for_prompt(
+                payload = self.weather_agent_service.get_current_weather_for_prompt(
                     agent_user_id=user_id,
                     prompt=prompt,
                     location=location_payload,
                     timezone_name=self._clean_text((location_payload or {}).get("timezone")) or None,
                 )
+                logger.info("weather tool success via coordinates/profile")
+                return payload
             if hasattr(self.weather_service, "get_weather"):
-                return self.weather_service.get_weather(
+                payload = self.weather_service.get_weather(
                     prompt=prompt,
                     location=location or None,
                     location_payload=location_payload,
                 )
-            return self.weather_service.get_current_weather(location)
+                logger.info("weather tool success via location hint")
+                return payload
+            payload = self.weather_service.get_current_weather(location)
+            logger.info("weather tool success via current weather service")
+            return payload
         if tool_name == "time":
             return self.time_service.get_current_time(location)
         return self.search_service.search(prompt)
@@ -1296,7 +1348,15 @@ class SemiAgentService:
         normalized_reasoning_provider = self._normalize_reasoning_provider(reasoning_provider)
         normalized_board_state = self.board_memory.normalize_board_state(board_state)
         user_context = self.user_tracker.resolve(user_id=user_id)
+        normalized_location = self._normalize_location_payload(location)
         route_decision = self._route_request(clean_prompt, normalized_board_state)
+        logger.info(
+            "semi-agent run route=%s tool=%s location=%s user=%s",
+            route_decision.route,
+            route_decision.tool_name,
+            normalized_location,
+            user_context.get("resolved_user_id"),
+        )
 
         if route_decision.route == "direct_reasoning":
             return {
@@ -1318,7 +1378,7 @@ class SemiAgentService:
                 **self._run_live_tool(
                     prompt=clean_prompt,
                     board_state=normalized_board_state,
-                    location=location,
+                    location=normalized_location,
                     user_context=user_context,
                     session_id=session_id,
                     route_decision=route_decision,
@@ -1333,7 +1393,7 @@ class SemiAgentService:
             prompt=clean_prompt,
             board_state=normalized_board_state,
             largest_empty_space=largest_empty_space,
-            location=location,
+            location=normalized_location,
             user_id=user_id,
             session_id=session_id,
             reasoning_provider=normalized_reasoning_provider,
@@ -1393,7 +1453,15 @@ class SemiAgentService:
         normalized_reasoning_provider = self._normalize_reasoning_provider(reasoning_provider)
         normalized_board_state = self.board_memory.normalize_board_state(board_state)
         user_context = self.user_tracker.resolve(user_id=user_id)
+        normalized_location = self._normalize_location_payload(location)
         route_decision = self._route_request(clean_prompt, normalized_board_state)
+        logger.info(
+            "semi-agent start_run route=%s tool=%s location=%s user=%s",
+            route_decision.route,
+            route_decision.tool_name,
+            normalized_location,
+            user_context.get("resolved_user_id"),
+        )
 
         if route_decision.route in {"direct_reasoning", "live_tool"}:
             run_id = f"run_{uuid.uuid4().hex}"
@@ -1411,7 +1479,7 @@ class SemiAgentService:
                     user_context=user_context,
                     session_id=session_id,
                     route_decision=route_decision,
-                    location=location,
+                    location=normalized_location,
                 )
             if route_decision.route == "live_tool":
                 whitespace_future = self._executor.submit(
@@ -1419,7 +1487,7 @@ class SemiAgentService:
                     prompt=clean_prompt,
                     board_state=normalized_board_state,
                     route_decision=route_decision,
-                    location=location,
+                    location=normalized_location,
                     user_context=user_context,
                     reasoning_provider=normalized_reasoning_provider,
                 )
@@ -1711,6 +1779,8 @@ class SemiAgentService:
                     "error": error_text,
                 }
                 warnings.append(f"live_tool_error={exc}")
+                if tool_name == "weather":
+                    logger.warning("weather speech tool failed: %s", exc, exc_info=True)
             assistant_text, llm_source, summary_warnings = self._summarize_live_tool_payload(
                 prompt=prompt,
                 tool_payload=tool_payload,
@@ -2190,6 +2260,20 @@ class SemiAgentService:
                     "viewer": viewer,
                 }
 
+        direct_dynamic_viewer = self._extract_dynamic_ui_viewer(
+            object_payload=object_payload,
+            binding={},
+        )
+        if direct_dynamic_viewer is not None:
+            return {
+                "ok": True,
+                "found": True,
+                "object_name": object_name,
+                "message": "Opened the dynamic widget.",
+                "board_commands": [],
+                "viewer": direct_dynamic_viewer,
+            }
+
         if binding is None:
             return {
                 "ok": True,
@@ -2523,12 +2607,23 @@ class SemiAgentService:
             arguments.get("location") if isinstance(arguments.get("location"), dict) else None
         )
         timezone_name = self._clean_text(arguments.get("timezone"))
-        return self.weather_agent_service.get_current_weather_for_prompt(
+        effective_location = argument_location or location
+        logger.info(
+            "weather mcp input prompt=%r arguments_location=%s request_location=%s effective_location=%s user_id=%s",
+            self._clean_text(prompt),
+            argument_location,
+            location,
+            effective_location,
+            user_id,
+        )
+        payload = self.weather_agent_service.get_current_weather_for_prompt(
             agent_user_id=user_id,
             prompt=prompt,
-            location=argument_location or location,
+            location=effective_location,
             timezone_name=timezone_name or None,
         )
+        logger.info("weather mcp success widget_type=%s", payload.get("widget_type"))
+        return payload
 
     def _dispatch_phone_command_tool(
         self,
@@ -2905,6 +3000,20 @@ class SemiAgentService:
         default_payload: Dict[str, Any],
         user_id: str,
     ) -> Dict[str, Any]:
+        dynamic_ui_viewer = self._extract_dynamic_ui_viewer(
+            object_payload=object_payload,
+            binding=binding,
+        )
+        if dynamic_ui_viewer is not None:
+            return {
+                "title": self._clean_text(dynamic_ui_viewer.get("title")) or default_title,
+                "summary": self._clean_text(dynamic_ui_viewer.get("summary")) or default_summary,
+                "memory_type": binding.get("memory_type"),
+                "linked_call_ids": binding.get("linked_call_ids", []),
+                "payload": default_payload,
+                **dynamic_ui_viewer,
+            }
+
         target_user_id = self._extract_target_user_id(object_payload, binding)
         if target_user_id is not None:
             try:
@@ -2986,6 +3095,71 @@ class SemiAgentService:
             "linked_call_ids": binding.get("linked_call_ids", []),
             "payload": default_payload,
         }
+
+    def _extract_dynamic_ui_viewer(
+        self,
+        *,
+        object_payload: Dict[str, Any],
+        binding: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        candidates: List[Dict[str, Any]] = []
+        for value in (object_payload, object_payload.get("extraData"), object_payload.get("extra_data")):
+            if isinstance(value, dict):
+                candidates.append(value)
+        payload = binding.get("payload") if isinstance(binding.get("payload"), dict) else {}
+        linked_results = payload.get("linked_results") if isinstance(payload.get("linked_results"), list) else []
+        for linked in linked_results:
+            if not isinstance(linked, dict):
+                continue
+            result = linked.get("result") if isinstance(linked.get("result"), dict) else {}
+            candidates.append(result)
+            board_object = result.get("board_object") if isinstance(result.get("board_object"), dict) else {}
+            candidates.append(board_object)
+            extra_data = board_object.get("extra_data", board_object.get("extraData"))
+            if isinstance(extra_data, dict):
+                candidates.append(extra_data)
+
+        for candidate in candidates:
+            dynamic_payload = self._dynamic_ui_payload_from_candidate(candidate)
+            if dynamic_payload is None:
+                continue
+            return {
+                "widget_type": "dynamic_ui",
+                "title": self._clean_text(dynamic_payload.get("title") or candidate.get("title")),
+                "summary": self._clean_text(dynamic_payload.get("summary") or candidate.get("summary")),
+                "ui": self._clean_jsonish(dynamic_payload.get("ui") or dynamic_payload.get("ui_tree") or {}),
+                "state": self._clean_jsonish(
+                    dynamic_payload.get("state")
+                    or candidate.get("dynamic_ui_state")
+                    or candidate.get("dynamicUiState")
+                    or {}
+                ),
+                "voiceBindings": self._clean_jsonish(
+                    dynamic_payload.get("voiceBindings")
+                    or dynamic_payload.get("voice_bindings")
+                    or []
+                ),
+            }
+        return None
+
+    def _dynamic_ui_payload_from_candidate(
+        self,
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        widget_type = self._clean_text(candidate.get("widget_type")).lower()
+        kind = self._clean_text(candidate.get("kind")).lower()
+        if widget_type == "dynamic_ui" and (
+            isinstance(candidate.get("ui"), dict) or isinstance(candidate.get("ui_tree"), dict)
+        ):
+            return candidate
+        dynamic_ui = candidate.get("dynamic_ui", candidate.get("dynamicUi"))
+        if isinstance(dynamic_ui, dict):
+            return dynamic_ui
+        if kind == "dynamic_ui" and (
+            isinstance(candidate.get("ui"), dict) or isinstance(candidate.get("ui_tree"), dict)
+        ):
+            return candidate
+        return None
 
     def _extract_target_user_id(
         self,
@@ -4073,6 +4247,8 @@ class SemiAgentService:
         widget_type = self._clean_text(result.get("widget_type"))
         if widget_type == "phone_command_launcher":
             return None
+        if widget_type == "dynamic_ui":
+            return deepcopy(result)
         if widget_type in {
             "meetup_invite",
             "weather_snapshot",

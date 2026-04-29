@@ -16,6 +16,7 @@ import 'google_calendar_connect.dart';
 import 'src/config/backend_base_url.dart';
 import 'src/screens/navigation_launcher_screen.dart';
 import 'src/theme/app_theme.dart';
+import 'src/widgets/dynamic_ui_renderer.dart';
 
 const _bloodRed = Color(0xFF8C1C13);
 const _almondCream = Color(0xFFE7D7C1);
@@ -1392,6 +1393,7 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   final TextEditingController _promptController = TextEditingController();
   late final String _sessionId;
   _ActiveUserPopup? _activeUserPopup;
+  GlobalKey<DynamicUiViewerState>? _activeDynamicUiKey;
   Map<String, dynamic>? _cachedLocationPayload;
   String _lastSpeech = 'Готов съм. Кажете какво искате да направя.';
   String _statusText = 'Loading saved board memory...';
@@ -1800,6 +1802,18 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
   }) async {
     final cleanMessage = message.trim();
     if (cleanMessage.isEmpty || _isBusy) return;
+    final handledByDynamicUi =
+        await _activeDynamicUiKey?.currentState?.applyVoicePhrase(cleanMessage) ??
+            false;
+    if (handledByDynamicUi) {
+      _promptController.clear();
+      if (mounted) {
+        setState(() {
+          _statusText = 'Интерактивната карта е обновена.';
+        });
+      }
+      return;
+    }
 
     setState(() {
       _isBusy = true;
@@ -1812,6 +1826,9 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
 
     try {
       final location = await _maybeResolveCurrentLocationPayload(cleanMessage);
+      debugPrint(
+        'HelloAgain weather/location: attaching location=${location != null}',
+      );
       final startPayload = await _backendClient.startAgentRun(
         prompt: cleanMessage,
         boardState: _sceneController.exportStateSnapshot(),
@@ -1962,45 +1979,100 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
     String prompt,
   ) async {
     if (!_promptNeedsPreciseLocation(prompt)) {
+      debugPrint('HelloAgain location: prompt does not need location.');
       return null;
     }
     if (_cachedLocationPayload != null) {
+      debugPrint(
+        'HelloAgain location: using cached lat=${_cachedLocationPayload!['lat']} lng=${_cachedLocationPayload!['lng']}',
+      );
       return _cachedLocationPayload;
     }
+    final canUseBackendProfileFallback = (widget.accountToken ?? '').trim().isNotEmpty;
     try {
       final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      debugPrint('HelloAgain location: serviceEnabled=$serviceEnabled');
       if (!serviceEnabled) {
-        return null;
+        if (canUseBackendProfileFallback) {
+          debugPrint(
+            'HelloAgain location: GPS disabled; backend may use saved home coordinates.',
+          );
+          return null;
+        }
+        throw StateError(
+          'Разрешението е включено, но не успях да взема местоположението. Проверете дали GPS е активен.',
+        );
       }
       var permission = await Geolocator.checkPermission();
+      debugPrint('HelloAgain location: permission before request=$permission');
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
+        debugPrint('HelloAgain location: permission after request=$permission');
       }
       if (permission == LocationPermission.denied ||
           permission == LocationPermission.deniedForever) {
-        return null;
+        if (canUseBackendProfileFallback) {
+          debugPrint(
+            'HelloAgain location: permission denied; backend may use saved home coordinates.',
+          );
+          return null;
+        }
+        throw StateError('Трябва ми местоположение, за да покажа времето.');
       }
       Position? position;
       try {
         position = await Geolocator.getCurrentPosition(
           locationSettings: const LocationSettings(
             accuracy: LocationAccuracy.medium,
+            timeLimit: Duration(seconds: 10),
           ),
         );
-      } catch (_) {
-        position = await Geolocator.getLastKnownPosition();
+      } catch (error) {
+        debugPrint('HelloAgain location: current position failed: $error');
+        final lastKnown = await Geolocator.getLastKnownPosition();
+        final timestamp = lastKnown?.timestamp;
+        final isRecent = timestamp == null ||
+            DateTime.now().difference(timestamp).abs() <
+                const Duration(minutes: 10);
+        position = isRecent ? lastKnown : null;
+        debugPrint(
+          'HelloAgain location: lastKnown usable=${position != null} timestamp=$timestamp',
+        );
       }
       if (position == null) {
-        return null;
+        if (canUseBackendProfileFallback) {
+          debugPrint(
+            'HelloAgain location: no GPS coordinates; backend may use saved home coordinates.',
+          );
+          return null;
+        }
+        throw StateError(
+          'Разрешението е включено, но не успях да взема местоположението. Проверете дали GPS е активен.',
+        );
       }
+      debugPrint(
+        'HelloAgain location: received lat=${position.latitude} lng=${position.longitude}',
+      );
       _cachedLocationPayload = <String, dynamic>{
         'lat': position.latitude,
         'lng': position.longitude,
         'timezone': DateTime.now().timeZoneName,
       };
       return _cachedLocationPayload;
-    } catch (_) {
-      return null;
+    } catch (error) {
+      if (error is StateError) {
+        rethrow;
+      }
+      debugPrint('HelloAgain location: unexpected failure: $error');
+      if (canUseBackendProfileFallback) {
+        debugPrint(
+          'HelloAgain location: backend may use saved home coordinates after frontend failure.',
+        );
+        return null;
+      }
+      throw StateError(
+        'Разрешението е включено, но не успях да взема местоположението. Проверете дали GPS е активен.',
+      );
     }
   }
 
@@ -2023,6 +2095,16 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       'place to go',
       'go outside',
       'park',
+      'времето',
+      'температура',
+      'прогноза',
+      'дъжд',
+      'слънчево',
+      'облачно',
+      'навън',
+      'разходка',
+      'на открито',
+      'среща',
       'времето',
       'температура',
       'дъжд',
@@ -2077,6 +2159,35 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
         return;
       }
     }
+    if (_isDynamicUiViewer(viewer)) {
+      final dynamicUiKey = GlobalKey<DynamicUiViewerState>();
+      final dynamicObjectName = objectName ??
+          (viewer['object_name'] ?? viewer['objectName'])?.toString();
+      _activeDynamicUiKey = dynamicUiKey;
+      try {
+        await showDialog<void>(
+          context: context,
+          barrierDismissible: !automated,
+          builder: (context) => DynamicUiResultDialog(
+            viewer: viewer,
+            dynamicUiKey: dynamicUiKey,
+            onOpenViewer: (nextViewer) => _presentViewer(nextViewer),
+            onStateChanged: dynamicObjectName == null || dynamicObjectName.isEmpty
+                ? null
+                : (state) => _persistDynamicWidgetState(
+                      objectName: dynamicObjectName,
+                      viewer: viewer,
+                      state: state,
+                    ),
+          ),
+        );
+      } finally {
+        if (identical(_activeDynamicUiKey, dynamicUiKey)) {
+          _activeDynamicUiKey = null;
+        }
+      }
+      return;
+    }
     if (!mounted) {
       return;
     }
@@ -2085,6 +2196,45 @@ class _AgentBoardScreenState extends State<AgentBoardScreen> {
       barrierDismissible: !automated,
       builder: (context) => AgentResultDialog(viewer: viewer),
     );
+  }
+
+  bool _isDynamicUiViewer(Map<String, dynamic> viewer) {
+    final widgetType = (viewer['widget_type'] ?? viewer['widgetType'] ?? '')
+        .toString()
+        .trim()
+        .toLowerCase();
+    return widgetType == 'dynamic_ui' ||
+        viewer['ui'] is Map ||
+        viewer['ui_tree'] is Map ||
+        viewer['uiTree'] is Map;
+  }
+
+  Future<void> _persistDynamicWidgetState({
+    required String objectName,
+    required Map<String, dynamic> viewer,
+    required Map<String, dynamic> state,
+  }) async {
+    _sceneController.updateObjectExtraData(objectName, (current) {
+      final next = Map<String, dynamic>.from(current);
+      next['kind'] = (next['kind'] ?? 'dynamic_ui').toString();
+      next['dynamic_ui_state'] = state;
+      final existingUi = next['dynamic_ui'];
+      if (existingUi is Map) {
+        next['dynamic_ui'] = {
+          ...Map<String, dynamic>.from(existingUi),
+          'state': state,
+        };
+      } else if (viewer['ui'] is Map) {
+        next['dynamic_ui'] = {
+          'ui': Map<String, dynamic>.from(viewer['ui'] as Map),
+          'state': state,
+          if (viewer['voiceBindings'] is List)
+            'voiceBindings': List<dynamic>.from(viewer['voiceBindings'] as List),
+        };
+      }
+      return next;
+    });
+    await _persistBoardStateSilently();
   }
 
   Future<void> _applyCommands(dynamic rawCommands) async {
@@ -3440,6 +3590,161 @@ class _PopupActionButton extends StatelessWidget {
   }
 }
 
+class DynamicUiResultDialog extends StatelessWidget {
+  const DynamicUiResultDialog({
+    super.key,
+    required this.viewer,
+    this.dynamicUiKey,
+    this.onStateChanged,
+    this.onOpenViewer,
+  });
+
+  final Map<String, dynamic> viewer;
+  final GlobalKey<DynamicUiViewerState>? dynamicUiKey;
+  final DynamicUiStateChanged? onStateChanged;
+  final DynamicUiOpenViewer? onOpenViewer;
+
+  @override
+  Widget build(BuildContext context) {
+    final title = (viewer['title'] ?? 'Помощник').toString();
+    final summary = (viewer['summary'] ?? '').toString();
+    final root = _dynamicUiRoot(viewer);
+    final state = _dynamicUiState(viewer);
+    final voiceBindings = _dynamicUiVoiceBindings(viewer);
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 430),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: _whiteSmoke,
+            borderRadius: BorderRadius.circular(28),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.16),
+                blurRadius: 32,
+                offset: const Offset(0, 18),
+              ),
+            ],
+          ),
+          child: Padding(
+            padding: const EdgeInsets.all(18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          _PopupChip(
+                            text: 'Интерактивно',
+                            color: const Color(0xFFB85A40),
+                          ),
+                          const SizedBox(height: 10),
+                          Text(
+                            title,
+                            style: const TextStyle(
+                              fontSize: 22,
+                              fontWeight: FontWeight.w900,
+                              height: 1.1,
+                              color: Color(0xFF2E1B1A),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      tooltip: 'Затвори',
+                      onPressed: () => Navigator.of(context).maybePop(),
+                      icon: const Icon(Icons.close_rounded),
+                    ),
+                  ],
+                ),
+                if (summary.trim().isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    summary,
+                    style: TextStyle(
+                      fontSize: 15.5,
+                      height: 1.35,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.black.withValues(alpha: 0.66),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 16),
+                DynamicUiViewer(
+                  key: dynamicUiKey,
+                  root: root,
+                  initialState: state,
+                  voiceBindings: voiceBindings,
+                  onStateChanged: onStateChanged,
+                  onOpenViewer: onOpenViewer,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Map<String, dynamic> _dynamicUiRoot(Map<String, dynamic> viewer) {
+  for (final key in const ['ui', 'ui_tree', 'uiTree']) {
+    final value = viewer[key];
+    if (value is Map) return Map<String, dynamic>.from(value);
+  }
+  final dynamicUi = viewer['dynamic_ui'] ?? viewer['dynamicUi'];
+  if (dynamicUi is Map) {
+    for (final key in const ['ui', 'ui_tree', 'uiTree']) {
+      final value = dynamicUi[key];
+      if (value is Map) return Map<String, dynamic>.from(value);
+    }
+  }
+  return {
+    'type': 'card',
+    'children': [
+      {
+        'type': 'text',
+        'text': (viewer['summary'] ?? 'Няма съдържание за показване.')
+            .toString(),
+        'style': {'textSize': 'medium', 'color': 'primary'},
+      },
+    ],
+  };
+}
+
+Map<String, dynamic> _dynamicUiState(Map<String, dynamic> viewer) {
+  for (final key in const ['state', 'dynamic_ui_state', 'dynamicUiState']) {
+    final value = viewer[key];
+    if (value is Map) return Map<String, dynamic>.from(value);
+  }
+  final dynamicUi = viewer['dynamic_ui'] ?? viewer['dynamicUi'];
+  if (dynamicUi is Map) {
+    final state = dynamicUi['state'];
+    if (state is Map) return Map<String, dynamic>.from(state);
+  }
+  return <String, dynamic>{};
+}
+
+List<dynamic> _dynamicUiVoiceBindings(Map<String, dynamic> viewer) {
+  final direct = viewer['voiceBindings'] ?? viewer['voice_bindings'];
+  if (direct is List) return List<dynamic>.from(direct);
+  final dynamicUi = viewer['dynamic_ui'] ?? viewer['dynamicUi'];
+  if (dynamicUi is Map) {
+    final value = dynamicUi['voiceBindings'] ?? dynamicUi['voice_bindings'];
+    if (value is List) return List<dynamic>.from(value);
+  }
+  return const [];
+}
+
 class AgentResultDialog extends StatelessWidget {
   const AgentResultDialog({super.key, required this.viewer});
 
@@ -3711,9 +4016,12 @@ class AgentWeatherSnapshotView extends StatelessWidget {
     final label = (weather['label'] ?? '').toString();
     final summary = (weather['summary'] ?? '').toString();
     final advice = (weather['advice'] ?? '').toString();
-    final temperature = _formatWeatherNumber(weather['temperature_c']);
-    final apparentTemperature = _formatWeatherNumber(
-      weather['apparent_temperature_c'],
+    final temperature = _formatWeatherTemperature(weather);
+    final apparentTemperature = _formatWeatherTemperature(
+      weather,
+      currentKey: 'apparent_temperature_c',
+      minKey: 'apparent_temperature_min_c',
+      maxKey: 'apparent_temperature_max_c',
     );
     final wind = _formatWeatherNumber(weather['wind_speed']);
     final windUnit = (weather['wind_unit'] ?? 'km/h').toString();
@@ -3908,6 +4216,20 @@ String _formatWeatherNumber(Object? value) {
     return value % 1 == 0 ? value.round().toString() : value.toStringAsFixed(1);
   }
   return value.toString().trim();
+}
+
+String _formatWeatherTemperature(
+  Map<String, dynamic> weather, {
+  String currentKey = 'temperature_c',
+  String minKey = 'temperature_min_c',
+  String maxKey = 'temperature_max_c',
+}) {
+  final current = _formatWeatherNumber(weather[currentKey]);
+  if (current.isNotEmpty) return current;
+  final min = _formatWeatherNumber(weather[minKey]);
+  final max = _formatWeatherNumber(weather[maxKey]);
+  if (min.isNotEmpty && max.isNotEmpty) return '$min-$max';
+  return max.isNotEmpty ? max : min;
 }
 
 String _weatherSubtitle(Map<String, dynamic> weather) {
@@ -4545,6 +4867,17 @@ class SceneController extends ChangeNotifier {
     final current = _objects[name];
     if (current == null) return;
     _objects[name] = _resolveNonOverlappingPlacement(current);
+    notifyListeners();
+  }
+
+  void updateObjectExtraData(
+    String name,
+    Map<String, dynamic> Function(Map<String, dynamic> current) update,
+  ) {
+    final current = _objects[name];
+    if (current == null) return;
+    final nextExtraData = update(Map<String, dynamic>.from(current.extraData));
+    _objects[name] = current.copyWith(extraData: nextExtraData);
     notifyListeners();
   }
 

@@ -27,9 +27,16 @@ class AgentVoiceController extends ChangeNotifier {
   static const _sampleRate = 16000;
   static const _channels = 1;
   static const _speechThreshold = 0.035;
-  static const _silenceWindow = Duration(milliseconds: 900);
-  static const _maxTurnLength = Duration(seconds: 14);
-  static const _minTurnLength = Duration(milliseconds: 450);
+  static const _rollingNoiseWindowMs = 3200;
+  static const _speechStartRatio = 1.8;
+  static const _speechEndRatio = 1.25;
+  static const _minSpeechMs = 450;
+  static const _endSilenceMs = 900;
+  static const _maxTurnMs = 14000;
+  static const _minSpeechAmplitude = 0.010;
+  static const _silenceWindow = Duration(milliseconds: _endSilenceMs);
+  static const _maxTurnLength = Duration(milliseconds: _maxTurnMs);
+  static const _minTurnLength = Duration(milliseconds: _minSpeechMs);
   static const _preSpeechChunkLimit = 8;
 
   final Future<void> Function(String transcript) _onTranscript;
@@ -55,6 +62,10 @@ class AgentVoiceController extends ChangeNotifier {
   bool _suspended = false;
   bool _disposed = false;
   double _micLevel = 0;
+  final _RollingNoiseFloor _noiseFloor = _RollingNoiseFloor(
+    windowMs: _rollingNoiseWindowMs,
+    fallbackLevel: _minSpeechAmplitude / _speechStartRatio,
+  );
   String _status = 'Гласовият режим е изключен.';
   final String _language;
   String? _error;
@@ -62,6 +73,7 @@ class AgentVoiceController extends ChangeNotifier {
   String _lastSpokenText = '';
   DateTime? _speechStartedAt;
   DateTime? _lastVoiceAt;
+  DateTime? _belowVoiceSince;
 
   bool get enabled => _enabled;
   bool get listening => _listening;
@@ -295,17 +307,32 @@ class AgentVoiceController extends ChangeNotifier {
     _emit();
 
     final now = DateTime.now();
+    final floor = _noiseFloor.level;
+    final speechStartLevel = math.max(
+      _minSpeechAmplitude,
+      floor * _speechStartRatio,
+    );
+    final speechEndLevel = math.max(
+      _minSpeechAmplitude * 0.75,
+      floor * _speechEndRatio,
+    );
     if (_speechDetected) {
       _turnChunks.add(chunk);
-      if (level >= _speechThreshold) {
+      if (level >= speechEndLevel || level >= _speechThreshold) {
         _lastVoiceAt = now;
+        _belowVoiceSince = null;
+      } else {
+        _belowVoiceSince ??= now;
       }
 
       if (_speechStartedAt != null &&
           now.difference(_speechStartedAt!) >= _maxTurnLength) {
         unawaited(_finishTurn());
+      } else if (_belowVoiceSince != null &&
+          now.difference(_belowVoiceSince!) >= _silenceWindow) {
+        unawaited(_finishTurn());
       } else if (_lastVoiceAt != null &&
-          now.difference(_lastVoiceAt!) >= _silenceWindow) {
+          now.difference(_lastVoiceAt!) >= _silenceWindow * 3) {
         unawaited(_finishTurn());
       }
       return;
@@ -316,10 +343,11 @@ class AgentVoiceController extends ChangeNotifier {
       _preSpeechChunks.removeFirst();
     }
 
-    if (level >= _speechThreshold) {
+    if (level > speechStartLevel && level >= _minSpeechAmplitude) {
       _speechDetected = true;
       _speechStartedAt = now;
       _lastVoiceAt = now;
+      _belowVoiceSince = null;
       _turnChunks
         ..clear()
         ..addAll(_preSpeechChunks)
@@ -327,6 +355,8 @@ class AgentVoiceController extends ChangeNotifier {
       _preSpeechChunks.clear();
       _status = 'Чувам Ви. Продължете.';
       _emit();
+    } else {
+      _noiseFloor.add(level, now);
     }
   }
 
@@ -421,6 +451,8 @@ class AgentVoiceController extends ChangeNotifier {
     _speechDetected = false;
     _speechStartedAt = null;
     _lastVoiceAt = null;
+    _belowVoiceSince = null;
+    _noiseFloor.clear();
     _preSpeechChunks.clear();
     _turnChunks.clear();
   }
@@ -438,6 +470,46 @@ class AgentVoiceController extends ChangeNotifier {
     unawaited(_backgroundService.stop());
     super.dispose();
   }
+}
+
+class _RollingNoiseFloor {
+  _RollingNoiseFloor({
+    required this.windowMs,
+    required this.fallbackLevel,
+  });
+
+  final int windowMs;
+  final double fallbackLevel;
+  final ListQueue<_NoiseFrame> _frames = ListQueue<_NoiseFrame>();
+  double _sum = 0;
+
+  double get level {
+    if (_frames.isEmpty) {
+      return fallbackLevel;
+    }
+    return math.max(fallbackLevel, _sum / _frames.length);
+  }
+
+  void add(double value, DateTime at) {
+    _frames.add(_NoiseFrame(value, at));
+    _sum += value;
+    final cutoff = at.subtract(Duration(milliseconds: windowMs));
+    while (_frames.isNotEmpty && _frames.first.at.isBefore(cutoff)) {
+      _sum -= _frames.removeFirst().value;
+    }
+  }
+
+  void clear() {
+    _frames.clear();
+    _sum = 0;
+  }
+}
+
+class _NoiseFrame {
+  const _NoiseFrame(this.value, this.at);
+
+  final double value;
+  final DateTime at;
 }
 
 Uint8List _joinChunks(List<Uint8List> chunks) {

@@ -32,9 +32,16 @@ class BrowserVoiceBridge {
   static const int _channels = 1;
   static const double _speechThreshold = 0.010;
   static const double _softSpeechThreshold = 0.0055;
-  static const Duration _maxTurnLength = Duration(seconds: 18);
-  static const Duration _minTurnLength = Duration(milliseconds: 320);
-  static const Duration _silenceWindow = Duration(milliseconds: 700);
+  static const int _rollingNoiseWindowMs = 3200;
+  static const double _speechStartRatio = 1.8;
+  static const double _speechEndRatio = 1.25;
+  static const int _minSpeechMs = 360;
+  static const int _endSilenceMs = 850;
+  static const int _maxTurnMs = 18000;
+  static const double _minSpeechAmplitude = 0.007;
+  static const Duration _maxTurnLength = Duration(milliseconds: _maxTurnMs);
+  static const Duration _minTurnLength = Duration(milliseconds: _minSpeechMs);
+  static const Duration _silenceWindow = Duration(milliseconds: _endSilenceMs);
   static const Duration _speechBootstrapWindow = Duration(milliseconds: 1200);
   static const Duration _noSpeechWindow = Duration(seconds: 8);
   static const int _preSpeechChunkLimit = 8;
@@ -84,7 +91,12 @@ class BrowserVoiceBridge {
     var speechDetected = false;
     DateTime? speechStartedAt;
     DateTime? lastVoiceAt;
+    DateTime? belowVoiceSince;
     final listeningStartedAt = DateTime.now();
+    final noiseFloor = _RollingNoiseFloor(
+      windowMs: _rollingNoiseWindowMs,
+      fallbackLevel: _minSpeechAmplitude / _speechStartRatio,
+    );
     StreamSubscription<Uint8List>? sub;
 
     Future<void> finishCapture() async {
@@ -128,18 +140,33 @@ class BrowserVoiceBridge {
 
         final level = _pcmLevel(chunk);
         final now = DateTime.now();
+        final floor = noiseFloor.level;
+        final speechStartLevel = math.max(
+          _minSpeechAmplitude,
+          floor * _speechStartRatio,
+        );
+        final speechEndLevel = math.max(
+          _softSpeechThreshold,
+          floor * _speechEndRatio,
+        );
 
         if (speechDetected) {
           turnChunks.add(chunk);
-          if (level >= _softSpeechThreshold) {
+          if (level >= speechEndLevel || level >= _speechThreshold) {
             lastVoiceAt = now;
+            belowVoiceSince = null;
+          } else {
+            belowVoiceSince ??= now;
           }
 
           if (speechStartedAt != null &&
               now.difference(speechStartedAt!) >= _maxTurnLength) {
             unawaited(finishCapture());
+          } else if (belowVoiceSince != null &&
+              now.difference(belowVoiceSince!) >= _silenceWindow) {
+            unawaited(finishCapture());
           } else if (lastVoiceAt != null &&
-              now.difference(lastVoiceAt!) >= _silenceWindow) {
+              now.difference(lastVoiceAt!) >= _silenceWindow * 3) {
             unawaited(finishCapture());
           }
           return;
@@ -152,14 +179,16 @@ class BrowserVoiceBridge {
 
         final timeListening = now.difference(listeningStartedAt);
         final crossedSpeechThreshold =
-            level >= _speechThreshold ||
+            (level > speechStartLevel && level >= _minSpeechAmplitude) ||
             (timeListening >= _speechBootstrapWindow &&
-                level >= _softSpeechThreshold);
+                noiseFloor.sampleCount < 4 &&
+                level >= _speechThreshold);
 
         if (crossedSpeechThreshold) {
           speechDetected = true;
           speechStartedAt = now;
           lastVoiceAt = now;
+          belowVoiceSince = null;
           turnChunks
             ..clear()
             ..addAll(preSpeechChunks)
@@ -167,6 +196,8 @@ class BrowserVoiceBridge {
           preSpeechChunks.clear();
         } else if (timeListening >= _noSpeechWindow) {
           unawaited(finishCapture());
+        } else {
+          noiseFloor.add(level, now);
         }
       },
       onError: (Object error, StackTrace stackTrace) async {
@@ -379,6 +410,43 @@ class BrowserVoiceBridge {
     wavBytes.setRange(44, totalLength, pcmBytes);
     return wavBytes;
   }
+}
+
+class _RollingNoiseFloor {
+  _RollingNoiseFloor({
+    required this.windowMs,
+    required this.fallbackLevel,
+  });
+
+  final int windowMs;
+  final double fallbackLevel;
+  final ListQueue<_NoiseFrame> _frames = ListQueue<_NoiseFrame>();
+  double _sum = 0;
+
+  int get sampleCount => _frames.length;
+
+  double get level {
+    if (_frames.isEmpty) {
+      return fallbackLevel;
+    }
+    return math.max(fallbackLevel, _sum / _frames.length);
+  }
+
+  void add(double value, DateTime at) {
+    _frames.add(_NoiseFrame(value, at));
+    _sum += value;
+    final cutoff = at.subtract(Duration(milliseconds: windowMs));
+    while (_frames.isNotEmpty && _frames.first.at.isBefore(cutoff)) {
+      _sum -= _frames.removeFirst().value;
+    }
+  }
+}
+
+class _NoiseFrame {
+  const _NoiseFrame(this.value, this.at);
+
+  final double value;
+  final DateTime at;
 }
 
 BrowserVoiceBridge createBrowserVoiceBridge() => BrowserVoiceBridge();

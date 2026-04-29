@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from apps.accounts.models import AccountProfile
 
 from .services import extract_weather_day_offset, get_weather_snapshot
+
+
+logger = logging.getLogger(__name__)
 
 
 class WeatherAgentService:
@@ -28,12 +32,14 @@ class WeatherAgentService:
         try:
             lat = float(candidate.get("lat"))
             lng = float(candidate.get("lng"))
+            logger.info("weather location resolved from request lat=%s lng=%s", lat, lng)
             return lat, lng
         except (TypeError, ValueError):
             pass
 
         profile = self.resolve_profile(agent_user_id)
         if profile is not None and profile.home_lat is not None and profile.home_lng is not None:
+            logger.info("weather location resolved from saved home coordinates user_id=%s", clean_user_id)
             return float(profile.home_lat), float(profile.home_lng)
         raise ValueError(
             "Location is required for weather. Send location.lat/location.lng or store home coordinates."
@@ -51,10 +57,13 @@ class WeatherAgentService:
         if not clean_prompt:
             raise ValueError("prompt required")
         lat, lng = self.resolve_location(agent_user_id=agent_user_id, location=location)
-        return get_weather_snapshot(
+        logger.info("weather snapshot request lat=%s lng=%s timezone=%s", lat, lng, timezone_name)
+        payload = get_weather_snapshot(
             lat=lat,
             lng=lng,
             day_offset=extract_weather_day_offset(clean_prompt),
             timezone_name=timezone_name,
         )
+        logger.info("weather snapshot success widget_type=%s", payload.get("widget_type"))
+        return payload
 

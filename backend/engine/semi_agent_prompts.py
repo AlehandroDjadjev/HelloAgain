@@ -232,6 +232,14 @@ Rules:
 - The visible object `text` must be a compact summarized title, ideally 2 to 6 words.
 - Deliberately choose that visible title as its own tiny front-facing name. Do not copy it from raw payload structure, JSON keys, or serialized result text.
 - Keep the full MCP structure in the background mapping through `linked_call_ids` and `result_bindings`.
+- For rich interactive UI, attach a safe JSON UI DSL under object `extraData.dynamic_ui` or under the linked result payload with `"widget_type": "dynamic_ui"`.
+- Dynamic UI must be a tree, never code. Use only these node types: card, column, row, stack, grid, scroll, text, rich_text, icon, image, image_picker, button, checkbox, toggle, input, list, progress, chip, divider, spacer.
+- Dynamic UI style tokens are primary, surface, accent, muted; keep text large, spacing calm, and controls easy to tap.
+- Dynamic UI actions may use state_append, state_update, state_remove, state_remove_value, state_toggle, state_set, pick_image, open_viewer, confirm_action, phone_command.
+- For phone context widgets, use phone_command actions to launch the existing phone flow safely; do not invent direct phone data access.
+- For gallery images, use image_picker with a state target, then render that state through an image node.
+- Voice bindings may use wildcard phrases like "добави *" with action values like "$voice.text" so a to-do list works by voice and touch.
+- If you create an interactive dynamic UI widget, add a click/open command for the new object so the user can use voice immediately.
 - Never paste raw MCP JSON, argument blobs, or long response text into `name` or `text`.
 - If there is richer added content, place it in the second layer protocol behind the object using `result_title` and `result_summary`, not in the visible board title.
 - Put it in the center of the board OR in a good empty space.

@@ -386,6 +386,12 @@ def agent_run_start_view(request: HttpRequest):
     prompt = payload.get("prompt", "")
     if not str(prompt).strip():
         return JsonResponse({"detail": "prompt required"}, status=400)
+    location_payload = payload.get("location") if isinstance(payload.get("location"), dict) else {}
+    print(
+        f"[controller] semi-agent start location payload: {location_payload}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     try:
         result = semi_agent_service.start_run(
@@ -394,7 +400,7 @@ def agent_run_start_view(request: HttpRequest):
             largest_empty_space=payload.get("largest_empty_space")
             if isinstance(payload.get("largest_empty_space"), dict)
             else {},
-            location=payload.get("location") if isinstance(payload.get("location"), dict) else {},
+            location=location_payload,
             user_id=_effective_user_id(request, payload),
             session_id=str(payload.get("session_id") or "default_session"),
             reasoning_provider=str(payload.get("reasoning_provider") or "openai"),
