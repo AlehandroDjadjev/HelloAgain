@@ -11,6 +11,7 @@ class SessionStatus(models.TextChoices):
     APPROVED = "approved", "Approved"
     EXECUTING = "executing", "Executing"
     AWAITING_CONFIRMATION = "awaiting_confirmation", "Awaiting Confirmation"
+    AWAITING_USER_INPUT = "awaiting_user_input", "Awaiting User Input"
     PAUSED = "paused", "Paused"
     COMPLETED = "completed", "Completed"
     ABORTED = "aborted", "Aborted"
@@ -106,6 +107,16 @@ class AgentSession(models.Model):
             "Never contains raw screenshots or sensitive field content."
         ),
     )
+    pending_user_input = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Clarification gate state for a pending user-input query. "
+            "Shape: {query_id, status, question, attempt_count, max_attempts, "
+            "required_fields, candidates, ui_context, reason, last_user_reply, "
+            "followup_question, why_unresolved, fallback_mode, entity_updates}."
+        ),
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -124,7 +135,7 @@ class AgentSession(models.Model):
         Expected keys in step_data:
           step_index, action_type, params (redacted), reasoning,
           result_code, result_success, screen_hash_before,
-          screen_hash_after, timestamp (ISO string).
+          screen_hash_after, screen_summary_after, timestamp (ISO string).
         """
         if self.step_history is None:
             self.step_history = []
@@ -137,6 +148,7 @@ class AgentSession(models.Model):
             "result_success":    bool(step_data.get("result_success")),
             "screen_hash_before": step_data.get("screen_hash_before", ""),
             "screen_hash_after":  step_data.get("screen_hash_after", ""),
+            "screen_summary_after": step_data.get("screen_summary_after", ""),
             "timestamp":          step_data.get(
                 "timestamp",
                 datetime.now(timezone.utc).isoformat(),
@@ -157,7 +169,7 @@ class AgentSession(models.Model):
 
     def has_llm_intent(self) -> bool:
         """Return True if this session has LLM intent data ready for execution."""
-        return bool(self.goal and self.target_app)
+        return bool(self.goal)
 
     def store_intent_data(
         self,

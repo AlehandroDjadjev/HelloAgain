@@ -4,6 +4,7 @@ enum PipelinePhase {
   parsingIntent,
   executing,
   awaitingConfirmation,
+  awaitingUserInput,
   completed,
   failed,
   cancelled,
@@ -16,6 +17,7 @@ extension PipelinePhaseLabel on PipelinePhase {
     PipelinePhase.parsingIntent => 'Parsing intent...',
     PipelinePhase.executing => 'Executing...',
     PipelinePhase.awaitingConfirmation => 'Awaiting confirmation',
+    PipelinePhase.awaitingUserInput => 'Awaiting clarification',
     PipelinePhase.completed => 'Completed',
     PipelinePhase.failed => 'Failed',
     PipelinePhase.cancelled => 'Cancelled',
@@ -90,4 +92,59 @@ class ConfirmationRequest {
         recipient: j['recipient'] as String? ?? '',
         contentPreview: j['content_preview'] as String? ?? '',
       );
+}
+
+class UserInputRequest {
+  final String queryId;
+  final String question;
+  final List<String> requiredFields;
+  final List<String> candidates;
+  final int attempt;
+  final int maxAttempts;
+  final String reason;
+  final String whyUnresolved;
+
+  const UserInputRequest({
+    required this.queryId,
+    required this.question,
+    this.requiredFields = const [],
+    this.candidates = const [],
+    this.attempt = 1,
+    this.maxAttempts = 3,
+    this.reason = '',
+    this.whyUnresolved = '',
+  });
+
+  factory UserInputRequest.fromJson(Map<String, dynamic> json) {
+    final params = (json['params'] as Map?)?.cast<String, dynamic>() ?? json;
+    List<String> readStringList(Object? value) {
+      if (value is List) {
+        return value.map((item) => item.toString()).toList();
+      }
+      return const [];
+    }
+
+    return UserInputRequest(
+      queryId:
+          (params['query_id'] ?? json['query_id'] ?? json['id'] ?? '')
+              .toString(),
+      question:
+          (params['question'] ?? json['question'] ?? '').toString(),
+      requiredFields: readStringList(
+        params['required_fields'] ?? json['required_fields'],
+      ),
+      candidates: readStringList(params['candidates'] ?? json['candidates']),
+      attempt:
+          (params['attempt'] as num?)?.toInt() ??
+          (json['attempt'] as num?)?.toInt() ??
+          1,
+      maxAttempts:
+          (params['max_attempts'] as num?)?.toInt() ??
+          (json['max_attempts'] as num?)?.toInt() ??
+          3,
+      reason: (params['reason'] ?? json['reason'] ?? '').toString(),
+      whyUnresolved:
+          (params['why_unresolved'] ?? json['why_unresolved'] ?? '').toString(),
+    );
+  }
 }

@@ -4,10 +4,12 @@ import 'package:android_control_plugin/android_control_plugin.dart';
 import 'package:flutter/foundation.dart' show AsyncCallback;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 import '../api/agent_client.dart';
 import '../api/voice_gateway_client.dart';
 import '../config/backend_base_url.dart';
+import '../native/mic_bridge_client.dart';
 import '../pipeline/orchestrator.dart';
 import '../pipeline/pipeline_state.dart';
 import '../voice/agent_voice_controller.dart';
@@ -28,13 +30,14 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const _defaultReasoningProvider = 'openai';
 
   late final TextEditingController _commandCtrl;
   late final TextEditingController _urlCtrl;
   late PipelineOrchestrator _orch;
   late AgentVoiceController _voiceController;
+  late MicBridgeClient _micBridgeClient;
   final _scrollCtrl = ScrollController();
   bool _showUrlField = false;
   bool _isLeavingApp = false;
@@ -47,6 +50,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     final initialCommand = widget.initialCommand?.trim();
     _commandCtrl = TextEditingController(
       text: (initialCommand != null && initialCommand.isNotEmpty)
@@ -54,7 +58,11 @@ class _HomeScreenState extends State<HomeScreen> {
           : 'Search up Jeffrey Epstien on Chrome',
     );
     _urlCtrl = TextEditingController(text: _resolveDefaultBaseUrl());
-    _orch = PipelineOrchestrator(client: AgentClient(baseUrl: _urlCtrl.text));
+    _micBridgeClient = _buildMicBridgeClient(_urlCtrl.text);
+    _orch = PipelineOrchestrator(
+      client: AgentClient(baseUrl: _urlCtrl.text),
+      micBridgeClient: _micBridgeClient,
+    );
     _orch.addListener(_onOrchestratorChange);
     _voiceController = _buildVoiceController(_urlCtrl.text);
     _voiceController.addListener(_onVoiceControllerChange);
@@ -76,7 +84,18 @@ class _HomeScreenState extends State<HomeScreen> {
     return resolveBackendBaseUrl();
   }
 
+  void _syncVoiceSessionContext() {
+    final activeSessionId = (_orch.sessionId ?? '').trim();
+    _voiceController.updateSessionContext(
+      sessionId: activeSessionId.isNotEmpty ? activeSessionId : null,
+    );
+    _micBridgeClient.updateSessionContext(
+      sessionId: activeSessionId.isNotEmpty ? activeSessionId : null,
+    );
+  }
+
   void _onOrchestratorChange() {
+    _syncVoiceSessionContext();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scrollCtrl.hasClients) {
         _scrollCtrl.jumpTo(_scrollCtrl.position.maxScrollExtent);
@@ -105,7 +124,18 @@ class _HomeScreenState extends State<HomeScreen> {
     }
 
     if (_lastObservedPhase != _orch.phase) {
+      final previousPhase = _lastObservedPhase;
       _lastObservedPhase = _orch.phase;
+      if (previousPhase == PipelinePhase.awaitingUserInput &&
+          _orch.phase != PipelinePhase.awaitingUserInput &&
+          _voiceController.enabled &&
+          !_voiceController.waitingForSingleTurn) {
+        unawaited(
+          _voiceController.resumeListening(
+            status: 'Hands-free mode is active. Listening for speech...',
+          ),
+        );
+      }
       _handlePhaseTransition(_orch.phase);
     }
   }
@@ -118,8 +148,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _orch.removeListener(_onOrchestratorChange);
     _voiceController.removeListener(_onVoiceControllerChange);
+    unawaited(_orch.stopMicBridgeService());
+    unawaited(_micBridgeClient.dispose());
     unawaited(_voiceController.stop());
     _voiceController.dispose();
     _commandCtrl.dispose();
@@ -131,7 +164,13 @@ class _HomeScreenState extends State<HomeScreen> {
   void _rebuildOrchestrator() {
     final shouldRestartVoice = _voiceController.enabled;
     _orch.removeListener(_onOrchestratorChange);
-    _orch = PipelineOrchestrator(client: AgentClient(baseUrl: _urlCtrl.text));
+    unawaited(_orch.stopMicBridgeService());
+    unawaited(_micBridgeClient.dispose());
+    _micBridgeClient = _buildMicBridgeClient(_urlCtrl.text);
+    _orch = PipelineOrchestrator(
+      client: AgentClient(baseUrl: _urlCtrl.text),
+      micBridgeClient: _micBridgeClient,
+    );
     _orch.addListener(_onOrchestratorChange);
     _lastObservedPhase = _orch.phase;
 
@@ -144,6 +183,10 @@ class _HomeScreenState extends State<HomeScreen> {
       unawaited(_voiceController.start());
     }
     setState(() {});
+  }
+
+  MicBridgeClient _buildMicBridgeClient(String baseUrl) {
+    return MicBridgeClient(baseUrl: baseUrl, language: 'bg-BG');
   }
 
   AgentVoiceController _buildVoiceController(String baseUrl) {
@@ -177,7 +220,43 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       return;
     }
+    final micBridgeReady = await _ensureMicBridgeReadyForExecution();
+    if (!micBridgeReady) {
+      return;
+    }
     await _orch.executePrepared();
+  }
+
+  Future<bool> _ensureMicBridgeReadyForExecution() async {
+    final status = await Permission.microphone.status;
+    final granted = status.isGranted
+        ? true
+        : (await Permission.microphone.request()).isGranted;
+    if (!granted) {
+      if (!mounted) {
+        return false;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Microphone permission is required before phone control can ask clarification questions in other apps.',
+          ),
+        ),
+      );
+      return false;
+    }
+    try {
+      await _orch.ensureMicBridgeReady();
+      return true;
+    } catch (error) {
+      if (!mounted) {
+        return false;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Mic bridge could not start: $error')),
+      );
+      return false;
+    }
   }
 
   Future<void> _handleVoiceTranscript(String transcript) async {
@@ -194,6 +273,11 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_orch.phase == PipelinePhase.awaitingConfirmation &&
         _orch.pendingConfirmation != null) {
       await _handleVoiceConfirmation(spokenText);
+      return;
+    }
+
+    if (_orch.phase == PipelinePhase.awaitingUserInput &&
+        _orch.pendingUserInput != null) {
       return;
     }
 
@@ -1342,6 +1426,11 @@ class _PhaseIndicator extends StatelessWidget {
         fg = Colors.orange;
         icon = Icons.touch_app_outlined;
         label = 'Waiting for your confirmation...';
+      case PipelinePhase.awaitingUserInput:
+        bg = Colors.orange.withAlpha(20);
+        fg = Colors.orange;
+        icon = Icons.record_voice_over_outlined;
+        label = 'Waiting for your answer...';
       default:
         bg = cs.primaryContainer.withAlpha(80);
         fg = cs.onPrimaryContainer;

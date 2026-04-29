@@ -7,6 +7,7 @@ from django.test import SimpleTestCase, override_settings
 from apps.agent_core.services.screen_formatter import (
     SENSITIVE_SENTINEL,
     format_screen_for_llm,
+    summarize_screen_for_history,
     summarize_step_history,
 )
 from apps.agent_core.services.step_reasoning import (
@@ -127,14 +128,17 @@ class ScreenFormatterTests(SimpleTestCase):
                 "reasoning": f"Tap n{i}",
                 "result_success": True,
                 "result_code": "OK",
+                "screen_summary_after": f"Foreground=com.android.chrome | Window=Result {i}",
             }
             for i in range(5)
         ]
         text = summarize_step_history(history)
         self.assertEqual(text.count("Step "), 5)
         self.assertIn("Tap n4", text)
+        self.assertIn("screen:", text)
+        self.assertIn("Result 4", text)
 
-    def test_summarize_history_truncation(self):
+    def test_summarize_history_keeps_full_action_trail_when_budget_allows(self):
         history = [
             {
                 "step_index": i + 1,
@@ -142,12 +146,40 @@ class ScreenFormatterTests(SimpleTestCase):
                 "params": {"selector": {"element_ref": f"n{i}"}},
                 "result_success": True,
                 "result_code": "OK",
+                "screen_summary_after": f"Foreground=com.android.chrome | Window=Result {i}",
             }
             for i in range(20)
         ]
         text = summarize_step_history(history, max_steps=5)
+        self.assertIn("Step 1:", text)
+        self.assertIn("Step 20:", text)
+
+    def test_summarize_history_compacts_older_steps_under_small_budget(self):
+        history = [
+            {
+                "step_index": i + 1,
+                "action_type": "TAP_ELEMENT",
+                "params": {"selector": {"element_ref": f"n{i}"}},
+                "reasoning": f"Tap result {i}",
+                "result_success": True,
+                "result_code": "OK",
+                "screen_summary_after": f"Foreground=com.android.chrome | Window=Result {i}",
+            }
+            for i in range(20)
+        ]
+        text = summarize_step_history(history, max_steps=5, token_budget=180)
         self.assertIn("Earlier steps:", text)
-        self.assertLessEqual(text.count("Step "), 5)
+        self.assertIn("#1", text)
+        self.assertIn("#20", text)
+
+    def test_summarize_screen_for_history_redacts_editable_text_values(self):
+        summary = summarize_screen_for_history(_screen([
+            _node("n1", "android.widget.EditText", text="super secret message", editable=True, focused=True),
+            _node("n2", "android.widget.ImageButton", cdesc="Send", clickable=True),
+        ], focused="n1"))
+        self.assertIn("EditText", summary)
+        self.assertIn("Send", summary)
+        self.assertNotIn("super secret message", summary)
 
     def test_format_screen_prefers_contact_name_over_section_header_label(self):
         text = format_screen_for_llm(_screen([
@@ -233,6 +265,72 @@ class ValidationTests(SimpleTestCase):
             "sensitivity": "low",
         }
         self.assertIsNone(_validate_response(raw, _extract_refs(screen_state), screen_state))
+
+    def test_validate_response_allows_request_user_input(self):
+        screen_state = _screen([
+            _node("n1", "android.widget.TextView", text="Alex Chen", clickable=True),
+            _node("n2", "android.widget.TextView", text="Alex Johnson", clickable=True),
+        ])
+        raw = {
+            "action_type": "REQUEST_USER_INPUT",
+            "params": {
+                "question": "Which Alex should I message? I see Alex Chen and Alex Johnson.",
+                "required_fields": ["recipient"],
+                "candidates": ["Alex Chen", "Alex Johnson"],
+                "reason": "multiple_visible_matches",
+                "max_attempts": 3,
+            },
+            "reasoning": "Two visible contacts match the requested recipient, so ask before continuing.",
+            "confidence": 0.9,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        self.assertIsNone(_validate_response(raw, _extract_refs(screen_state), screen_state))
+
+    def test_validate_response_rejects_open_ended_request_user_input(self):
+        screen_state = _screen([
+            _node("n1", "android.widget.TextView", text="Alex Chen", clickable=True),
+            _node("n2", "android.widget.TextView", text="Alex Johnson", clickable=True),
+        ])
+        raw = {
+            "action_type": "REQUEST_USER_INPUT",
+            "params": {
+                "question": "What should I do next?",
+                "required_fields": ["recipient"],
+                "candidates": ["Alex Chen", "Alex Johnson"],
+                "reason": "multiple_visible_matches",
+                "max_attempts": 3,
+            },
+            "reasoning": "The next step is unclear.",
+            "confidence": 0.8,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        error = _validate_response(raw, _extract_refs(screen_state), screen_state)
+        self.assertIn("too open-ended", error or "")
+
+    def test_validate_response_rejects_confirmation_like_request_user_input(self):
+        screen_state = _screen([
+            _node("send_btn", "android.widget.ImageButton", cdesc="Send", clickable=True),
+        ])
+        raw = {
+            "action_type": "REQUEST_USER_INPUT",
+            "params": {
+                "question": "Should I tap Send? Yes or no?",
+                "required_fields": ["recipient"],
+                "reason": "underdetermined_next_step",
+                "max_attempts": 3,
+            },
+            "reasoning": "Ask for approval before sending.",
+            "confidence": 0.8,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        error = _validate_response(raw, _extract_refs(screen_state), screen_state)
+        self.assertIn("approval or yes/no consent", error or "")
 
     def test_validate_response_invalid_action(self):
         screen_state = _screen([_node("n1", "android.widget.Button", text="Go", clickable=True)])
@@ -376,41 +474,77 @@ class StepReasoningServiceTests(SimpleTestCase):
         self.assertAlmostEqual(result.confidence, 0.91)
 
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
-    def test_reason_next_step_marks_chat_goal_complete_when_thread_is_already_open(self, mock_from_settings):
+    def test_reason_next_step_emits_clarification_when_required_entity_is_missing(self, mock_from_settings):
         mock_client = MagicMock()
         mock_client.generate.return_value = {
-            "action_type": "TAP_ELEMENT",
-            "params": {"selector": {"element_ref": "send_btn"}},
-            "reasoning": "The chat thread is open, tap the send area.",
-            "confidence": 0.67,
+            "action_type": "REQUEST_USER_INPUT",
+            "params": {
+                "question": "Where should I navigate?",
+                "required_fields": ["destination"],
+                "reason": "missing_required_data",
+                "max_attempts": 3,
+            },
+            "reasoning": "A destination is required before the next safe step can be chosen.",
+            "confidence": 0.93,
             "is_goal_complete": False,
             "requires_confirmation": False,
             "sensitivity": "low",
         }
         mock_from_settings.return_value = mock_client
 
-        screen_state = _screen(
-            [
-                _node("title", "android.widget.TextView", text="Alex"),
-                _node("message_box", "android.widget.EditText", cdesc="Message", clickable=True, editable=True),
-                _node("send_btn", "android.widget.ImageButton", cdesc="Send", clickable=True),
-            ]
+        service = StepReasoningService()
+        result = service.reason_next_step(
+            goal="Start navigation",
+            target_app="com.google.android.apps.maps",
+            entities={},
+            screen_state=_screen([
+                _node("n1", "android.widget.ImageButton", cdesc="Search here", clickable=True),
+                _node("n2", "android.widget.TextView", text="Home", clickable=True),
+            ]),
+            step_history=[],
+            constraints={"max_steps_remaining": 8},
         )
-        screen_state["foreground_package"] = "com.viber.voip"
-        screen_state["window_title"] = "Alex"
+
+        self.assertEqual(result.action_type, "REQUEST_USER_INPUT")
+        self.assertEqual(result.params["required_fields"], ["destination"])
+        self.assertEqual(result.params["reason"], "missing_required_data")
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
+    def test_reason_next_step_emits_clarification_for_multiple_visible_candidates(self, mock_from_settings):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "REQUEST_USER_INPUT",
+            "params": {
+                "question": "Which Alex should I message? I see Alex Chen and Alex Johnson.",
+                "required_fields": ["recipient"],
+                "candidates": ["Alex Chen", "Alex Johnson"],
+                "reason": "multiple_visible_matches",
+                "max_attempts": 3,
+            },
+            "reasoning": "Two visible contacts plausibly match Alex, so clarification is safer than guessing.",
+            "confidence": 0.95,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_settings.return_value = mock_client
 
         service = StepReasoningService()
         result = service.reason_next_step(
-            goal="Open the Alex chat in Viber",
-            target_app="com.viber.voip",
+            goal="Message Alex on WhatsApp",
+            target_app="com.whatsapp",
             entities={"recipient": "Alex"},
-            screen_state=screen_state,
-            step_history=[{"action_type": "OPEN_APP", "result_success": True}],
-            constraints={"max_steps_remaining": 6},
+            screen_state=_screen([
+                _node("n1", "android.widget.TextView", text="Alex Chen", clickable=True),
+                _node("n2", "android.widget.TextView", text="Alex Johnson", clickable=True),
+            ]),
+            step_history=[],
+            constraints={"max_steps_remaining": 8},
         )
 
-        self.assertTrue(result.is_goal_complete)
-        self.assertIn("conversation interface is already open", result.reasoning)
+        self.assertEqual(result.action_type, "REQUEST_USER_INPUT")
+        self.assertEqual(result.params["candidates"], ["Alex Chen", "Alex Johnson"])
+        self.assertEqual(result.params["reason"], "multiple_visible_matches")
 
     @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
     def test_reason_next_step_does_not_auto_complete_send_goal(self, mock_from_settings):
@@ -448,6 +582,82 @@ class StepReasoningServiceTests(SimpleTestCase):
         )
 
         self.assertFalse(result.is_goal_complete)
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
+    def test_reason_next_step_preserves_model_completion_decision(self, mock_from_settings):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "TAP_ELEMENT",
+            "params": {"selector": {"element_ref": "send_btn"}},
+            "reasoning": "The requested chat is already open.",
+            "confidence": 0.93,
+            "is_goal_complete": True,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_settings.return_value = mock_client
+
+        screen_state = _screen(
+            [
+                _node("title", "android.widget.TextView", text="Alex"),
+                _node("message_box", "android.widget.EditText", cdesc="Message", clickable=True, editable=True),
+                _node("send_btn", "android.widget.ImageButton", cdesc="Send", clickable=True),
+            ]
+        )
+        screen_state["foreground_package"] = "com.viber.voip"
+        screen_state["window_title"] = "Alex"
+
+        service = StepReasoningService()
+        result = service.reason_next_step(
+            goal="Open the Alex chat in Viber",
+            target_app="com.viber.voip",
+            entities={"recipient": "Alex"},
+            screen_state=screen_state,
+            step_history=[{"action_type": "OPEN_APP", "result_success": True}],
+            constraints={"max_steps_remaining": 6},
+        )
+
+        self.assertTrue(result.is_goal_complete)
+
+    @patch("apps.agent_core.services.step_reasoning.LLMClient.from_settings")
+    def test_reason_next_step_does_not_auto_complete_alarm_setup_goal(self, mock_from_settings):
+        mock_client = MagicMock()
+        mock_client.generate.return_value = {
+            "action_type": "TAP_ELEMENT",
+            "params": {"selector": {"element_ref": "n20"}},
+            "reasoning": "Tap Add alarm to start creating the requested alarm.",
+            "confidence": 0.95,
+            "is_goal_complete": False,
+            "requires_confirmation": False,
+            "sensitivity": "low",
+        }
+        mock_from_settings.return_value = mock_client
+
+        screen_state = {
+            "foreground_package": "com.google.android.deskclock",
+            "window_title": "Clock",
+            "screen_hash": "clock_add",
+            "focused_element_ref": None,
+            "is_sensitive": False,
+            "nodes": [
+                _node("n20", "android.widget.Button", text="Add alarm", clickable=True),
+                _node("n21", "android.widget.TextView", text="Alarm"),
+            ],
+        }
+
+        service = StepReasoningService()
+        result = service.reason_next_step(
+            goal="Open Clock app and set alarm for 7:00 tomorrow",
+            target_app="com.google.android.deskclock",
+            entities={"time": "7:00", "day": "tomorrow"},
+            screen_state=screen_state,
+            step_history=[{"action_type": "OPEN_APP", "result_success": True}],
+            constraints={"max_steps_remaining": 6},
+        )
+
+        self.assertFalse(result.is_goal_complete)
+        self.assertEqual(result.action_type, "TAP_ELEMENT")
+        self.assertEqual(result.params["selector"]["element_ref"], "n20")
 
     def test_normalize_reasoned_step_prefers_focus_for_unfocused_editable(self):
         step = _normalize_reasoned_step(

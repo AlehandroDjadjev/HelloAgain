@@ -27,7 +27,6 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         private const val TAG = "HelloAgainMainActivity"
-        private const val VOICE_SERVICE_CHANNEL = "com.example.frontend/voice_service"
         private const val NAVIGATION_OVERLAY_CHANNEL = "hello_again/navigation_overlay"
         private const val PHONE_HINT_CHANNEL = "hello_again/phone_hint"
         private const val DEEP_LINK_CHANNEL = "hello_again/deep_link"
@@ -37,6 +36,7 @@ class MainActivity : FlutterActivity() {
     private var pendingPhoneHintResult: MethodChannel.Result? = null
     private var pendingDeepLink: String? = null
     private var deepLinkChannel: MethodChannel? = null
+    private var micBridgePlugin: MicBridgePlugin? = null
     private var overlayWindowManager: WindowManager? = null
     private var overlayWindowContext: Context? = null
     private var overlayView: View? = null
@@ -69,22 +69,11 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        MethodChannel(
+        micBridgePlugin?.dispose()
+        micBridgePlugin = MicBridgePlugin(
+            applicationContext,
             flutterEngine.dartExecutor.binaryMessenger,
-            VOICE_SERVICE_CHANNEL,
-        ).setMethodCallHandler { call, result ->
-            when (call.method) {
-                "start" -> {
-                    startVoiceService()
-                    result.success(null)
-                }
-                "stop" -> {
-                    stopService(Intent(this, VoiceAssistantForegroundService::class.java))
-                    result.success(null)
-                }
-                else -> result.notImplemented()
-            }
-        }
+        )
 
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
@@ -173,6 +162,8 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         hideNavigationOverlay()
+        micBridgePlugin?.dispose()
+        micBridgePlugin = null
         super.onDestroy()
     }
 
@@ -244,15 +235,6 @@ class MainActivity : FlutterActivity() {
                     null,
                 )
             }
-    }
-
-    private fun startVoiceService() {
-        val intent = Intent(this, VoiceAssistantForegroundService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
     }
 
     private fun requestOverlayPermission() {

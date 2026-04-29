@@ -12,6 +12,7 @@ class AgentClient {
           : baseUrl;
 
   final String _base;
+  String get baseUrl => _base;
 
   // ── Session lifecycle ──────────────────────────────────────────────────────
 
@@ -161,6 +162,17 @@ class AgentClient {
     if (actionType.isNotEmpty) 'action_type': actionType,
     if (reasoning.isNotEmpty) 'reasoning': reasoning,
     if (screenshotBase64 != null) 'screenshot_b64': screenshotBase64,
+  });
+
+  Future<Map<String, dynamic>> submitUserInput(
+    String sessionId, {
+    required String queryId,
+    required String transcript,
+    String source = 'voice',
+  }) => _post('/api/agent/sessions/$sessionId/user-input/', {
+    'query_id': queryId,
+    'transcript': transcript,
+    'source': source,
   });
 
   // ── Confirmation ───────────────────────────────────────────────────────────

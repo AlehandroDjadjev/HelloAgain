@@ -24,6 +24,7 @@ class SessionService:
     PAUSEABLE = frozenset([
         SessionStatus.EXECUTING,
         SessionStatus.AWAITING_CONFIRMATION,
+        SessionStatus.AWAITING_USER_INPUT,
         SessionStatus.APPROVED,
     ])
     # Statuses that are terminal — no transitions allowed

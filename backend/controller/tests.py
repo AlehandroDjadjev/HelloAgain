@@ -996,7 +996,7 @@ class SemiAgentServiceTests(SimpleTestCase):
                         warnings=[],
                     )
                 return SimpleNamespace(
-                    text="Здравей, подготвих резултата.",
+                    text="A model-written voice reply.",
                     source="openai_chat_completions",
                     warnings=[],
                 )
@@ -1137,7 +1137,7 @@ class SemiAgentServiceTests(SimpleTestCase):
         class FakeLlmProvider:
             def generate_reply_with_messages(self, **kwargs):
                 return SimpleNamespace(
-                    text="Здравей, подготвих резултата.",
+                    text="A model-written voice reply.",
                     source="fake_llm",
                     warnings=[],
                 )
@@ -1170,10 +1170,75 @@ class SemiAgentServiceTests(SimpleTestCase):
         )
 
         self.assertEqual(payload["status"], "completed")
-        self.assertEqual(payload["assistant_text"], "Здравей, подготвих резултата.")
+        self.assertEqual(payload["assistant_text"], "A model-written voice reply.")
         self.assertEqual(payload["assistant_audio_base64"], "")
         self.assertEqual(payload["provider_status"]["tts"], "unavailable: test")
         self.assertTrue(any("tts_unavailable=" in item for item in payload["warnings"]))
+
+    def test_run_speech_stage_uses_exact_model_reply_without_fallback(self) -> None:
+        class FakeLlmProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                return SimpleNamespace(
+                    text="A direct model-written response.",
+                    source="fake_llm",
+                    warnings=[],
+                )
+
+        class SilentTtsProvider:
+            def synthesize(self, text: str):
+                raise RuntimeError("tts unavailable")
+
+            def status(self) -> str:
+                return "unavailable: test"
+
+        service = SemiAgentService(
+            llm_provider=FakeLlmProvider(),
+            tts_provider=SilentTtsProvider(),
+        )
+
+        payload = service._run_speech_stage(
+            clean_prompt="say something",
+            step_one={},
+            mcp_results=[{"summary": "tool context"}],
+            registry_payload={},
+            user_context={
+                "resolved_user_id": "user",
+                "record_name": "user",
+                "history_key": "user",
+                "phone_number": "",
+                "source": "test",
+            },
+            session_id="session",
+        )
+
+        self.assertEqual(payload["assistant_text"], "A direct model-written response.")
+        self.assertFalse(any("fallback" in item.lower() for item in payload["warnings"]))
+
+    def test_run_speech_stage_raises_when_model_reply_fails(self) -> None:
+        class FailingLlmProvider:
+            def generate_reply_with_messages(self, **kwargs):
+                raise RuntimeError("llm unavailable")
+
+        service = SemiAgentService(
+            llm_provider=FailingLlmProvider(),
+            connections_service=object(),
+        )
+
+        with self.assertRaises(RuntimeError):
+            service._run_speech_stage(
+                clean_prompt="say something",
+                step_one={},
+                mcp_results=[],
+                registry_payload={},
+                user_context={
+                    "resolved_user_id": "user",
+                    "record_name": "user",
+                    "history_key": "user",
+                    "phone_number": "",
+                    "source": "test",
+                },
+                session_id="session",
+            )
 
     def test_normalize_step_two_plan_replaces_structured_title_with_compact_name(self) -> None:
         service = SemiAgentService()
@@ -1859,7 +1924,8 @@ class SemiAgentServiceTests(SimpleTestCase):
             self.assertIn("recent_chat_history", prompt)
             self.assertIn("Първо съобщение", prompt)
             self.assertIn("Кратък отговор.", prompt)
-            self.assertIn("keep the reply semi-short", prompt)
+            self.assertIn("Respond like a normal person", prompt)
+            self.assertNotIn("keep the reply semi-short", prompt)
 
     def test_dispatch_gnn_tool_uses_lazy_graph_service(self) -> None:
         class FakeGraphService:
